@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Keep this scoped to the project root. docs-site is intentionally excluded:
+  # docs-theme is private and Dependabot has a separate secrets store.
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    groups:
+      npm-minor-patch:
+        update-types:
+          - 'minor'
+          - 'patch'
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    groups:
+      actions-minor-patch:
+        update-types:
+          - 'minor'
+          - 'patch'

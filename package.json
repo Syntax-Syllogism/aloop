@@ -1,0 +1,46 @@
+{
+  "name": "@syntax-syllogism/aloop",
+  "version": "0.5.0",
+  "description": "Syntax & Syllogism agentic loop runner.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "aloop": "bin/loop.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "prompts",
+    "presets",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "agentic",
+    "loop",
+    "code-review",
+    "claude",
+    "codex",
+    "antigravity",
+    "opencode",
+    "cli"
+  ],
+  "homepage": "https://github.com/Syntax-Syllogism/aloop#readme",
+  "bugs": {
+    "url": "https://github.com/Syntax-Syllogism/aloop/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Syntax-Syllogism/aloop.git"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,20 @@
+name: Docs site
+
+on:
+  push:
+    branches: [master, release]
+    paths: ['docs/**', 'docs-site/**', '.github/workflows/docs.yml']
+  workflow_dispatch:
+
+jobs:
+  docs:
+    # The release branch is pushed to both the private origin and the public
+    # mirror, and this workflow also fires on master. Only the mirror's release
+    # branch may publish the docs site.
+    if: github.repository == 'Syntax-Syllogism/aloop' && github.ref == 'refs/heads/release'
+    uses: Syntax-Syllogism/workflows/.github/workflows/docs-publish.yml@workflows/v1
+    with:
+      tool_slug: 'aloop'
+      public_repo: 'Syntax-Syllogism/aloop'
+      site_repo: 'Syntax-Syllogism/Syntax-Syllogism.github.io'
+    secrets: inherit
