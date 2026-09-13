@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [0.5.0] - 2026-09-12
+
+### Added
+
+- Config-registered engine adapters for customizing loop execution environments
+- Worktree setup with automatic no-op detection
+- Lean prompts and work-item preset templates
+- Optional task input parameter to decouple from work-item operations
+- Complete configuration overrides for flexible behavior customization
+- Audited resume engine overrides for workflow control
+- Configurable base branch support for multi-branch operations
+- Per-phase commits with configurable AI model and effort levels
+
+### Fixed
+
+- Standalone public package history export
+- Task context inclusion in AI review prompts
+- Piped input safety with explicit confirmation requirements
+- Worktree stability on dirty git states
+- Wiki commit preservation with cron scheduling
+- Output streaming for long-running phases to prevent false hang detection
+
 ## [Unreleased]
 
 ---
