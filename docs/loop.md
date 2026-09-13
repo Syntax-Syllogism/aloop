@@ -1,3 +1,7 @@
+---
+title: Agentic loop runner
+---
+
 # Agentic loop runner
 
 `@syntax-syllogism/aloop` runs a task through implementation, review,
