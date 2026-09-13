@@ -139,3 +139,10 @@ History from before the standalone extraction (changesets format), preserved for
     rather than assuming `origin` in repos with several remotes.
   - Prompts ship with the package and are overridable per phase from
     `.loop/prompts/` in the consuming project.
+
+## [0.5.1] - 2026-09-13
+
+### Changed
+
+- Internal maintenance and tooling updates
+
