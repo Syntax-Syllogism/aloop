@@ -1,20 +1,21 @@
-import { createReadStream } from 'node:fs';
-import { appendFile, mkdir, stat, writeFile } from 'node:fs/promises';
-import { createInterface } from 'node:readline/promises';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { adapterFor, agentForPhase, passthroughRenderer, validateAgent } from './adapters.mjs';
+import { appendFile, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import packageJson from '../package.json' with { type: 'json' };
+import { adapterFor, agentForPhase, permissionLevel, PERMISSIONS, passthroughRenderer, validateAgent } from './adapters.mjs';
 import { runCommand } from './command.mjs';
 import { loadConfig } from './config.mjs';
 import { GitFacade } from './git.mjs';
+import { hermeticEnvironment, hermeticInvocation, hermeticSnapshot } from './hermetic.mjs';
+import { canonicalizeConfig, hashConfig, hashText } from './manifest.mjs';
+import { computeRunMetrics } from './metrics.mjs';
+import { publish } from './publish.mjs';
 import { renderPrompt } from './prompts.mjs';
+import { banner, describeAgent, ensureConfirmationAvailable, log, openTerminalInput, report } from './reporter.mjs';
 import { RunState, slugFor } from './state.mjs';
-import { APPROVED, CHANGES_REQUESTED, formatFindings, readVerdict } from './verdict.mjs';
-
-const CODE_PHASES = new Set(['implement', 'address']);
-
-function log(message) {
-  console.log(message);
-}
+import { runPhases } from './runner.mjs';
+import { formatFindings } from './verdict.mjs';
+import { planWorktree, resumedWorktree, setupWorktree } from './worktree.mjs';
 
 async function readStdin() {
   if (process.stdin.isTTY) return '';
@@ -36,14 +37,6 @@ export function buildTaskContext({ task, taskFile }) {
     return `Your task is described in \`${taskFile}\`.`;
   }
   return '';
-}
-
-function banner(text) {
-  log(`\n── ${text} ${'─'.repeat(Math.max(0, 60 - text.length))}`);
-}
-
-function describeAgent(agent) {
-  return `${agent.name}${agent.model ? ` model=${agent.model}` : ''}${agent.effort ? ` effort=${agent.effort}` : ''}`;
 }
 
 function overrideSavedEngines(agentSettings, engine, customAdapters) {
@@ -68,14 +61,6 @@ function configOverrideRecord(config, path) {
   };
 }
 
-async function directoryExists(path) {
-  try {
-    return (await stat(path)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
 async function fileExists(path) {
   try {
     return (await stat(path)).isFile();
@@ -84,101 +69,294 @@ async function fileExists(path) {
   }
 }
 
-async function resumedWorktree(git, repoRoot, branch, savedPath) {
-  if (!savedPath) return null;
-  if (resolve(savedPath) === resolve(repoRoot)) {
-    if (await directoryExists(savedPath)) return savedPath;
-  } else {
-    const registeredPath = await git.worktreePath(branch);
-    if (registeredPath && await directoryExists(registeredPath)) return registeredPath;
-  }
-  throw new Error(
-    `Saved worktree "${savedPath}" for branch "${branch}" is unavailable. Restore it or re-register it with git worktree before resuming.`,
-  );
-}
-
-function openTerminalInput() {
-  return new Promise((resolveInput, rejectInput) => {
-    const input = createReadStream('/dev/tty');
-    const onOpen = () => {
-      input.off('error', onError);
-      resolveInput(input);
-    };
-    const onError = (error) => {
-      input.off('open', onOpen);
-      input.destroy();
-      rejectInput(error);
-    };
-    input.once('open', onOpen);
-    input.once('error', onError);
-  });
-}
-
-async function ensureConfirmationAvailable(input, terminalOpener) {
-  if (input || process.stdin.isTTY) return;
-  let terminalInput;
+async function createSourceSnapshot(ctx) {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), 'aloop-source-'));
+  const snapshot = join(temporaryRoot, 'repo');
   try {
-    terminalInput = await terminalOpener();
-  } catch {
-    throw new Error('no terminal available to confirm phases; re-run with --yes to run unattended');
-  }
-  terminalInput.destroy();
-}
-
-async function confirm(question, { input = null, terminalOpener = openTerminalInput } = {}) {
-  let confirmationInput = input;
-  let closeInput = false;
-  if (!confirmationInput) {
-    if (process.stdin.isTTY) {
-      confirmationInput = process.stdin;
-    } else {
-      try {
-        confirmationInput = await terminalOpener();
-      } catch {
-        throw new Error('no terminal available to confirm phases; re-run with --yes to run unattended');
-      }
-      closeInput = true;
+    await runCommand('git', ['clone', '--no-hardlinks', '--no-local', ctx.worktree, snapshot], {
+      cwd: temporaryRoot,
+      timeoutMs: ctx.config.timeoutMs,
+    });
+    const snapshotGit = new GitFacade(snapshot);
+    if (!(await snapshotGit.localBranchExists(ctx.baseBranch))) {
+      await snapshotGit.run(['branch', ctx.baseBranch, await ctx.git.revParse(ctx.baseBranch)]);
     }
-  }
-  const rl = createInterface({ input: confirmationInput, output: process.stdout });
-  try {
-    const answer = await rl.question(`${question} [Y/n/q] `);
-    const normalized = answer.trim().toLowerCase();
-    if (normalized === 'q') return 'quit';
-    return normalized === '' || normalized === 'y' ? 'yes' : 'skip';
-  } finally {
-    rl.close();
-    if (closeInput) confirmationInput.destroy();
+    return {
+      path: snapshot,
+      cleanup: () => rm(temporaryRoot, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
   }
 }
+
 
 async function tee(path, text) {
   await appendFile(path, text);
 }
 
+function phaseInvocation(phase, ctx, { command, args, cwd, mounts }) {
+  if (!phase.hermetic) {
+    return { command, args, env: undefined, policy: { mode: 'host' } };
+  }
+  return hermeticInvocation({
+    settings: phase.hermetic,
+    command,
+    args,
+    cwd,
+    mounts,
+  });
+}
+
+function gitMetadataMount(ctx, mode) {
+  if (!ctx.gitCommonDir) return [];
+  const relativePath = relative(ctx.worktree, ctx.gitCommonDir);
+  const isInsideWorktree = relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+  return isInsideWorktree ? [] : [{ path: ctx.gitCommonDir, mode }];
+}
+
+function manifestRole(phase) {
+  if (phase.verdict) return 'verdict';
+  if (phase.kind === 'gate') return 'gate';
+  if (phase.kind === 'publish') return 'publish';
+  if (phase.role === 'repair') return 'repair';
+  return 'agent';
+}
+
+function engineRecord(agent) {
+  if (!agent) return null;
+  return {
+    name: agent.name,
+    ...(agent.model ? { model: agent.model } : {}),
+    ...(agent.effort ? { effort: agent.effort } : {}),
+  };
+}
+
+function manifestEntry(phase, ctx, values = {}) {
+  return {
+    phase: phase.name,
+    kind: phase.kind,
+    role: manifestRole(phase),
+    inputSha: null,
+    outputSha: null,
+    promptHash: null,
+    configHash: ctx.configHash,
+    artifacts: [],
+    gateReceipts: [],
+    engine: null,
+    status: 'completed',
+    durationMs: 0,
+    ...values,
+  };
+}
+
+function budgetUsage(ctx) {
+  const total = computeRunMetrics(ctx.state.manifest).total;
+  const startedAt = Date.parse(ctx.state.data.startedAt);
+  const hasUsageEntries = total.usageCoverage.applicableEntries > 0;
+  return {
+    tokens: total.tokens ?? (hasUsageEntries ? null : 0),
+    usd: total.cost ?? (hasUsageEntries ? null : 0),
+    wallClockMs: Number.isFinite(startedAt) ? Math.max(0, Date.now() - startedAt) : null,
+  };
+}
+
+function budgetWarning(ctx, field, message) {
+  if (ctx.budgetWarnings.has(field)) return;
+  ctx.budgetWarnings.add(field);
+  log(`  warning: ${message}`);
+}
+
+function budgetStatus(ctx) {
+  if (ctx.dryRun) return null;
+  const budget = ctx.config.budget;
+  if (!budget || !Object.keys(budget).length) return null;
+
+  const usage = budgetUsage(ctx);
+  const checks = [
+    ['tokens', 'tokens', 'token usage is unavailable; the token budget cannot be enforced.'],
+    ['usd', 'usd', 'cost usage is unavailable; the dollar budget cannot be enforced.'],
+    ['wallClockMs', 'wallClockMs', 'the run start time is unavailable; the wall-clock budget cannot be enforced.'],
+  ];
+  for (const [field, label, warning] of checks) {
+    if (budget[field] === undefined) continue;
+    if (usage[field] === null) {
+      budgetWarning(ctx, field, warning);
+      continue;
+    }
+    if (usage[field] >= budget[field]) {
+      return {
+        reason: `budget exhausted: ${label}`,
+        output: `${label} usage ${usage[field]} reached the configured limit ${budget[field]}.`,
+        usage: usage[field],
+        limit: budget[field],
+      };
+    }
+  }
+  return null;
+}
+
+function logBudgetStall(budget) {
+  log(`  ${budget.reason}; ${budget.output}`);
+}
+
+async function recordBudgetStall(ctx, phase, budget) {
+  logBudgetStall(budget);
+  await recordManifest(ctx, manifestEntry(phase, ctx, {
+    status: 'stalled',
+    budgetStall: true,
+    failure: { reason: budget.reason, usage: budget.usage, limit: budget.limit },
+  }));
+  return { phase: phase.name, reason: budget.reason, output: budget.output };
+}
+
+async function markBudgetExhaustedComplete(state, phase, details = {}) {
+  await state.markComplete(phase.name, { ...details, budgetExhausted: true });
+}
+
+async function recordManifest(ctx, entry) {
+  if (ctx.dryRun) return;
+  ctx.state.manifest.append(entry);
+  await ctx.state.save();
+}
+
+async function markStalledManifest(ctx, phase, result, startIndex) {
+  const stalledPhase = result.stalledPhase ?? phase.name;
+  const entry = ctx.state.manifest.entries
+    .slice(startIndex)
+    .findLast((candidate) => candidate.phase === stalledPhase);
+  if (entry) {
+    entry.status = 'stalled';
+    await ctx.state.save();
+    return;
+  }
+  await recordManifest(ctx, manifestEntry(phase, ctx, { status: 'stalled' }));
+}
+
 async function runGate(phase, ctx) {
   const commands = phase.commands ?? ctx.config.gate;
   const logFile = ctx.state.logPath(phase.name);
+  await tee(logFile, '');
+  const started = performance.now();
+  const gateReceipts = [];
+  const execution = phaseInvocation(phase, ctx, {
+    command: ctx.config.shell,
+    args: ['-c', commands.join(' && ')],
+    cwd: ctx.worktree,
+    mounts: [
+      { path: ctx.worktree, mode: 'ro' },
+      { path: ctx.state.dir, mode: 'rw' },
+      ...gitMetadataMount(ctx, 'ro'),
+    ],
+  });
   for (const command of commands) {
     log(`  $ ${command}`);
+    const commandStarted = performance.now();
     try {
       // Gate commands run through a shell on purpose: they are user-authored
       // strings that routinely need quoting, pipes, `&&`, and env vars, and
       // naive whitespace splitting mangles all four without complaining.
-      await runCommand('sh', ['-c', command], {
+      const commandExecution = phaseInvocation(phase, ctx, {
+        command: ctx.config.shell,
+        args: ['-c', command],
         cwd: ctx.worktree,
+        mounts: [
+          { path: ctx.worktree, mode: 'ro' },
+          { path: ctx.state.dir, mode: 'rw' },
+          ...gitMetadataMount(ctx, 'ro'),
+        ],
+      });
+      await runCommand(commandExecution.command, commandExecution.args, {
+        cwd: commandExecution.policy.mode === 'host' ? ctx.worktree : undefined,
+        env: commandExecution.env,
         timeoutMs: ctx.config.timeoutMs,
+        activeProcessPath: ctx.activeProcessPath,
         onOutput: (text) => {
           process.stdout.write(text);
           void tee(logFile, text);
         },
       });
+      gateReceipts.push({ command, exitCode: 0, durationMs: Math.round(performance.now() - commandStarted) });
     } catch (error) {
       await tee(logFile, `\n${error.output ?? error.message}\n`);
-      return { ok: false, command, output: error.output ?? error.message };
+      gateReceipts.push({
+        command,
+        exitCode: typeof error.code === 'number' ? error.code : null,
+        durationMs: Math.round(performance.now() - commandStarted),
+      });
+      return {
+        ok: false,
+        command,
+        output: error.output ?? error.message,
+        gateReceipts,
+        durationMs: Math.round(performance.now() - started),
+        execution: execution.policy,
+      };
     }
   }
-  return { ok: true };
+  return { ok: true, gateReceipts, durationMs: Math.round(performance.now() - started), execution: execution.policy };
+}
+
+async function runPublish(phase, ctx, { remote, branch, base, approvedSha }) {
+  const startedAt = new Date().toISOString();
+  const started = performance.now();
+  const inputSha = await ctx.git.revParse();
+  const descriptionPath = join(ctx.state.dir, 'pr.md');
+  let result;
+  let failure = null;
+  try {
+    result = await publish({
+      git: ctx.git,
+      remote,
+      branch,
+      base,
+      prBodyPath: descriptionPath,
+      draft: ctx.config.publish.draft ?? true,
+      backend: ctx.config.publish.backend ?? 'github',
+      approvedSha,
+      ...(phase.hermetic ? { env: hermeticEnvironment(phase.hermetic) } : {}),
+    });
+  } catch (error) {
+    failure = error;
+  }
+  const outputSha = await ctx.git.revParse();
+  const manifest = manifestEntry(phase, ctx, {
+    inputSha,
+    outputSha,
+    approvedSha,
+    artifacts: [
+      ...(await fileExists(descriptionPath) ? ['pr.md'] : []),
+    ],
+    startedAt,
+    completedAt: new Date().toISOString(),
+    durationMs: Math.round(performance.now() - started),
+    ...(result ? {
+      remoteSha: result.remoteSha,
+      prUrl: result.pullRequest.url,
+      pullRequest: result.pullRequest,
+      status: 'completed',
+    } : {
+      status: 'stalled',
+      failure: { reason: failure?.message ?? 'publishing failed' },
+    }),
+  });
+  return { ok: Boolean(result), result, manifest, failure };
+}
+
+async function withRetries(phase, operation, { failed = () => false } = {}) {
+  const maxAttempts = phase.retry?.maxAttempts ?? 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await operation();
+      if (!failed(result)) return result;
+      if (attempt === maxAttempts) return result;
+    } catch (error) {
+      if (attempt === maxAttempts) throw error;
+    }
+    log(`  ${phase.name} attempt ${attempt}/${maxAttempts} failed; retrying`);
+  }
+  throw new Error(`Phase "${phase.name}" exhausted its retry policy.`);
 }
 
 async function runSetup(commands, ctx) {
@@ -186,9 +364,10 @@ async function runSetup(commands, ctx) {
   for (const command of commands) {
     log(`  $ ${command}`);
     try {
-      await runCommand('sh', ['-c', command], {
+      await runCommand(ctx.config.shell, ['-c', command], {
         cwd: ctx.worktree,
         timeoutMs: ctx.config.timeoutMs,
+        activeProcessPath: ctx.activeProcessPath,
         onOutput: (text) => {
           process.stdout.write(text);
           void tee(logFile, text);
@@ -201,39 +380,121 @@ async function runSetup(commands, ctx) {
   }
 }
 
-function isCodePhase(phase) {
-  return CODE_PHASES.has(phase.name);
+async function captureEngineVersions(agentSettings, customAdapters, cwd) {
+  const versions = {};
+  const engines = new Map(Object.values(agentSettings).map((agent) => [agent.name, agent]));
+  for (const [name, agent] of engines) {
+    const adapter = adapterFor(name, customAdapters);
+    if (!adapter.version) continue;
+    try {
+      const version = await adapter.version({ agent, cwd });
+      if (typeof version === 'string' && version.trim()) versions[name] = version.trim();
+    } catch {
+      // Version capture is diagnostic context and must not make a run fail.
+    }
+  }
+  return versions;
 }
 
-async function noOpReason(phase, result, ctx, { hasFindings = true, headBefore = null } = {}) {
-  if (ctx.dryRun || !isCodePhase(phase) || (phase.name === 'address' && !hasFindings)) return null;
-  const pending = await ctx.git.status();
-  const headChanged = headBefore !== null && headBefore !== (await ctx.git.revParse());
-  if (pending || headChanged || (result.bytesEmitted ?? 0) > 0) return null;
-  return `${phase.name} produced no changes and no output — the engine likely did nothing. Check ${ctx.state.logPath(phase.name)}.`;
+async function captureRunSnapshot({ state, rootGit, baseBranch, branch, config, agentSettings, cwd, worktree }) {
+  const capturedAt = new Date().toISOString();
+  const gateDefinitions = {
+    default: [...config.gate],
+    phases: config.resolvedPhases
+      .flatMap((phase) => [phase, ...(phase.repair ?? [])])
+      .filter((phase) => phase.kind === 'gate')
+      .map((phase) => ({ name: phase.name, commands: [...(phase.commands ?? config.gate)] })),
+  };
+  const configHash = hashConfig(config);
+  return {
+    snapshotVersion: 1,
+    capturedAt,
+    runId: state.data.runId,
+    baseSha: await rootGit.revParse(baseBranch),
+    branch,
+    baseBranch,
+    resolvedConfig: canonicalizeConfig(config),
+    configHash,
+    // Prompt context is only fully known when each invocation runs. Keep the
+    // immutable snapshot honest by pointing at the manifest's actual hashes.
+    promptHashes: {
+      source: 'manifest.json',
+      selector: 'phases[*].promptHash',
+    },
+    engineVersions: await captureEngineVersions(agentSettings, config.adapters, worktree),
+    aloopVersion: packageJson.version,
+    gateDefinitions,
+    hermetic: hermeticSnapshot(config),
+    environment: {
+      nodeVersion: process.version,
+      platform: process.platform,
+      cwd: process.cwd(),
+      timestamp: capturedAt,
+    },
+    worktree,
+    runDirectory: state.dir,
+    cwd,
+  };
 }
 
 async function runAgent(phase, ctx, variables) {
+  const startedAt = new Date().toISOString();
+  const started = performance.now();
+  const inputSha = ctx.dryRun ? null : await ctx.git.revParse();
   const agent = ctx.agentSettings[phase.name] ?? agentForPhase(ctx.config, phase.name);
   const engineOverride = ctx.engineOverrides[phase.name];
   const adapter = adapterFor(agent.name, ctx.config.adapters);
-  const { prompt, path } = await renderPrompt(phase.prompt, variables, {
+  const worktreeWrite = permissionLevel(phase.permissions) === PERMISSIONS.WRITE_WORKTREE;
+  const artifactOnly = !worktreeWrite;
+  const sourceSnapshot = artifactOnly && !ctx.dryRun ? await createSourceSnapshot(ctx) : null;
+  const agentRepo = sourceSnapshot?.path ?? ctx.worktree;
+
+  try {
+  const { prompt, path } = await renderPrompt(phase.prompt, {
+    ...variables,
+    ...(sourceSnapshot ? { REPO: agentRepo } : {}),
+  }, {
     projectPromptDir: ctx.promptDir,
   });
+  const promptHash = hashText(prompt);
   log(`  engine: ${agent.name}${agent.model ? `   model: ${agent.model}` : ''}${agent.effort ? `   effort: ${agent.effort}` : ''}   prompt: ${path}`);
   if (engineOverride) log(`  resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)}`);
 
+  // Every read-only agent starts in the driver-owned artifact directory. The
+  // source snapshot is disposable, so an adapter's writable added directories
+  // cannot reach the real worktree while the agent can still inspect a Git tree.
+  const agentCwd = artifactOnly ? ctx.state.dir : ctx.worktree;
+  // Only the verdict phase's prompt is instructed to edit the task file (its
+  // Code Review section), so only it is granted the external task-file repo as
+  // writable. Every other artifact-only phase — pr-description included — gets
+  // just its own run directory; it has no business touching the task file repo.
+  const artifactOnlyDirs = phase.role === 'verdict' ? ctx.artifactDirs : [ctx.state.dir];
   const { command, args } = adapter.command({
     prompt,
-    cwd: ctx.worktree,
-    addDirs: ctx.addDirs,
+    cwd: agentCwd,
+    addDirs: worktreeWrite ? ctx.addDirs : [...artifactOnlyDirs, ...(sourceSnapshot ? [sourceSnapshot.path] : [])],
     timeoutMs: ctx.config.timeoutMs,
     agent,
+    permissions: phase.permissions,
+    artifactOnly,
+  });
+  const execution = phaseInvocation(phase, ctx, {
+    command,
+    args,
+    cwd: agentCwd,
+    mounts: [
+      { path: ctx.worktree, mode: worktreeWrite ? 'rw' : 'ro' },
+      ...(worktreeWrite
+        ? ctx.addDirs.filter((path) => path !== ctx.worktree).map((path) => ({ path, mode: 'rw' }))
+        : artifactOnlyDirs.map((path) => ({ path, mode: 'rw' }))),
+      ...(sourceSnapshot ? [{ path: sourceSnapshot.path, mode: 'ro' }] : []),
+      ...gitMetadataMount(ctx, worktreeWrite ? 'rw' : 'ro'),
+    ],
   });
   if (ctx.dryRun) {
-    log(`  would run: ${[command, ...args].map((value) => JSON.stringify(String(value))).join(' ')}`);
+    log(`  would run: ${[execution.command, ...execution.args].map((value) => JSON.stringify(String(value))).join(' ')}`);
     log(`\n${prompt}\n`);
-    return { agent, command, args, dryRun: true };
+    return { agent, command, args, execution, dryRun: true };
   }
   const logFile = ctx.state.logPath(phase.name);
   const overrideNote = engineOverride ? ` (resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)})` : '';
@@ -242,225 +503,69 @@ async function runAgent(phase, ctx, variables) {
   // human text and passes through, so a vendor warning is never swallowed.
   const renderer = adapter.createRenderer?.() ?? passthroughRenderer();
   let bytesEmitted = 0;
+  const pendingLogWrites = [];
   const emit = (text) => {
     if (!text) return;
     bytesEmitted += Buffer.byteLength(text);
     process.stdout.write(text);
-    void tee(logFile, text);
+    pendingLogWrites.push(tee(logFile, text));
   };
+  let commandError;
   try {
-    await runCommand(command, args, {
-      cwd: ctx.worktree,
+    await runCommand(execution.command, execution.args, {
+      cwd: execution.policy.mode === 'host' ? agentCwd : undefined,
+      env: execution.env,
       timeoutMs: ctx.config.timeoutMs,
+      activeProcessPath: ctx.activeProcessPath,
       onOutput: (text, stream) => emit(stream === 'stderr' ? text : renderer.write(text)),
     });
+  } catch (error) {
+    commandError = error;
   } finally {
     // A killed or failed run still has a partial line worth reading.
     emit(renderer.end());
+    await Promise.all(pendingLogWrites);
   }
-  return { agent, bytesEmitted };
-}
+  const usage = renderer.usage?.() ?? adapter.usage?.() ?? null;
 
-function reviewResumePoint(state, phase, resume) {
-  if (!resume) return { round: 1, sinceSha: null };
-
-  const pending = state.data.pendingRepairs?.[phase.name];
-  if (pending) {
-    return {
-      atCap: pending.round >= phase.maxRounds,
-      pending,
-      resumed: true,
-      round: pending.round,
-      sinceSha: pending.reviewedSha,
-    };
+  const manifest = manifestEntry(phase, ctx, {
+    inputSha,
+    outputSha: await ctx.git.revParse(),
+    promptHash,
+    artifacts: [`${phase.name}.log`],
+    engine: engineRecord(agent),
+    startedAt,
+    completedAt: new Date().toISOString(),
+    durationMs: Math.round(performance.now() - started),
+    ...(usage?.tokens !== undefined ? { tokens: usage.tokens } : {}),
+    ...(usage?.cost !== undefined ? { cost: usage.cost } : {}),
+    ...(commandError ? {
+      status: 'stalled',
+      failure: {
+        command,
+        code: commandError.code ?? null,
+        timedOut: Boolean(commandError.timedOut),
+      },
+    } : {}),
+    execution: execution.policy,
+    ...(!commandError && phase.name === 'pr-description' && await fileExists(join(ctx.state.dir, 'pr.md'))
+      ? { artifacts: [`${phase.name}.log`, 'pr.md'] }
+      : {}),
+  });
+  if (commandError) {
+    await recordManifest(ctx, manifest);
+    throw commandError;
   }
-
-  const previousRound = state.data.rounds?.[phase.name] ?? 0;
-  const sinceSha = state.data.reviewedShas?.[phase.name]?.[previousRound] ?? null;
-  if (!sinceSha) return { round: 1, sinceSha: null };
 
   return {
-    atCap: previousRound >= phase.maxRounds,
-    resumed: true,
-    round: previousRound + 1,
-    sinceSha,
+    agent,
+    bytesEmitted,
+    execution: execution.policy,
+    manifest,
   };
-}
-
-async function clearPendingRepair(phase, state) {
-  const pendingRepairs = { ...state.data.pendingRepairs };
-  delete pendingRepairs[phase.name];
-  await state.record({ pendingRepairs });
-}
-
-async function runRepairs(phase, ctx, baseVariables, pending) {
-  let gateOk = true;
-  let gateFailure = null;
-  for (let index = pending.nextRepair; index < phase.repair.length; index += 1) {
-    const repair = phase.repair[index];
-    banner(`${repair.name} (round ${pending.round}${ctx.resume ? ' resume' : ''})`);
-    if (repair.kind === 'gate') {
-      if (ctx.dryRun) {
-        log(`  would run: ${(repair.commands ?? ctx.config.gate).join(' && ')}`);
-        gateOk = true;
-      } else {
-        const result = await runGate(repair, ctx);
-        gateOk = result.ok;
-        gateFailure = result.ok ? null : `${result.command}\n${result.output}`;
-      }
-    } else {
-      const headBefore = isCodePhase(repair) && !ctx.dryRun ? await ctx.git.revParse() : null;
-      const result = await runAgent(repair, ctx, {
-        ...baseVariables,
-        ROUND: pending.round,
-        MAX_ROUNDS: phase.maxRounds,
-        VERDICT_FILE: ctx.state.verdictPath(pending.round),
-        FINDINGS: formatFindings(pending.verdict.blocking),
-        SINCE_SHA: pending.reviewedSha,
-        GATE_STATUS: gateOk ? 'passing' : `FAILING\n${gateFailure}`,
-      });
-      const stalledReason = await noOpReason(repair, result, ctx, {
-        hasFindings: pending.verdict?.blocking?.length > 0,
-        headBefore,
-      });
-      if (stalledReason) return { gateOk, gateFailure, stalled: stalledReason, stalledPhase: repair.name };
-    }
-    await ctx.state.record({
-      pendingRepairs: {
-        ...ctx.state.data.pendingRepairs,
-        [phase.name]: { ...pending, nextRepair: index + 1 },
-      },
-    });
+  } finally {
+    await sourceSnapshot?.cleanup();
   }
-  await clearPendingRepair(phase, ctx.state);
-  return { gateOk, gateFailure };
-}
-
-/**
- * Run a verdict phase and its repair phases until the verdict clears.
- *
- * Two guards keep this from spinning: a hard round cap, and a refusal to exit
- * on approval while the last gate re-check was red. Without the second one an
- * agreeable reviewer can wave through a tree that does not build.
- */
-async function runVerdictLoop(phase, ctx, baseVariables) {
-  const resumePoint = reviewResumePoint(ctx.state, phase, ctx.resume);
-  if (resumePoint.atCap) {
-    return { verdict: CHANGES_REQUESTED, rounds: phase.maxRounds, stalled: 'round cap reached' };
-  }
-
-  let round = resumePoint.round;
-  let gateOk = true;
-  let gateFailure = null;
-  let sinceSha = resumePoint.sinceSha;
-
-  if (resumePoint.pending) {
-    const result = await runRepairs(phase, ctx, baseVariables, resumePoint.pending);
-    gateOk = result.gateOk;
-    gateFailure = result.gateFailure;
-    if (result.stalled) {
-      return { verdict: CHANGES_REQUESTED, rounds: resumePoint.pending.round, stalled: result.stalled, stalledPhase: result.stalledPhase };
-    }
-    round += 1;
-  } else if (resumePoint.resumed) {
-    // Runs created before repair checkpoints existed cannot tell whether address
-    // completed, so fail closed by rechecking before asking for another verdict.
-    const legacyGate = phase.repair.find((repair) => repair.kind === 'gate' && repair.recheck);
-    if (legacyGate) {
-      const result = await runRepairs(phase, ctx, baseVariables, {
-        round: round - 1,
-        reviewedSha: sinceSha,
-        verdict: { blocking: [] },
-        nextRepair: phase.repair.indexOf(legacyGate),
-      });
-      gateOk = result.gateOk;
-      gateFailure = result.gateFailure;
-      if (result.stalled) {
-        return { verdict: CHANGES_REQUESTED, rounds: round, stalled: result.stalled, stalledPhase: result.stalledPhase };
-      }
-    }
-  }
-
-  for (;;) {
-    const verdictPath = ctx.state.verdictPath(round);
-    banner(`${phase.name} (round ${round}/${phase.maxRounds})`);
-    await runAgent(phase, ctx, {
-      ...baseVariables,
-      ROUND: round,
-      MAX_ROUNDS: phase.maxRounds,
-      VERDICT_FILE: verdictPath,
-      SINCE_SHA: sinceSha ?? '(none — review the cumulative branch diff)',
-      GATE_STATUS: gateOk ? 'passing' : `FAILING\n${gateFailure}`,
-    });
-
-    if (ctx.dryRun) return { verdict: APPROVED, rounds: round, dryRun: true };
-
-    const reviewedSha = await ctx.git.revParse();
-    const verdict = await readVerdict(verdictPath);
-    const reviewState = {
-      rounds: { ...ctx.state.data.rounds, [phase.name]: round },
-      reviewedShas: {
-        ...ctx.state.data.reviewedShas,
-        [phase.name]: {
-          ...(ctx.state.data.reviewedShas?.[phase.name] ?? {}),
-          [round]: reviewedSha,
-        },
-      },
-    };
-    // Checkpoint the owed repair even when this is the final allowed round.
-    // The cap stops *this* process below, but the last review's findings are
-    // still unaddressed; recording them lets a resume (with a raised cap) run
-    // the address phase before re-reviewing, instead of burning a fresh review
-    // round on the identical tree. Resuming without raising the cap stays a
-    // no-op: reviewResumePoint reports atCap while pending.round >= maxRounds.
-    if (verdict.verdict === CHANGES_REQUESTED && phase.repair.length) {
-      reviewState.pendingRepairs = {
-        ...ctx.state.data.pendingRepairs,
-        [phase.name]: { round, reviewedSha, verdict, nextRepair: 0 },
-      };
-    }
-    await ctx.state.record(reviewState);
-    sinceSha = reviewedSha;
-    log(`\n  verdict: ${verdict.verdict}${verdict.summary ? ` — ${verdict.summary}` : ''}`);
-
-    if (verdict.verdict === APPROVED && gateOk) return { verdict: APPROVED, rounds: round };
-    if (verdict.verdict === APPROVED && !gateOk) {
-      log('  approval withheld: the gate is still failing.');
-      return {
-        verdict: CHANGES_REQUESTED,
-        rounds: round,
-        stalled: 'approval withheld: repair gate remains failing',
-        output: gateFailure,
-      };
-    }
-    if (!phase.repair.length) {
-      return { verdict: verdict.verdict, rounds: round, stalled: 'no repair phase configured' };
-    }
-    if (round >= phase.maxRounds) {
-      return { verdict: verdict.verdict, rounds: round, stalled: 'round cap reached', findings: verdict.blocking };
-    }
-
-    const result = await runRepairs(phase, ctx, baseVariables, ctx.state.data.pendingRepairs[phase.name]);
-    gateOk = result.gateOk;
-    gateFailure = result.gateFailure;
-    if (result.stalled) {
-      return { verdict: CHANGES_REQUESTED, rounds: round, stalled: result.stalled, stalledPhase: result.stalledPhase };
-    }
-    round += 1;
-  }
-}
-
-async function setupWorktree(git, config, slug, branch, repoRoot, baseBranch) {
-  if (!config.worktrees) return { worktree: repoRoot, created: false, worktreeCreated: false };
-  const root = config.worktreeRoot
-    ? resolve(repoRoot, config.worktreeRoot)
-    : join(dirname(repoRoot), '.loop-worktrees');
-  await mkdir(root, { recursive: true });
-  const existing = await git.worktreePath(branch);
-  if (existing) return { worktree: existing, created: false, worktreeCreated: false };
-  const path = join(root, slug);
-  const result = await git.addWorktree(path, branch, baseBranch);
-  return { worktree: path, created: result.created, worktreeCreated: true };
 }
 
 export async function runLoop(options = {}) {
@@ -507,9 +612,11 @@ export async function runLoop(options = {}) {
     runsDir,
     slug,
     { task, taskFile: taskFile === '-' ? null : taskFile, name, branch: configuredBranch, repoRoot },
-    { readOnly: Boolean(args.dryRun) },
+    { readOnly: Boolean(args.dryRun), resume: Boolean(args.resume), lock: !args.dryRun },
   );
 
+  let runStarted = false;
+  try {
   const persistedName = args.resume ? state.data.name : null;
   if (persistedName && args.name && slugFor(args.name) !== persistedName) {
     throw new Error(
@@ -576,6 +683,8 @@ export async function runLoop(options = {}) {
       await state.record({ taskFile });
     }
   }
+  await state.record({ status: 'running' });
+  runStarted = true;
   const configuredAgentSettings = Object.fromEntries(
     config.resolvedPhases
       .flatMap((phase) => [phase, ...(phase.repair ?? [])])
@@ -625,9 +734,28 @@ export async function runLoop(options = {}) {
     : null;
   const { worktree, created, worktreeCreated } = savedWorktree
     ? { worktree: savedWorktree, created: false, worktreeCreated: false }
-    : await setupWorktree(rootGit, config, slug, branch, repoRoot, baseBranch);
+    : args.dryRun
+      ? { ...(await planWorktree(rootGit, config, slug, branch, repoRoot)), created: false, worktreeCreated: false }
+      : await setupWorktree(rootGit, config, slug, branch, repoRoot, baseBranch);
   const worktreeGit = new GitFacade(worktree);
+  const hermeticPhaseExists = config.resolvedPhases
+    .flatMap((phase) => [phase, ...(phase.repair ?? [])])
+    .some((phase) => phase.hermetic);
+  const gitCommonDir = args.dryRun || !hermeticPhaseExists
+    ? null
+    : resolve(worktree, await worktreeGit.commonDir());
   await state.record({ worktree, branch, baseBranch });
+  await state.saveManifest({
+    runId: state.data.runId,
+    name: state.data.name,
+    task: task ?? null,
+    taskFile,
+    branch,
+    baseBranch,
+    repoRoot,
+    worktree,
+    snapshot: 'snapshot.json',
+  });
   if (args.baseBranch && !created) {
     log(`  note: branch "${branch}" already has a worktree or exists; --base-branch has no effect on this run.`);
   }
@@ -640,8 +768,8 @@ export async function runLoop(options = {}) {
   const taskFileRepo = taskFileGit ? await taskFileGit.toplevel().catch(() => null) : null;
   const taskFileAccessDir = taskFileRepo === repoRoot ? dirname(taskFile) : taskFileRepo;
 
-  const addDirs = [state.dir];
-  if (taskFileAccessDir && !addDirs.includes(taskFileAccessDir)) addDirs.push(taskFileAccessDir);
+  const artifactDirs = [state.dir];
+  if (taskFileAccessDir && !artifactDirs.includes(taskFileAccessDir)) artifactDirs.push(taskFileAccessDir);
 
   const remote = config.remote ?? (await rootGit.defaultRemote()) ?? 'origin';
   if (config.remote && !(await rootGit.remoteExists(config.remote))) {
@@ -650,14 +778,21 @@ export async function runLoop(options = {}) {
   const ctx = {
     config,
     worktree,
-    addDirs,
+    gitCommonDir,
+    addDirs: [worktree, ...artifactDirs],
+    artifactDirs,
     state,
     git: worktreeGit,
     agentSettings,
     engineOverrides,
+    budgetWarnings: new Set(),
+    configHash: hashConfig(config),
     resume: Boolean(args.resume),
     dryRun: args.dryRun,
+    remote,
+    baseBranch,
     promptDir: join(repoRoot, config.promptDir),
+    activeProcessPath: join(state.dir, 'active-command.json'),
   };
 
   if (worktreeCreated && !args.dryRun && config.setup.length) {
@@ -679,6 +814,19 @@ export async function runLoop(options = {}) {
     GATE_COMMANDS: config.gate.join('\n') || '(none configured)',
   };
 
+  if (!args.dryRun && !(await state.hasSnapshot())) {
+    await state.saveSnapshot(await captureRunSnapshot({
+      state,
+      rootGit,
+      baseBranch,
+      branch,
+      config,
+      agentSettings,
+      cwd,
+      worktree,
+    }));
+  }
+
   log(`task      : ${name}`);
   if (taskFile) log(`task file : ${taskFile}`);
   log(`branch    : ${branch}${created ? ' (created)' : ''}`);
@@ -687,127 +835,57 @@ export async function runLoop(options = {}) {
   log(`run dir   : ${state.dir}`);
   log(`phases    : ${config.resolvedPhases.map((phase) => phase.name).join(' → ')}`);
 
-  const summary = { phases: [], stalled: null, branch, worktree, runDir: state.dir, task: name, taskFile };
+  const summary = {
+    phases: [],
+    stalled: null,
+    branch,
+    baseBranch,
+    remote,
+    worktree,
+    runDir: state.dir,
+    task: name,
+    taskFile,
+    prUrl: state.data.prUrl ?? state.manifestMetadata.prUrl ?? null,
+    pullRequest: state.data.pullRequest ?? state.manifestMetadata.pullRequest ?? null,
+  };
 
-  let startIndex = 0;
-  if (args.from) {
-    startIndex = config.resolvedPhases.findIndex((phase) => phase.name === args.from);
-    if (startIndex < 0) throw new Error(`--from names a phase that is not in the pipeline: ${args.from}`);
-  }
+  await runPhases({
+    args,
+    config,
+    state,
+    ctx,
+    variables,
+    summary,
+    remote,
+    branch,
+    baseBranch,
+    confirmInput,
+    terminalOpener,
+    operations: {
+      budgetStatus,
+      markBudgetExhaustedComplete,
+      manifestEntry,
+      markStalledManifest,
+      recordBudgetStall,
+      recordManifest,
+      runAgent,
+      runGate,
+      runPublish,
+      withRetries,
+    },
+  });
 
-  for (const phase of config.resolvedPhases.slice(startIndex)) {
-    if (args.resume && state.isComplete(phase.name)) {
-      log(`\n── ${phase.name}: already complete, skipping`);
-      continue;
-    }
-    if (!args.yes && !args.dryRun) {
-      const answer = await confirm(`\nRun phase "${phase.name}"?`, {
-        input: confirmInput,
-        terminalOpener,
-      });
-      if (answer === 'quit') {
-        summary.stalled = { phase: phase.name, reason: 'stopped by user' };
-        break;
-      }
-      if (answer === 'skip') {
-        log(`  skipped ${phase.name}`);
-        continue;
-      }
-    }
-
-    // A verdict phase prints its own per-round banner.
-    if (!phase.verdict) banner(phase.name);
-
-    // A publishing phase must run on a clean tree. This is a deterministic
-    // guard, not the agent's job: an earlier phase failing to commit its work
-    // leaves the tree dirty, and without this stop the git agent — told the
-    // tree is already clean but forbidden from committing — improvises an
-    // uncommittable "fix" and spins until its timeout. Unresolved review
-    // findings deliberately do NOT block here; a clean tree with open findings
-    // is a valid state to resume through docs and git.
-    if (phase.requiresCleanTree && !ctx.dryRun) {
-      const pending = await ctx.git.status();
-      if (pending) {
-        log('  worktree is not clean; refusing to run this phase over uncommitted changes.');
-        summary.stalled = {
-          phase: phase.name,
-          reason: 'worktree has uncommitted changes; a publishing phase must run on a clean tree',
-          output: pending,
-        };
-        break;
-      }
-    }
-
-    if (phase.kind === 'gate') {
-      if (ctx.dryRun) {
-        log(`  would run: ${(phase.commands ?? config.gate).join(' && ')}`);
-        continue;
-      }
-      const result = await runGate(phase, ctx);
-      if (!result.ok) {
-        summary.stalled = { phase: phase.name, reason: `gate failed: ${result.command}`, output: result.output };
-        break;
-      }
-      await state.markComplete(phase.name);
-      summary.phases.push({ name: phase.name, ok: true });
-      continue;
-    }
-
-    if (phase.verdict) {
-      const result = await runVerdictLoop(phase, ctx, variables);
-      summary.phases.push({ name: phase.name, rounds: result.rounds, verdict: result.verdict });
-      if (result.stalled) {
-        summary.stalled = {
-          phase: result.stalledPhase ?? phase.name,
-          reason: result.stalled,
-          findings: result.findings,
-          rounds: result.rounds,
-          output: result.output,
-        };
-        break;
-      }
-      await state.markComplete(phase.name, { rounds: result.rounds });
-      continue;
-    }
-
-    const headBefore = isCodePhase(phase) && !ctx.dryRun ? await ctx.git.revParse() : null;
-    const result = await runAgent(phase, ctx, variables);
-    const stalledReason = await noOpReason(phase, result, ctx, { headBefore });
-    if (stalledReason) {
-      log(`  ${stalledReason}`);
-      summary.stalled = { phase: phase.name, reason: stalledReason };
-      break;
-    }
-    await state.markComplete(phase.name);
-    summary.phases.push({ name: phase.name, ok: true });
-  }
-
-  report(summary);
+  await state.record({
+    status: summary.stalled ? 'stalled' : 'completed',
+    ...(summary.stalled ? { stalled: summary.stalled } : {}),
+  });
+  report(summary, formatFindings);
   return summary;
-}
 
-function report(summary) {
-  banner('summary');
-  for (const phase of summary.phases) {
-    const detail = phase.rounds ? ` (${phase.rounds} round${phase.rounds === 1 ? '' : 's'}, ${phase.verdict})` : '';
-    log(`  ✓ ${phase.name}${detail}`);
+  } catch (error) {
+    if (runStarted && !args.dryRun) await state.record({ status: 'stalled' }).catch(() => {});
+    throw error;
+  } finally {
+    await state.release();
   }
-  if (!summary.stalled) {
-    log(`\nPipeline finished. Branch ${summary.branch} is ready.`);
-    log(`Logs: ${summary.runDir}`);
-    return;
-  }
-  log(`\n  ✗ stalled in "${summary.stalled.phase}": ${summary.stalled.reason}`);
-  if (summary.stalled.findings?.length) {
-    log(`\nOutstanding blocking findings:\n${formatFindings(summary.stalled.findings)}`);
-  }
-  if (summary.stalled.output) log(`\n${summary.stalled.output.trim().split('\n').slice(-20).join('\n')}`);
-  log(`\nWorktree: ${summary.worktree}`);
-  log(`Logs:     ${summary.runDir}`);
-  const resumeArgs = [`--name ${summary.task}`];
-  if (summary.taskFile && summary.taskFile !== join(summary.runDir, 'task.md')) {
-    resumeArgs.push(`--task-file ${summary.taskFile}`);
-  }
-  log(`Resume:   aloop ${resumeArgs.join(' ')} --resume`);
-  process.exitCode = 1;
 }

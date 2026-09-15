@@ -1,8 +1,14 @@
 {
   "name": "@syntax-syllogism/aloop",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Syntax & Syllogism agentic loop runner.",
   "type": "module",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./backends/github": "./src/publish.mjs",
+    "./backends/gitlab": "./src/backends/gitlab.mjs",
+    "./src/*": "./src/*"
+  },
   "engines": {
     "node": ">=22"
   },

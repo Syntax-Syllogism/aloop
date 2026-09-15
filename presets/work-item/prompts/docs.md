@@ -1,6 +1,7 @@
-Do a documentation-as-built pass with the committed work in the current
-branch `{{BRANCH}}`, in the worktree at `{{REPO}}`. The work implements
-`{{TASK_NAME}}` and has passed code review.
+Do a documentation-as-built pass with the committed implementation in the
+current branch `{{BRANCH}}`, in the worktree at `{{REPO}}`. This phase runs
+before the gate and review phases, so its commit is part of the artifact they
+inspect. The work implements `{{TASK_NAME}}`.
 
 This is a docs/agent-guidance reconciliation pass only. Do not make code changes
 unless they are strictly necessary to correct documentation generation or broken
@@ -28,4 +29,5 @@ commit. Keep the worktree clean for the next phase. If the documentation is
 already accurate, make no changes and leave the worktree clean.
 
 If you find a bug while reading, note it in your final summary (and under `## Changelog` in the task file if present)
-rather than fixing it; a code change at this point would go out unreviewed.
+rather than fixing it. Later `address` rounds may revise documentation as part
+of their reviewed fixes.

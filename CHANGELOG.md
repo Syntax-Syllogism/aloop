@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [0.6.0] - 2026-09-14
+
+### Added
+
+- **Publish attestation.** The loop records the exact reviewer-approved commit
+  SHA and refuses to publish until a gate-backed review approval covers the tree
+  being shipped. Any mutation that lands after approval is re-gated, and the
+  approval is preserved across a resumed publish/PR phase.
+- **Driver-owned publishing.** The driver, not the agent, performs the push and
+  pull-request/publish step. Publishing is bound to the configured remote,
+  retries are bounded, and PR descriptions are validated before use.
+- **GitLab publish backend.** Publishing can target GitLab in addition to
+  GitHub, selected through the publish backend configuration.
+- **Operational run commands.** `list`, `status`, `inspect`, `metrics`,
+  `cancel`, `clean`, and `doctor` inspect, cancel, clean up, and diagnose
+  persisted runs, each with `--json` output for scripting.
+- **Run budgets.** Optional `budget` ceilings (`tokens`, `usd`, `wallClockMs`)
+  are enforced cumulatively across a run, including review rounds and repairs.
+  The runner stalls at the next phase or repair boundary when a limit is
+  reached and records the usage in the manifest; budget stalls are resumable.
+- **Per-phase least privilege.** Phases declare a permission kind
+  (`read-only`, `write-worktree`, `publish`). Read-only phases run against
+  isolated source snapshots with artifact-only writes scoped to the run
+  directory.
+- **Opt-in hermetic phase execution** to isolate a phase from ambient
+  environment and network state.
+- **POSIX command shell configuration and Windows (Git Bash) support**, so runs
+  work across POSIX shells and on Windows.
+
+### Changed
+
+- Renamed the `git` phase and its prompt to `pr-description`, reflecting its
+  narrowed responsibility now that publishing is driver-owned.
+- Configuration now lints the phase order and rejects orderings that would
+  break the publish attestation boundary.
+
+### Fixed
+
+- Make the config-import cache-buster collision-proof.
+- Sync the work-item preset's verdict schema rules with the runner.
+- Handle a failed Windows timeout teardown and isolate POSIX tests from
+  Windows CI.
+
 ## [0.5.0] - 2026-09-12
 
 ### Added

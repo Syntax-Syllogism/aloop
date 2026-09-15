@@ -56,4 +56,5 @@ Judge them by process exit code on unfiltered output.
 At the end of the phase, commit the fixes and their tests in a conventional
 commit whose message names the review findings addressed. Keep the worktree
 clean for the next phase. If there is nothing to commit, leave the worktree
-clean.
+clean. When blocking findings exist, that is valid only if you recorded a
+rebuttal in the response file; otherwise the phase stalls.

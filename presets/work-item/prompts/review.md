@@ -10,7 +10,9 @@ section, creating the section at the end of the file if it is absent. Start with
 AND Time as there may be multiple rounds of code reviews. Provide a summary of your
 review and note any gaps in completion of the task.
 
-The implementation, repair, and documentation phases commit their work. The
+The implementation and documentation phases have already committed their work,
+so documentation is included in the reviewed diff. The repair phase may revise
+documentation while committing fixes or may record a written rebuttal. The
 worktree should be clean; confirm that with `git status`. Review the complete
 cumulative branch diff with `git diff {{BASE_BRANCH}}...HEAD`, including all
 new files. Review all of it, not a sample.
@@ -68,6 +70,9 @@ In addition to your notes in the task file (if present), write this JSON to
 Rules the loop enforces — violating them stalls the run:
 
 - `blocking` holds every 🔴 and 🟡 finding. `nits` holds 🟢 and 💬.
+- `blocking` and `nits` must be arrays when supplied. Each finding must be an
+  object with a non-empty `issue` or `summary` string; `file`, when included,
+  must be a string and `line`, when included, must be a number.
 - `CHANGES_REQUESTED` requires at least one entry in `blocking`.
 - `APPROVED` requires `blocking` to be empty.
 - Approve only if you would merge this as-is. If the gate status above is

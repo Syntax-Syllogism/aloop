@@ -19,6 +19,34 @@ function extractJson(text) {
   }
 }
 
+function validateFindings(list, label) {
+  list.forEach((finding, index) => {
+    const prefix = `${label}[${index}] is malformed:`;
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+      throw new Error(`${prefix} expected an object.`);
+    }
+
+    const description = finding.issue ?? finding.summary;
+    if (typeof description !== 'string' || !description.trim()) {
+      throw new Error(`${prefix} expected a non-empty issue or summary string.`);
+    }
+    if ('file' in finding && typeof finding.file !== 'string') {
+      throw new Error(`${prefix} file must be a string.`);
+    }
+    if ('line' in finding && typeof finding.line !== 'number') {
+      throw new Error(`${prefix} line must be a number.`);
+    }
+  });
+}
+
+function parseFindingList(value, label) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`${label} must be an array.`);
+  }
+  return value;
+}
+
 /**
  * Validate a verdict.
  *
@@ -33,14 +61,20 @@ export function parseVerdict(text) {
   if (![APPROVED, CHANGES_REQUESTED].includes(verdict)) {
     throw new Error(`Verdict must be ${APPROVED} or ${CHANGES_REQUESTED}, got ${JSON.stringify(data.verdict)}.`);
   }
-  const blocking = Array.isArray(data.blocking) ? data.blocking : [];
+  const blocking = parseFindingList(data.blocking, 'blocking');
+  const nits = parseFindingList(data.nits, 'nits');
+  validateFindings(blocking, 'blocking');
+  validateFindings(nits, 'nits');
   if (verdict === CHANGES_REQUESTED && blocking.length === 0) {
     throw new Error(`Verdict is ${CHANGES_REQUESTED} but lists no blocking findings.`);
+  }
+  if (verdict === APPROVED && blocking.length > 0) {
+    throw new Error(`Verdict is ${APPROVED} but lists ${blocking.length} blocking findings.`);
   }
   return {
     verdict,
     blocking,
-    nits: Array.isArray(data.nits) ? data.nits : [],
+    nits,
     summary: typeof data.summary === 'string' ? data.summary : '',
   };
 }

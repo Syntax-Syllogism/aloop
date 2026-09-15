@@ -28,6 +28,7 @@ yarn-error.log
 .DS_Store
 .idea/
 .history/
+.loop/
 
 # === private-only: AI / agent tooling ===
 AGENTS.md

@@ -6,7 +6,7 @@ export default {
     default: { name: 'claude', effort: 'high' },
     review: { name: 'codex', effort: 'high' },
   },
-  phases: ['implement', 'gate', 'review', 'address', 'docs', 'git'],
+  phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   gate: ['npm test'],
   maxRounds: 3,
   timeoutMs: 30 * 60 * 1000,

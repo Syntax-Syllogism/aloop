@@ -16,8 +16,28 @@
  * treats the result as opaque text.
  */
 
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runCommand } from './command.mjs';
+
 /** Fields worth showing for a tool call, most specific first. */
 const toolSummaryFields = ['command', 'file_path', 'pattern', 'path', 'url', 'description', 'prompt'];
+
+export const PERMISSIONS = Object.freeze({
+  READ_ONLY: 'read-only',
+  WRITE_WORKTREE: 'write-worktree',
+  PUBLISH: 'publish',
+});
+
+/** Resolve a phase permission conservatively for adapters and BYO engines. */
+export function permissionLevel(permissions) {
+  const requested = Array.isArray(permissions) ? permissions : [];
+  if (requested.includes(PERMISSIONS.READ_ONLY)) return PERMISSIONS.READ_ONLY;
+  if (requested.includes(PERMISSIONS.WRITE_WORKTREE)) return PERMISSIONS.WRITE_WORKTREE;
+  if (requested.includes(PERMISSIONS.PUBLISH)) return PERMISSIONS.PUBLISH;
+  return PERMISSIONS.READ_ONLY;
+}
 
 function condense(text, limit = 120) {
   const flat = text.replace(/\s+/g, ' ').trim();
@@ -49,6 +69,17 @@ function summarizeAgyParams(params) {
     if (typeof value === 'string' && value.trim()) return condense(value);
   }
   return '';
+}
+
+function cliVersion(command) {
+  return async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'aloop-version-'));
+    try {
+      return (await runCommand(command, ['--version'], { cwd, timeoutMs: 5000 })).stdout.trim();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  };
 }
 
 function renderClaudeBlock(block) {
@@ -141,10 +172,39 @@ export function renderAgyEvent(event) {
  */
 export function createJsonlRenderer(renderEvent) {
   let pending = '';
+  let usage = null;
+  const recordUsage = (event) => {
+    if (!event || typeof event !== 'object') return;
+    const source = event.usage ?? event.result?.usage ?? event;
+    if (!source || typeof source !== 'object') return;
+    const tokenValues = [
+      source.tokens,
+      source.total_tokens,
+      source.totalTokens,
+      source.input_tokens !== undefined && source.output_tokens !== undefined
+        ? Number(source.input_tokens) + Number(source.output_tokens)
+        : undefined,
+      source.prompt_tokens !== undefined && source.completion_tokens !== undefined
+        ? Number(source.prompt_tokens) + Number(source.completion_tokens)
+        : undefined,
+    ].filter((value) => Number.isFinite(value));
+    const cost = [event.usage, event.result?.usage, event]
+      .filter((candidate) => candidate && typeof candidate === 'object')
+      .flatMap((candidate) => [candidate.cost, candidate.total_cost, candidate.totalCost, candidate.total_cost_usd])
+      .find((value) => Number.isFinite(value));
+    if (tokenValues.length || cost !== undefined) {
+      usage = {
+        ...(tokenValues.length ? { tokens: tokenValues.at(-1) } : usage?.tokens !== undefined ? { tokens: usage.tokens } : {}),
+        ...(cost !== undefined ? { cost } : usage?.cost !== undefined ? { cost: usage.cost } : {}),
+      };
+    }
+  };
   const renderLine = (line) => {
     if (!line.trim()) return '';
     try {
-      return renderEvent(JSON.parse(line));
+      const event = JSON.parse(line);
+      recordUsage(event);
+      return renderEvent(event);
     } catch {
       return `${line}\n`;
     }
@@ -161,6 +221,9 @@ export function createJsonlRenderer(renderEvent) {
       pending = '';
       return renderLine(rest);
     },
+    usage() {
+      return usage;
+    },
   };
 }
 
@@ -171,9 +234,11 @@ export function passthroughRenderer() {
 
 const claudeAdapter = {
   name: 'claude',
+  version: cliVersion('claude'),
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-  command({ prompt, addDirs, agent = {} }) {
-    // `auto`, not `acceptEdits`: under acceptEdits a non-interactive `-p` run
+  command({ prompt, addDirs, permissions, artifactOnly = false, agent = {} }) {
+    // `auto`, not `acceptEdits`, is used for worktree-writing and
+    // artifact-only phases: under acceptEdits a non-interactive `-p` run
     // auto-denies every Bash call, because there is no one to answer the
     // prompt it raises. Phases that have to build, test, and commit then spin
     // until the timeout kills them.
@@ -181,7 +246,9 @@ const claudeAdapter = {
     // the process exits, so a phase that runs for half an hour looks identical
     // to one that has hung. stream-json emits an event per step, which
     // `createRenderer` turns back into readable lines.
-    const args = ['-p', prompt, '--permission-mode', 'auto', '--output-format', 'stream-json', '--verbose'];
+    const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
+    const permissionMode = canWrite ? 'auto' : 'plan';
+    const args = ['-p', prompt, '--permission-mode', permissionMode, '--output-format', 'stream-json', '--verbose'];
     if (agent.model) args.push('--model', agent.model);
     if (agent.effort) args.push('--effort', agent.effort);
     for (const dir of addDirs) args.push('--add-dir', dir);
@@ -192,9 +259,12 @@ const claudeAdapter = {
 
 const codexAdapter = {
   name: 'codex',
+  version: cliVersion('codex'),
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-  command({ prompt, cwd, addDirs, agent = {} }) {
-    const args = ['exec', prompt, '--sandbox', 'workspace-write', '--cd', cwd];
+  command({ prompt, cwd, addDirs, permissions, artifactOnly = false, agent = {} }) {
+    const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
+    const sandbox = canWrite ? 'workspace-write' : 'read-only';
+    const args = ['exec', prompt, '--sandbox', sandbox, '--cd', cwd];
     if (agent.model) args.push('--model', agent.model);
     if (agent.effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(agent.effort)}`);
     for (const dir of addDirs) args.push('--add-dir', dir);
@@ -204,8 +274,9 @@ const codexAdapter = {
 
 const agyAdapter = {
   name: 'agy',
+  version: cliVersion('agy'),
   efforts: ['low', 'medium', 'high'],
-  command({ prompt, addDirs, timeoutMs, agent = {} }) {
+  command({ prompt, addDirs, timeoutMs, permissions, artifactOnly = false, agent = {} }) {
     // `--dangerously-skip-permissions`, not bare `accept-edits`: in headless
     // `--print` mode agy cannot prompt for the `command` permission its Bash-
     // style tools need, so it auto-denies the first one and exits 0 having done
@@ -218,12 +289,13 @@ const agyAdapter = {
     // from a hang (the run log shows only the header). stream-json emits an
     // event per step, which `createRenderer` turns back into readable lines —
     // same reasoning as the claude adapter above.
+    const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const args = [
       '--print', prompt,
-      '--mode', 'accept-edits',
-      '--dangerously-skip-permissions',
+      '--mode', canWrite ? 'accept-edits' : 'plan',
       '--output-format', 'stream-json',
     ];
+    if (canWrite) args.splice(4, 0, '--dangerously-skip-permissions');
     if (agent.model) args.push('--model', agent.model);
     if (agent.effort) args.push('--effort', agent.effort);
     if (timeoutMs) args.push('--print-timeout', `${Math.ceil(timeoutMs / 1000)}s`);
@@ -244,6 +316,9 @@ function validateConfiguredAdapter(name, adapter) {
   }
   if (adapter.createRenderer !== undefined && typeof adapter.createRenderer !== 'function') {
     throw new Error(`Invalid adapter "${name}": createRenderer must be a function.`);
+  }
+  if (adapter.version !== undefined && typeof adapter.version !== 'function') {
+    throw new Error(`Invalid adapter "${name}": version must be a function.`);
   }
   return adapter;
 }

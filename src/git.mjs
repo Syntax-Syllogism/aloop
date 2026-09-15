@@ -18,6 +18,10 @@ export class GitFacade {
     return this.output(['rev-parse', '--show-toplevel']);
   }
 
+  async commonDir() {
+    return this.output(['rev-parse', '--git-common-dir']);
+  }
+
   async currentBranch() {
     return this.output(['symbolic-ref', '--quiet', '--short', 'HEAD']);
   }
@@ -32,6 +36,24 @@ export class GitFacade {
 
   async isDirty() {
     return Boolean(await this.status());
+  }
+
+  async push(remote, branch, { setUpstream = true, ...options } = {}) {
+    return this.run([
+      'push',
+      ...(setUpstream ? ['--set-upstream'] : []),
+      remote,
+      branch,
+    ], options);
+  }
+
+  async lsRemote(remote, branch, options = {}) {
+    const output = await this.output(['ls-remote', remote, `refs/heads/${branch}`], options);
+    const sha = output.split(/\s+/)[0];
+    if (!/^[0-9a-f]{40}$/i.test(sha)) {
+      throw new Error(`Remote branch ${remote}/${branch} has no resolvable SHA.`);
+    }
+    return sha;
   }
 
   async localBranchExists(branch) {
@@ -49,6 +71,10 @@ export class GitFacade {
 
   async remoteExists(remote) {
     return (await this.remotes()).includes(remote);
+  }
+
+  async remoteUrl(remote) {
+    return this.output(['remote', 'get-url', remote]);
   }
 
   async defaultRemote() {
