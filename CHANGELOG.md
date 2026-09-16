@@ -183,6 +183,12 @@ History from before the standalone extraction (changesets format), preserved for
   - Prompts ship with the package and are overridable per phase from
     `.loop/prompts/` in the consuming project.
 
+## [0.6.2] - 2026-09-16
+
+### Fixed
+
+- Resolve Windows executables to correct on-disk casing
+
 ## [0.5.2] - 2026-09-13
 
 ### Changed

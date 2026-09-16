@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { win32 as windowsPath } from 'node:path';
 
 export function signalProcessGroup(pid, signal, {
@@ -63,7 +63,10 @@ function environmentValue(env, name) {
   return key ? env[key] : undefined;
 }
 
-export function resolveWindowsExecutable(command, env = process.env, { fileExists = existsSync } = {}) {
+export function resolveWindowsExecutable(command, env = process.env, {
+  fileExists = existsSync,
+  realPath = realpathSync.native,
+} = {}) {
   const pathEntries = (environmentValue(env, 'PATH') ?? '').split(';').filter(Boolean);
   const pathExtensions = (environmentValue(env, 'PATHEXT') ?? WINDOWS_EXECUTABLE_EXTENSIONS.join(';'))
     .split(';')
@@ -76,7 +79,18 @@ export function resolveWindowsExecutable(command, env = process.env, { fileExist
   for (const base of bases) {
     for (const extension of extensions) {
       const candidate = `${base}${extension}`;
-      if (fileExists(candidate)) return candidate;
+      // Candidates are assembled from PATHEXT, which is upper-cased by convention
+      // (".EXE"), while the file on disk is usually "git.exe". existsSync matches
+      // case-insensitively, so a match here would otherwise be handed to spawn with
+      // the wrong casing — which fails with ENOENT under Git Bash / MSYS. Canonicalize
+      // to the real on-disk path so spawn receives the name that actually exists.
+      if (fileExists(candidate)) {
+        try {
+          return realPath(candidate);
+        } catch {
+          return candidate;
+        }
+      }
     }
   }
   return null;

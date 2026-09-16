@@ -42,6 +42,36 @@ test('Windows executable resolution searches PATH in PATHEXT order', () => {
   ]);
 });
 
+test('Windows executable resolution canonicalizes the matched path to its real on-disk casing', () => {
+  const resolved = resolveWindowsExecutable(
+    'git',
+    { PATH: 'C:\\Program Files\\Git\\cmd', PATHEXT: '.EXE;.CMD' },
+    {
+      // existsSync matches case-insensitively, so the upper-cased ".EXE" candidate hits.
+      fileExists: (candidate) => candidate === 'C:\\Program Files\\Git\\cmd\\git.EXE',
+      // realpathSync.native reports the actual casing stored on disk.
+      realPath: () => 'C:\\Program Files\\Git\\cmd\\git.exe',
+    },
+  );
+
+  assert.equal(resolved, 'C:\\Program Files\\Git\\cmd\\git.exe');
+});
+
+test('Windows executable resolution falls back to the matched candidate when realpath fails', () => {
+  const resolved = resolveWindowsExecutable(
+    'git',
+    { PATH: 'C:\\Program Files\\Git\\cmd', PATHEXT: '.EXE' },
+    {
+      fileExists: (candidate) => candidate === 'C:\\Program Files\\Git\\cmd\\git.EXE',
+      realPath: () => {
+        throw Object.assign(new Error('nope'), { code: 'ENOENT' });
+      },
+    },
+  );
+
+  assert.equal(resolved, 'C:\\Program Files\\Git\\cmd\\git.EXE');
+});
+
 test('runCommand wraps Windows command shims and leaves POSIX commands unchanged', async () => {
   const calls = [];
   const child = fakeChild();
