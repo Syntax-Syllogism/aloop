@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseLoopArgs } from '../bin/loop.mjs';
 import { defaults, normalizePhases, loadConfig, loadRunsDir } from '../src/config.mjs';
-import { adapterFor, agentForPhase, createJsonlRenderer, engineForPhase, renderAgyEvent, renderClaudeEvent } from '../src/adapters.mjs';
+import { adapterFor, agentForPhase, createJsonlRenderer, engineForPhase, renderAgyEvent, renderClaudeEvent, renderGeminiEvent } from '../src/adapters.mjs';
 import { interpolate, packagePrompts, renderPrompt } from '../src/prompts.mjs';
 import { parseVerdict, formatFindings } from '../src/verdict.mjs';
 import { hashConfig, hashText } from '../src/manifest.mjs';
@@ -1079,13 +1079,13 @@ test('adapters place the prompt and every extra directory on the command line', 
   const request = {
     prompt: 'do it', cwd: '/w', addDirs: ['/runs', '/wiki'], timeoutMs: 60000, permissions: ['write-worktree'],
   };
-  for (const engine of ['claude', 'codex', 'agy']) {
+  for (const engine of ['claude', 'codex', 'agy', 'gemini']) {
     const { command, args } = adapterFor(engine).command(request);
     assert.equal(command, engine);
     assert.ok(args.includes('do it'), `${engine} passes the prompt`);
     assert.ok(args.includes('/runs') && args.includes('/wiki'), `${engine} passes add-dirs`);
   }
-  assert.throws(() => adapterFor('gpt'), /Unsupported engine "gpt".*claude, codex, agy/);
+  assert.throws(() => adapterFor('gpt'), /Unsupported engine "gpt".*claude, codex, agy, gemini/);
 });
 
 test('configured adapters override built-ins and unknown errors list configured names', () => {
@@ -1093,7 +1093,7 @@ test('configured adapters override built-ins and unknown errors list configured 
   assert.equal(adapterFor('claude', { claude: customClaude }), customClaude);
   assert.throws(
     () => adapterFor('missing', { mytool: customClaude }),
-    /Unsupported engine "missing".*claude, codex, agy, mytool/,
+    /Unsupported engine "missing".*claude, codex, agy, gemini, mytool/,
   );
 });
 
@@ -1135,6 +1135,10 @@ test('built-in adapters map read-only permissions to their safest modes', () => 
   const agy = adapterFor('agy').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['read-only'] }).args;
   assert.equal(agy[agy.indexOf('--mode') + 1], 'plan');
   assert.equal(agy.includes('--dangerously-skip-permissions'), false);
+
+  const gemini = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['read-only'] }).args;
+  assert.equal(gemini[gemini.indexOf('--approval-mode') + 1], 'plan');
+  assert.equal(gemini.includes('yolo'), false);
 });
 
 test('built-in adapters scope artifact-only writes away from the worktree', () => {
@@ -1162,6 +1166,12 @@ test('built-in adapters scope artifact-only writes away from the worktree', () =
   assert.ok(agy.includes('--dangerously-skip-permissions'));
   assert.ok(agy.includes('/source-snapshot'));
   assert.equal(agy.includes('/worktree/example'), false);
+
+  const gemini = adapterFor('gemini').command(request).args;
+  assert.equal(gemini[gemini.indexOf('--approval-mode') + 1], 'yolo');
+  assert.ok(gemini.includes('--skip-trust'));
+  assert.ok(gemini.includes('/source-snapshot'));
+  assert.equal(gemini.includes('/worktree/example'), false);
 });
 
 test('a native Codex artifact-only review isolates source reads from worktree writes', async () => {
@@ -1368,6 +1378,73 @@ test('the agy renderer turns stream events into readable progress lines', () => 
   );
   // The enormous init tool list and user-input steps render as nothing.
   assert.equal(renderAgyEvent({ event: 'step_update', step_update: { step_type: 'user_input', state: 'DONE' } }), '');
+});
+
+test('the gemini adapter trusts the workspace, auto-approves tools, and streams', () => {
+  const args = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['write-worktree'] }).args;
+  // Headless gemini cannot answer a permission prompt, so a worktree-writing
+  // phase needs yolo to auto-approve the shell tools that build/test/commit.
+  assert.equal(args[args.indexOf('--approval-mode') + 1], 'yolo', 'auto-approves tools in headless mode');
+  // A fresh worktree is untrusted; without this gemini refuses to run and does nothing.
+  assert.ok(args.includes('--skip-trust'), 'trusts the untrusted worktree for this run');
+  // Default `text` output buffers every byte until exit — a working multi-minute
+  // phase then looks identical to a hang.
+  assert.ok(args.includes('--output-format') && args.includes('stream-json'), 'streams events');
+  assert.equal(args.includes('text'), false, 'text output withholds every byte until exit');
+});
+
+test('the gemini adapter passes a configured model and never emits an effort flag', () => {
+  const args = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], agent: { model: 'gemini-3-pro', effort: 'high' } }).args;
+  assert.ok(args.includes('--model') && args.includes('gemini-3-pro'));
+  // Gemini CLI has no effort flag; a configured effort is silently ignored.
+  assert.equal(args.includes('--effort'), false);
+  assert.equal(args.includes('high'), false);
+});
+
+test('the gemini renderer turns real stream events into readable progress lines', () => {
+  // Event shapes below match the Gemini CLI headless emitter (init, message,
+  // tool_use, tool_result, error, result); see renderGeminiEvent's doc comment.
+  assert.equal(
+    renderGeminiEvent({ type: 'init', session_id: 'ca1237fb-71fc-43e3', model: 'auto' }),
+    '  · session ca1237fb model auto\n',
+  );
+  // Assistant text streams as deltas, passed through verbatim (no forced newline).
+  assert.equal(
+    renderGeminiEvent({ type: 'message', role: 'assistant', content: 'all done', delta: true }),
+    'all done',
+  );
+  // The user turn is the prompt aloop already wrote; echoing it back is noise.
+  assert.equal(renderGeminiEvent({ type: 'message', role: 'user', content: 'do it' }), '');
+  // A tool call surfaces the tool and its most descriptive parameter.
+  assert.equal(
+    renderGeminiEvent({ type: 'tool_use', tool_name: 'run_shell_command', tool_id: 'call-1', parameters: { command: 'npm  test' } }),
+    '  → run_shell_command npm test\n',
+  );
+  // A failed tool result is surfaced; a successful one is not (its output is huge).
+  assert.equal(
+    renderGeminiEvent({ type: 'tool_result', tool_id: 'call-1', status: 'error', error: { type: 'TOOL_EXECUTION_ERROR', message: 'boom' } }),
+    '  ✗ boom\n',
+  );
+  assert.equal(renderGeminiEvent({ type: 'tool_result', tool_id: 'call-2', status: 'success', output: 'ok' }), '');
+  // Non-fatal warnings and system errors stay visible so a stall is not silent.
+  assert.equal(renderGeminiEvent({ type: 'error', severity: 'warning', message: 'Agent execution blocked' }), '  ⚠ Agent execution blocked\n');
+  assert.equal(renderGeminiEvent({ type: 'error', severity: 'error', message: 'quota exhausted' }), '  ✗ quota exhausted\n');
+  assert.equal(
+    renderGeminiEvent({ type: 'result', status: 'success', stats: { tool_calls: 1, duration_ms: 1960 } }),
+    '  ✓ done 1 tool call 2s\n',
+  );
+  assert.equal(
+    renderGeminiEvent({ type: 'result', status: 'error', error: { message: 'invalid model' } }),
+    '  ✗ error: invalid model\n',
+  );
+  // An unrecognized event renders as nothing rather than raw JSON.
+  assert.equal(renderGeminiEvent({ type: 'thinking', content: 'hmm' }), '');
+});
+
+test('the jsonl renderer captures Gemini token counts reported under result stats', () => {
+  const renderer = createJsonlRenderer(renderGeminiEvent);
+  renderer.write('{"type":"result","status":"success","stats":{"total_tokens":42,"input_tokens":30,"output_tokens":12}}\n');
+  assert.deepEqual(renderer.usage(), { tokens: 42 });
 });
 
 test('the jsonl renderer reassembles events split across chunks and passes plain text through', () => {

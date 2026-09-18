@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Gemini engine.** `gemini` joins `claude`, `codex`, and `agy` as a built-in
+  engine. Any phase can run on the Gemini CLI via `engines.*.name = 'gemini'` or
+  `--engine gemini`. Headless phases run with `--approval-mode` (`plan` when
+  read-only, `yolo` when writing), `--skip-trust` so a fresh worktree is
+  trusted, and `--output-format stream-json` so long phases stay watchable.
+  Gemini has no reasoning-effort flag, so a configured `effort` is ignored for
+  it.
+
+## [0.7.0] - 2026-09-18
+
+### Added
+
+- Gemini is now available as a built-in engine
+
 ## [0.6.0] - 2026-09-14
 
 ### Added

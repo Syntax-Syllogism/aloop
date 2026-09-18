@@ -115,7 +115,7 @@ export function usage() {
     '  -n, --name <slug>       Explicit run identity/slug',
     '  -b, --branch <name>     Branch to build on (default: <branchPrefix><name>)',
     '      --base-branch <branch>  Base to branch from and PR against (default: baseBranch config)',
-    '  -e, --engine <name>     Default engine: claude | codex | agy',
+    '  -e, --engine <name>     Default engine: claude | codex | agy | gemini',
     '      --override-engine   With --resume and --engine, replace saved agent executables',
     '      --config <path>     Load loop configuration from this file (also overrides saved config on resume)',
     '      --phases a,b,c      Override the configured phase list',

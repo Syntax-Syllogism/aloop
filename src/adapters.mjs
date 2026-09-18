@@ -71,6 +71,24 @@ function summarizeAgyParams(params) {
   return '';
 }
 
+/**
+ * Summarize a Gemini tool call's parameters.
+ *
+ * Gemini's built-in tools use the descriptive keys the shared summarizer already
+ * knows (`command`, `file_path`, `path`, `pattern`, `url`, …); an MCP tool may
+ * use anything, so fall back to the first string value — robust to tools this
+ * list has never seen, the same shape as `summarizeAgyParams`.
+ */
+function summarizeGeminiParams(params) {
+  if (!params || typeof params !== 'object') return '';
+  const known = summarizeToolInput(params);
+  if (known) return known;
+  for (const value of Object.values(params)) {
+    if (typeof value === 'string' && value.trim()) return condense(value);
+  }
+  return '';
+}
+
 function cliVersion(command) {
   return async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'aloop-version-'));
@@ -164,6 +182,63 @@ export function renderAgyEvent(event) {
 }
 
 /**
+ * Turn one Gemini stream-json event into the line a watching human wants.
+ *
+ * Gemini tags each event with `type` (like Claude, unlike agy's `event`). The
+ * headless stream emits `init` (session), `message` (user/assistant turns —
+ * assistant text streams as deltas), `tool_use` (a tool the model invoked, with
+ * `tool_name`/`parameters`), `tool_result` (its outcome, `status` success|error
+ * with an `error.message`), `error` (non-fatal warnings and system errors), and
+ * `result` (final status, token counts under `stats`). Tool activity and tool
+ * or system failures are surfaced so a long phase stays watchable; a successful
+ * tool result is not — its full output would bury the log, exactly as the
+ * claude and agy renderers omit theirs. An unrecognized shape renders as nothing
+ * rather than raw JSON, so the enormous init payload and any event a future
+ * release adds stay out of the log.
+ */
+export function renderGeminiEvent(event) {
+  if (event.type === 'init') {
+    const id = String(event.session_id ?? '').slice(0, 8);
+    const model = event.model;
+    return `  · session ${id}${model ? ` model ${model}` : ''}\n`;
+  }
+  if (event.type === 'message') {
+    // Assistant text arrives as deltas; stream them through verbatim. The user
+    // turn is the prompt aloop already wrote, so echoing it back is noise.
+    if (event.role !== 'assistant' || typeof event.content !== 'string') return '';
+    return event.content;
+  }
+  if (event.type === 'tool_use') {
+    const detail = summarizeGeminiParams(event.parameters);
+    return `  → ${event.tool_name ?? 'tool'}${detail ? ` ${detail}` : ''}\n`;
+  }
+  if (event.type === 'tool_result') {
+    // Only failures are worth a line; a successful result's `output` is the
+    // tool's full stdout and belongs in the phase's files, not the run log.
+    if (event.status !== 'error') return '';
+    const message = event.error?.message ?? event.output ?? 'tool call failed';
+    return `  ✗ ${condense(String(message), 160)}\n`;
+  }
+  if (event.type === 'error') {
+    // Non-fatal warnings and system errors — a warning is marked, not dropped,
+    // so a stall or a blocked turn is visible while the phase runs.
+    const mark = event.severity === 'warning' ? '⚠' : '✗';
+    return `  ${mark} ${condense(String(event.message ?? 'error'), 160)}\n`;
+  }
+  if (event.type === 'result') {
+    const stats = event.stats ?? {};
+    const calls = stats.tool_calls ? ` ${stats.tool_calls} tool call${stats.tool_calls === 1 ? '' : 's'}` : '';
+    const seconds = stats.duration_ms ? ` ${Math.round(stats.duration_ms / 1000)}s` : '';
+    if (event.status && event.status !== 'success') {
+      const why = event.error?.message ? `: ${condense(String(event.error.message), 160)}` : '';
+      return `  ✗ ${String(event.status).toLowerCase()}${why}${calls}${seconds}\n`;
+    }
+    return `  ✓ done${calls}${seconds}\n`;
+  }
+  return '';
+}
+
+/**
  * Line-buffer a JSONL stream and render each complete event.
  *
  * Chunks split mid-line, so the tail is held until its newline arrives. A line
@@ -175,7 +250,9 @@ export function createJsonlRenderer(renderEvent) {
   let usage = null;
   const recordUsage = (event) => {
     if (!event || typeof event !== 'object') return;
-    const source = event.usage ?? event.result?.usage ?? event;
+    // Gemini reports token counts under `stats` rather than `usage`; check it
+    // before falling back to the event itself so its totals are not lost.
+    const source = event.usage ?? event.result?.usage ?? event.stats ?? event.result?.stats ?? event;
     if (!source || typeof source !== 'object') return;
     const tokenValues = [
       source.tokens,
@@ -305,7 +382,43 @@ const agyAdapter = {
   createRenderer: () => createJsonlRenderer(renderAgyEvent),
 };
 
-const adapters = { claude: claudeAdapter, codex: codexAdapter, agy: agyAdapter };
+const geminiAdapter = {
+  name: 'gemini',
+  version: cliVersion('gemini'),
+  // Gemini CLI exposes no reasoning-effort flag, so this adapter declares no
+  // `efforts`: a configured effort is simply not passed through (see docs).
+  command({ prompt, addDirs, permissions, artifactOnly = false, agent = {} }) {
+    // `yolo`, not `plan`/`auto_edit`: in headless `--prompt` mode Gemini cannot
+    // interactively approve the shell tools a worktree-writing phase needs to
+    // build, test, and commit. `plan` is read-only and `auto_edit` auto-approves
+    // only edit tools, so either one auto-denies the first shell call and the
+    // phase "completes" instantly with an empty log. `yolo` auto-approves every
+    // tool — Gemini's equivalent of the claude adapter's `--permission-mode
+    // auto` and agy's `--dangerously-skip-permissions`.
+    //
+    // `--skip-trust`: a fresh worktree is an untrusted folder, and Gemini
+    // refuses to run headlessly in one (it prints a trust warning and does
+    // nothing). This trusts the workspace for this one invocation only.
+    //
+    // stream-json, not the default `text`: text output withholds every byte
+    // until the process exits, so a multi-minute phase is indistinguishable from
+    // a hang. stream-json emits an event per step, which `createRenderer` turns
+    // back into readable lines — same reasoning as the claude adapter above.
+    const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
+    const args = [
+      '--prompt', prompt,
+      '--approval-mode', canWrite ? 'yolo' : 'plan',
+      '--skip-trust',
+      '--output-format', 'stream-json',
+    ];
+    if (agent.model) args.push('--model', agent.model);
+    for (const dir of addDirs) args.push('--include-directories', dir);
+    return { command: 'gemini', args };
+  },
+  createRenderer: () => createJsonlRenderer(renderGeminiEvent),
+};
+
+const adapters = { claude: claudeAdapter, codex: codexAdapter, agy: agyAdapter, gemini: geminiAdapter };
 
 function validateConfiguredAdapter(name, adapter) {
   if (!adapter || typeof adapter !== 'object' || Array.isArray(adapter) || typeof adapter.command !== 'function') {

@@ -85,9 +85,10 @@ export default {
 };
 ```
 
-Supported built-in engines are `claude`, `codex`, and `agy`. The corresponding
-CLI must already be installed and authenticated. Engine descriptors may include
-an engine-specific `model` and `effort`. `--config` selects a configuration
+Supported built-in engines are `claude`, `codex`, `agy`, and `gemini`. The
+corresponding CLI must already be installed and authenticated. Engine
+descriptors may include an engine-specific `model` and `effort` (Gemini has no
+effort tier, so a configured `effort` is ignored for it). `--config` selects a configuration
 file outside the current repository; command-line phase and round options take
 precedence.
 

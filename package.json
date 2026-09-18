@@ -1,6 +1,6 @@
 {
   "name": "@syntax-syllogism/aloop",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Syntax & Syllogism agentic loop runner.",
   "type": "module",
   "exports": {
@@ -31,6 +31,7 @@
     "claude",
     "codex",
     "antigravity",
+    "gemini",
     "opencode",
     "cli"
   ],

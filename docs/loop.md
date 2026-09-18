@@ -42,7 +42,7 @@ earned it.
   -n, --name <slug>       Explicit run identity/slug
   -b, --branch <name>     Branch to build on (default: <branchPrefix><name>)
       --base-branch <branch>  Base to branch from and PR against (default: baseBranch config)
-  -e, --engine <name>     Default engine: claude | codex | agy
+  -e, --engine <name>     Default engine: claude | codex | agy | gemini
       --override-engine   With --resume and --engine, replace saved agent executables
       --config <path>     Load loop configuration from this file
       --phases a,b,c      Override the configured phase list
@@ -191,6 +191,7 @@ starts:
 | `claude` | `--model` | `--effort` | `low`, `medium`, `high`, `xhigh`, `max` |
 | `codex` | `--model` | `-c model_reasoning_effort=…` | `low`, `medium`, `high`, `xhigh`, `max` |
 | `agy` | `--model` | `--effort` | `low`, `medium`, `high` |
+| `gemini` | `--model` | — | none (Gemini CLI has no effort flag; a configured `effort` is ignored) |
 | configured adapter name | adapter-defined | adapter-defined | adapter's `efforts`, or any value when omitted |
 
 The `adapters` map registers additional engines without changing the package.
@@ -253,7 +254,8 @@ and run shell commands. Include its auto-approve and writable-directory flags
 in `command`; otherwise a phase can wait for input until the timeout.** The
 runner cannot verify those vendor-specific flags. The built-ins use equivalent
 headless permissions: Claude `--permission-mode auto`, Codex
-`--sandbox workspace-write`, and agy `--dangerously-skip-permissions`.
+`--sandbox workspace-write`, agy `--dangerously-skip-permissions`, and Gemini
+`--approval-mode yolo` with `--skip-trust`.
 
 The verdict contract remains file-based: the engine only needs to execute the
 prompt and write the files requested by it. A resumed run re-reads adapters from
@@ -379,14 +381,16 @@ The runner passes `permissions`, `artifactOnly`, a permission-filtered
 an agent adapter. For artifact-only invocations, built-in
 adapters use their write-capable headless mode with the run directory as the
 working root: Claude `--permission-mode auto`, Codex `--sandbox workspace-write`,
-and agy `--mode accept-edits` with `--dangerously-skip-permissions`. This keeps
+agy `--mode accept-edits` with `--dangerously-skip-permissions`, and Gemini
+`--approval-mode yolo` with `--skip-trust`. This keeps
 required verdict, review, and PR-description files writable without making the
 worktree the process working directory. A custom adapter that does not consume
 `readOnlyDirs` still starts in the run directory and receives only artifact
 directories, which is the conservative default; its process remains subject
 to the driver's post-review tree check. `write-worktree` maps to Claude
-`--permission-mode auto`, Codex `--sandbox workspace-write`, and agy's
-`--mode accept-edits` with `--dangerously-skip-permissions`. Vendor-specific
+`--permission-mode auto`, Codex `--sandbox workspace-write`, agy's
+`--mode accept-edits` with `--dangerously-skip-permissions`, and Gemini's
+`--approval-mode yolo` with `--skip-trust`. Vendor-specific
 custom adapters must map the permission request to their own sandbox and
 approval flags; aloop cannot verify those flags.
 
