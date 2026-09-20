@@ -57,6 +57,19 @@ async function clearPendingRepair(phase, state) {
   await state.record({ pendingRepairs });
 }
 
+function requiresCommitBaseline(phase) {
+  return hasPostcondition(phase, 'head-advanced') || hasPostcondition(phase, 'head-advanced-or-rebuttal');
+}
+
+async function phaseHeadBefore(phase, ctx) {
+  if (ctx.dryRun) return null;
+  if (requiresCommitBaseline(phase)) {
+    return ctx.state.baselineFor(phase.name, () => ctx.git.revParse());
+  }
+  if (hasPostcondition(phase, 'head-unchanged')) return ctx.git.revParse();
+  return null;
+}
+
 async function invalidateGateCompletion(state, reviewedSha) {
   const gate = state.manifest.entries.findLast((entry) => entry.role === 'gate'
     && entry.status === 'completed'
@@ -65,25 +78,32 @@ async function invalidateGateCompletion(state, reviewedSha) {
   await state.record({ completed: state.data.completed.filter((name) => name !== gate.phase) });
 }
 
+function phaseAndRepairNames(phase) {
+  return [phase.name, ...(phase.repair ?? []).flatMap(phaseAndRepairNames)];
+}
+
 async function invalidateFollowingPhaseState(state, phases, phaseName) {
   const phaseIndex = phases.findIndex((phase) => phase.name === phaseName);
-  const followingNames = new Set(phases.slice(phaseIndex + 1).map((phase) => phase.name));
-  if (!followingNames.size) return;
+  if (phaseIndex < 0) return;
+  const invalidatedNames = new Set(phases.slice(phaseIndex).flatMap(phaseAndRepairNames));
 
-  const completed = state.data.completed.filter((name) => !followingNames.has(name));
+  const completed = state.data.completed.filter((name) => !invalidatedNames.has(name));
   const phaseState = Object.fromEntries(
-    Object.entries(state.data.phases ?? {}).filter(([name]) => !followingNames.has(name)),
+    Object.entries(state.data.phases ?? {}).filter(([name]) => !invalidatedNames.has(name)),
   );
   const pendingRepairs = Object.fromEntries(
-    Object.entries(state.data.pendingRepairs ?? {}).filter(([name]) => !followingNames.has(name)),
+    Object.entries(state.data.pendingRepairs ?? {}).filter(([name]) => !invalidatedNames.has(name)),
   );
   const rounds = Object.fromEntries(
-    Object.entries(state.data.rounds ?? {}).filter(([name]) => !followingNames.has(name)),
+    Object.entries(state.data.rounds ?? {}).filter(([name]) => !invalidatedNames.has(name)),
   );
   const reviewedShas = Object.fromEntries(
-    Object.entries(state.data.reviewedShas ?? {}).filter(([name]) => !followingNames.has(name)),
+    Object.entries(state.data.reviewedShas ?? {}).filter(([name]) => !invalidatedNames.has(name)),
   );
-  await state.record({ completed, phases: phaseState, pendingRepairs, rounds, reviewedShas });
+  const phaseBaselines = Object.fromEntries(
+    Object.entries(state.data.phaseBaselines ?? {}).filter(([name]) => !invalidatedNames.has(name)),
+  );
+  await state.record({ completed, phases: phaseState, pendingRepairs, rounds, reviewedShas, phaseBaselines });
 }
 
 async function runRepairs(phase, ctx, baseVariables, pending, operations, { retainCheckpoint = false } = {}) {
@@ -131,9 +151,35 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations, { reta
         }));
       }
     } else {
-      const headBefore = !ctx.dryRun && (hasPostcondition(repair, 'head-advanced') || hasPostcondition(repair, 'head-advanced-or-rebuttal'))
-        ? await ctx.git.revParse()
-        : null;
+      const headBefore = await phaseHeadBefore(repair, ctx);
+      const forceNotedRepair = ctx.resume && ctx.note?.targetPhase === phase.name;
+      if (!ctx.dryRun && ctx.resume && requiresCommitBaseline(repair) && !forceNotedRepair) {
+        const stalledReason = await codePhasePostcondition(repair, ctx, {
+          hasFindings: pending.verdict?.blocking?.length > 0,
+          headBefore,
+          round: pending.round,
+        });
+        if (!stalledReason) {
+          const outputSha = await ctx.git.revParse();
+          const responsePath = join(ctx.state.dir, `response-round-${pending.round}.md`);
+          await recordManifest(ctx, manifestEntry(repair, ctx, {
+            inputSha: headBefore,
+            outputSha,
+            round: pending.round,
+            artifacts: [
+              ...(await fileExists(responsePath) ? [`response-round-${pending.round}.md`] : []),
+            ],
+            status: 'completed',
+          }));
+          await ctx.state.record({
+            pendingRepairs: {
+              ...ctx.state.data.pendingRepairs,
+              [phase.name]: { ...pending, nextRepair: index + 1 },
+            },
+          });
+          continue;
+        }
+      }
       const repairCtx = ctx.note?.targetPhase === phase.name
         ? { ...ctx, note: { ...ctx.note, repairPhase: repair.name } }
         : ctx;
@@ -616,8 +662,22 @@ export async function runPhases({
       await state.markComplete(phase.name, { rounds: result.rounds });
       continue;
     }
-    const headBefore = !ctx.dryRun && (hasPostcondition(phase, 'head-advanced') || hasPostcondition(phase, 'head-advanced-or-rebuttal') || hasPostcondition(phase, 'head-unchanged'))
-      ? await ctx.git.revParse() : null;
+    const headBefore = await phaseHeadBefore(phase, ctx);
+    if (!ctx.dryRun && args.resume && requiresCommitBaseline(phase) && !forceNotedPhase) {
+      const stalledReason = await codePhasePostcondition(phase, ctx, { headBefore });
+      if (!stalledReason) {
+        const outputSha = await ctx.git.revParse();
+        log(`  ${phase.name} already satisfies its commit postcondition; skipping agent on resume`);
+        await recordManifest(ctx, manifestEntry(phase, ctx, {
+          inputSha: headBefore,
+          outputSha,
+          status: 'completed',
+        }));
+        await state.markComplete(phase.name);
+        summary.phases.push({ name: phase.name, ok: true });
+        continue;
+      }
+    }
     const result = await withRetries(phase, () => runAgent(phase, ctx, variables));
     const stalledReason = await codePhasePostcondition(phase, ctx, { headBefore });
     if (stalledReason) {

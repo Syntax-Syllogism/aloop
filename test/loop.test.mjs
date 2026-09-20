@@ -794,7 +794,7 @@ if (attempt < 2) process.exit(1);
 });
 
 test('a verdict phase honors retry.maxAttempts independently of maxRounds', async () => {
-const verdictScript = `
+  const verdictScript = `
 const fs = require('node:fs');
 const path = require('node:path');
 const prompt = process.argv[1];
@@ -914,14 +914,15 @@ esac
 });
 
 test('a verdict retry cannot consume an artifact from a failed attempt', async () => {
-  const verdictScript = `
+const verdictScript = `
 const fs = require('node:fs');
+const { dirname, join } = require('node:path');
 const prompt = process.argv[1];
-const path = 'verdict-attempts';
+const verdictPath = prompt.match(/write this JSON to \`([^\`]+)\`/)[1];
+const path = join(dirname(verdictPath), 'verdict-attempts');
 const attempt = fs.existsSync(path) ? Number(fs.readFileSync(path, 'utf8')) + 1 : 1;
 fs.writeFileSync(path, String(attempt));
 if (attempt === 1) {
-  const verdictPath = prompt.match(/write this JSON to \`([^\`]+)\`/)[1];
   fs.writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [] }));
   process.exit(1);
 }
@@ -1221,7 +1222,8 @@ if (addDirs.includes(worktree)) {
 if (!addDirs.includes(sourceDir) || sourceDir === worktree) process.exit(4);
 writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [] }));
 writeFileSync(join(runDir, 'review-round-1.md'), 'review complete\\n');
-writeFileSync('README.md', 'artifact cwd\\n');
+writeFileSync(join(runDir, 'README.md'), 'artifact cwd\\n');
+writeFileSync(join(runDir, 'custom-cwd.txt'), process.cwd());
 writeFileSync(join(runDir, 'source-read.md'), readFileSync(join(sourceDir, 'README.md')));
 if (addDirs.includes(taskDir)) appendFileSync(taskFile, '\\n## Code Review\\n\\nReview complete.\\n');
 ` , { mode: 0o755 });
@@ -1247,6 +1249,9 @@ if (addDirs.includes(taskDir)) appendFileSync(taskFile, '\\n## Code Review\\n\\n
   assert.equal(summary.stalled, null);
   assert.equal(await readFile(join(root, 'README.md'), 'utf8'), '# fixture\n');
   assert.equal(await readFile(join(summary.runDir, 'README.md'), 'utf8'), 'artifact cwd\n');
+  const reviewCwd = (await readFile(join(summary.runDir, 'custom-cwd.txt'), 'utf8')).trim();
+  assert.notEqual(reviewCwd, summary.runDir);
+  assert.match(reviewCwd, /aloop-source-[^/]+\/repo$/);
   assert.equal(await readFile(join(summary.runDir, 'review-round-1.md'), 'utf8'), 'review complete\n');
   assert.equal(await readFile(join(summary.runDir, 'source-read.md'), 'utf8'), '# fixture\n');
   assert.match(await readFile(workItem, 'utf8'), /## Code Review/);
@@ -1264,7 +1269,7 @@ test('a native Codex pr-description phase does not receive the external task-fil
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   await writeFile(join(binDir, 'codex'), `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const args = process.argv.slice(2);
 if (args[0] === '--version') process.exit(0);
@@ -1280,6 +1285,7 @@ if (addDirs.includes(taskDir)) {
   writeFileSync(taskDir + '/native-task-file-write.txt', 'must be denied');
   process.exit(3);
 }
+writeFileSync(join(dirname(prPath), 'custom-cwd.txt'), process.cwd());
 writeFileSync(prPath, 'Title: fixture pr\\n\\nBody text.\\n');
 `, { mode: 0o755 });
 
@@ -1299,10 +1305,13 @@ writeFileSync(prPath, 'Title: fixture pr\\n\\nBody text.\\n');
 
   assert.equal(summary.stalled, null);
   assert.equal(await readFile(join(summary.runDir, 'pr.md'), 'utf8'), 'Title: fixture pr\n\nBody text.\n');
+  const descriptionCwd = (await readFile(join(summary.runDir, 'custom-cwd.txt'), 'utf8')).trim();
+  assert.notEqual(descriptionCwd, summary.runDir);
+  assert.match(descriptionCwd, /aloop-source-[^/]+\/repo$/);
   assert.equal(await readFile(join(dirname(workItem), 'native-task-file-write.txt'), 'utf8').catch(() => null), null);
 });
 
-test('an unaware custom read-only adapter starts in the artifact directory', async () => {
+test('an unaware custom read-only adapter starts in the source snapshot', async () => {
   const { root, workItem } = await repoFixture({ config: `export default {
   adapters: {
     unaware: {
@@ -1310,11 +1319,11 @@ test('an unaware custom read-only adapter starts in the artifact directory', asy
         command: process.execPath,
         args: ['-e', ${JSON.stringify(`
           const { writeFileSync } = require('node:fs');
-          const { join } = require('node:path');
+          const { join, dirname } = require('node:path');
           const prompt = process.argv[1];
           const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
-          writeFileSync('README.md', 'custom artifact cwd\\n');
-          writeFileSync(join(process.cwd(), 'custom-cwd.txt'), process.cwd());
+          writeFileSync(join(dirname(verdictPath), 'README.md'), 'custom artifact cwd\\n');
+          writeFileSync(join(dirname(verdictPath), 'custom-cwd.txt'), process.cwd());
           writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [] }));
         `)}, prompt],
       }),
@@ -1338,7 +1347,9 @@ test('an unaware custom read-only adapter starts in the artifact directory', asy
   assert.equal(summary.stalled, null);
   assert.equal(await readFile(join(root, 'README.md'), 'utf8'), '# fixture\n');
   assert.equal(await readFile(join(summary.runDir, 'README.md'), 'utf8'), 'custom artifact cwd\n');
-  assert.equal(await readFile(join(summary.runDir, 'custom-cwd.txt'), 'utf8'), summary.runDir);
+  const reviewCwd = (await readFile(join(summary.runDir, 'custom-cwd.txt'), 'utf8')).trim();
+  assert.notEqual(reviewCwd, summary.runDir);
+  assert.match(reviewCwd, /aloop-source-[^/]+\/repo$/);
 });
 
 test('the claude renderer turns stream events into readable progress lines', () => {
@@ -1903,6 +1914,8 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
     branch: undefined,
     baseBranch: undefined,
     engine: undefined,
+    model: undefined,
+    effort: undefined,
     overrideEngine: undefined,
     config: undefined,
     phases: undefined,
@@ -1927,6 +1940,8 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
     branch: undefined,
     baseBranch: undefined,
     engine: undefined,
+    model: undefined,
+    effort: undefined,
     overrideEngine: undefined,
     config: undefined,
     phases: undefined,
@@ -3118,6 +3133,60 @@ test('a phase with only head-advanced stalls without a commit', async () => {
   assert.match(summary.stalled.reason, /commit-only produced no commit/);
 });
 
+test('resume recognizes a manual commit from the stalled phase baseline', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const attemptsPath = join(await mkdtemp(join(tmpdir(), 'loop-attempts-')), 'count');
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: {
+    recorder: {
+      command: () => ({ command: 'sh', args: ['-c', ${JSON.stringify(`printf x >> ${attemptsPath}`)}] }),
+    },
+  },
+  engines: { default: 'recorder' },
+  phases: [{ name: 'implement', kind: 'agent', prompt: 'implement', postconditions: ['clean-tree', 'head-advanced'] }],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  const originalExitCode = process.exitCode;
+  console.log = () => {};
+  let firstSummary;
+  try {
+    firstSummary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+  } finally {
+    console.log = original;
+    process.exitCode = originalExitCode;
+  }
+
+  assert.equal(firstSummary.stalled.phase, 'implement');
+  const firstState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  const baseline = firstState.data.phaseBaselines.implement;
+  assert.match(baseline, /^[0-9a-f]{40}$/);
+
+  await writeFile(join(firstSummary.worktree, 'manual-fix.txt'), 'fixed\n');
+  await git(firstSummary.worktree, 'add', 'manual-fix.txt');
+  await git(firstSummary.worktree, 'commit', '-m', 'fix: manual implementation');
+
+  const resumedSummary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
+  assert.equal(resumedSummary.stalled, null);
+  assert.deepEqual(resumedSummary.phases.map((phase) => phase.name), ['implement']);
+  assert.equal(await readFile(attemptsPath, 'utf8'), 'x', 'resume must not invoke the agent again');
+
+  const resumedState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  assert.equal(resumedState.data.phaseBaselines.implement, baseline);
+  assert.equal(resumedState.isComplete('implement'), true);
+  const implementationEntries = resumedState.manifest.entries.filter((entry) => entry.phase === 'implement');
+  assert.equal(implementationEntries.at(-1).status, 'completed');
+  assert.equal(implementationEntries.at(-1).inputSha, baseline);
+  assert.notEqual(implementationEntries.at(-1).outputSha, baseline);
+
+  const secondResume = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
+  assert.equal(secondResume.stalled, null);
+  const finalState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  assert.equal(finalState.data.phaseBaselines.implement, baseline);
+  assert.equal(await readFile(attemptsPath, 'utf8'), 'x');
+});
+
 test('an implement phase that leaves edits uncommitted stalls', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const { root, workItem } = await repoFixture({ config: `export default {
@@ -3987,6 +4056,51 @@ test('a noted completed phase invalidates downstream gate and review attestation
   assert.equal(state.data.reviewedShas.review[1], await git(resumed.worktree, 'rev-parse', 'HEAD'));
 });
 
+test('a noted review rerun clears nested repair baselines before addressing findings', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const agentScript = [
+    'prompt=$1',
+    'if printf "%s" "$prompt" | grep -q "Machine-readable verdict"; then',
+    "  verdict_path=$(printf '%s\\n' \"$prompt\" | sed -n 's/.*write this JSON to `\\([^`]*\\)`.*/\\1/p')",
+    '  if printf "%s" "$prompt" | grep -q "round 2 of"; then',
+    `    printf '%s\\n' '{"verdict":"APPROVED","blocking":[]}' > "$verdict_path"`,
+    '  else',
+    `    printf '%s\\n' '{"verdict":"CHANGES_REQUESTED","blocking":[{"file":"src/x.mjs","line":1,"issue":"fix it"}]}' > "$verdict_path"`,
+    '  fi',
+    'elif test -f repair.txt; then',
+    '  :',
+    'else',
+    "  printf repaired > repair.txt; git add repair.txt && git commit -m 'fix: address finding' >/dev/null",
+    'fi',
+  ].join('\n');
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'review-agent', prompt] }; } } },
+  engines: { default: 'mytool' },
+  gate: ['true'],
+  phases: ['review', 'address'],
+  maxRounds: 2,
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+
+  const original = console.log;
+  const originalExitCode = process.exitCode;
+  console.log = () => {};
+  let initial;
+  let resumed;
+  try {
+    initial = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+    resumed = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'review', note: 'recheck the review', yes: true } });
+  } finally {
+    console.log = original;
+    process.exitCode = originalExitCode;
+  }
+
+  assert.equal(initial.stalled, null);
+  assert.equal(resumed.stalled.phase, 'address');
+  assert.match(resumed.stalled.reason, /no fix commit and no rebuttal recorded/);
+});
+
 test('a gate repair cap stalls with the last gate output', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const { root, workItem } = await repoFixture({ config: `export default {
@@ -4344,7 +4458,7 @@ test('a dry run honours an overridden phase list', async () => {
   assert.deepEqual(summary.phases.map((phase) => phase.name), ['implement']);
 });
 
-test('the runtime engine override keeps the configured model and effort', async () => {
+test('switching engines drops the configured model and effort (they are vendor-specific)', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const { root, workItem } = await repoFixture({ config: `export default {
   engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
@@ -4361,7 +4475,70 @@ test('the runtime engine override keeps the configured model and effort', async 
   } finally {
     console.log = original;
   }
-  assert.match(lines.join('\n'), /engine: codex\s+model: sonnet\s+effort: high/);
+  // `sonnet` is a claude model; handing it to codex is nonsense, so the switch
+  // drops it and codex falls back to its own default.
+  assert.match(lines.join('\n'), /engine: codex\s+prompt:/);
+  assert.doesNotMatch(lines.join('\n'), /model: sonnet/);
+});
+
+test('--engine keeps the configured model and effort when the engine is unchanged', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
+  gate: ['true'],
+  phases: ['implement'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, engine: 'claude', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /engine: claude\s+model: sonnet\s+effort: high/);
+});
+
+test('--model and --effort override the default engine model and effort', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
+  gate: ['true'],
+  phases: ['implement'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, model: 'opus', effort: 'low', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /engine: claude\s+model: opus\s+effort: low/);
+});
+
+test('--engine and --model together select a new engine and its model', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
+  gate: ['true'],
+  phases: ['implement'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, engine: 'gemini', model: 'gemini-3-pro', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /engine: gemini\s+model: gemini-3-pro/);
 });
 
 test('a dry-run resume uses configured agent settings instead of persisted settings', async () => {
@@ -4528,14 +4705,83 @@ test('resume can override saved engines and records the change in state and phas
   }
 
   const resumedState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
-  assert.deepEqual(resumedState.data.agentSettings.implement, { name: 'agy', model: 'saved-model', effort: 'low' });
+  // Switching engines drops the saved model/effort — `saved-model` is a claude
+  // model and means nothing to agy — so the override leaves only the new name.
+  assert.deepEqual(resumedState.data.agentSettings.implement, { name: 'agy' });
   assert.deepEqual(resumedState.data.engineOverrides.at(-1).phases.implement, {
     from: { name: 'claude', model: 'saved-model', effort: 'low' },
-    to: { name: 'agy', model: 'saved-model', effort: 'low' },
+    to: { name: 'agy' },
   });
-  assert.match(lines.join('\n'), /resumed engine override:[\s\S]*implement: claude model=saved-model effort=low → agy model=saved-model effort=low/);
+  assert.match(lines.join('\n'), /resumed engine override:[\s\S]*implement: claude model=saved-model effort=low → agy/);
   const phaseLog = await readFile(join(root, '.loop/runs/ss-demo-feature/implement.log'), 'utf8');
-  assert.match(phaseLog, /resumed override: claude model=saved-model effort=low → agy model=saved-model effort=low/);
+  assert.match(phaseLog, /resumed override: claude model=saved-model effort=low → agy/);
+});
+
+test('a resume engine override applies --model and --effort to the new engine', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  engines: { default: { name: 'claude', model: 'new-model', effort: 'xhigh' } },
+  gate: ['true'],
+  phases: ['implement'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  await state.record({
+    agentSettings: { implement: { name: 'claude', model: 'saved-model', effort: 'low' } },
+  });
+  const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
+  await writeFile(join(binDir, 'agy'), '#!/usr/bin/env node\n', { mode: 0o755 });
+  const originalPath = process.env.PATH;
+  const originalExitCode = process.exitCode;
+  const original = console.log;
+  const lines = [];
+  process.env.PATH = `${binDir}:${originalPath}`;
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, engine: 'agy', model: 'agy-pro', effort: 'high', overrideEngine: true, yes: true } });
+  } finally {
+    process.env.PATH = originalPath;
+    process.exitCode = originalExitCode;
+    console.log = original;
+  }
+
+  const resumedState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  // --model/--effort replace the dropped vendor-specific saved values on the new engine.
+  assert.deepEqual(resumedState.data.agentSettings.implement, { name: 'agy', model: 'agy-pro', effort: 'high' });
+  assert.deepEqual(resumedState.data.engineOverrides.at(-1).phases.implement, {
+    from: { name: 'claude', model: 'saved-model', effort: 'low' },
+    to: { name: 'agy', model: 'agy-pro', effort: 'high' },
+  });
+  assert.match(lines.join('\n'), /resumed engine override:[\s\S]*implement: claude model=saved-model effort=low → agy model=agy-pro effort=high/);
+});
+
+test('a resume engine override rejects an effort the new engine cannot honor', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  engines: { default: { name: 'claude', model: 'new-model', effort: 'xhigh' } },
+  gate: ['true'],
+  phases: ['implement'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  await state.record({
+    agentSettings: { implement: { name: 'claude', model: 'saved-model', effort: 'low' } },
+  });
+  const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
+  await writeFile(join(binDir, 'agy'), '#!/usr/bin/env node\n', { mode: 0o755 });
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${originalPath}`;
+  try {
+    // agy supports low/medium/high, so xhigh must be rejected before any phase runs.
+    await assert.rejects(
+      runLoop({ args: { taskFile: workItem, cwd: root, resume: true, engine: 'agy', effort: 'xhigh', overrideEngine: true, yes: true } }),
+      /does not support effort "xhigh"/,
+    );
+  } finally {
+    process.env.PATH = originalPath;
+  }
 });
 
 test('a dry-run engine override cannot consume persisted agent settings', async () => {

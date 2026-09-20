@@ -80,6 +80,15 @@ receipts, repair entries, and their input/output SHAs separately; a successful
 later attempt is therefore evidence of the repaired tree rather than a
 replacement for the original failure.
 
+Commit-required agent phases persist their first-attempt `HEAD` in
+`state.json` under `phaseBaselines`. The baseline is reused across resumes, so
+if a phase stalled for producing no commit and an operator later creates a
+clean commit, `--resume` can recognize that `HEAD` has advanced past the
+baseline, record the phase as completed, and skip another agent invocation.
+The completion entry records the persisted baseline as `inputSha` and the
+current `HEAD` as `outputSha`. A forced noted rerun invalidates the phase and
+its later state, then captures a new baseline.
+
 ## Concurrent-run protection
 
 Real runs acquire a single-host lock in their run directory before loading or

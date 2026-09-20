@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [0.8.4] - 2026-09-20
+
+### Fixed
+
+- Nested repair baselines are now properly cleared when rerunning reviews
+- Resume commit checks are now correctly skipped during dry runs
+- Resume of existing commits now works correctly in read-only working directories
+- Model and engine flags are now handled correctly
+
 ## [0.8.0] - 2026-09-20
 
 ### Added

@@ -167,6 +167,7 @@ export interface RunData {
   completed: string[];
   rounds: Record<string, number>;
   reviewedShas: Record<string, string>;
+  phaseBaselines?: Record<string, string>;
   phases?: Record<string, Record<string, any>>;
   pendingRepairs?: Record<string, any>;
   [key: string]: any;
@@ -184,6 +185,7 @@ export interface RunState {
   verdictPath(round: number): string;
   isComplete(name: string): boolean;
   markComplete(name: string, details?: Record<string, unknown>): Promise<void>;
+  baselineFor(name: string, compute: () => Promise<string>): Promise<string>;
   record(patch: Record<string, unknown>): Promise<void>;
   saveManifest(manifest: Record<string, unknown>): Promise<void>;
 }

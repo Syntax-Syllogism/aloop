@@ -44,12 +44,23 @@ export function buildTaskContext({ task, taskFile }) {
   return '';
 }
 
-function overrideSavedEngines(agentSettings, engine, customAdapters) {
+function overrideSavedEngines(agentSettings, { engine, model, effort }, customAdapters) {
+  // Switching engine drops the saved model/effort: they are vendor-specific and
+  // meaningless to the new engine (see the --engine override above). --model and
+  // --effort set them explicitly for the new engine; without them each phase
+  // falls back to the target engine's default. validateAgent rejects an effort
+  // the target engine cannot honor.
+  const target = validateAgent(
+    { name: engine, ...(model ? { model } : {}), ...(effort ? { effort } : {}) },
+    customAdapters,
+  );
   const overrides = {};
   const overriddenSettings = Object.fromEntries(
     Object.entries(agentSettings).map(([phaseName, agent]) => {
-      if (agent.name === engine) return [phaseName, agent];
-      const overridden = validateAgent({ ...agent, name: engine }, customAdapters);
+      if (agent.name === target.name && agent.model === target.model && agent.effort === target.effort) {
+        return [phaseName, agent];
+      }
+      const overridden = { ...target };
       overrides[phaseName] = { from: agent, to: overridden };
       return [phaseName, overridden];
     }),
@@ -482,10 +493,10 @@ async function runAgent(phase, ctx, variables) {
   log(`  engine: ${agent.name}${agent.model ? `   model: ${agent.model}` : ''}${agent.effort ? `   effort: ${agent.effort}` : ''}   prompt: ${path}`);
   if (engineOverride) log(`  resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)}`);
 
-  // Every read-only agent starts in the driver-owned artifact directory. The
-  // source snapshot is disposable, so an adapter's writable added directories
-  // cannot reach the real worktree while the agent can still inspect a Git tree.
-  const agentCwd = artifactOnly ? ctx.state.dir : ctx.worktree;
+  // Read-only agents inspect the disposable source snapshot. Their writable
+  // added directories still point only at the run artifacts (and task file for
+  // review), so changing cwd cannot reach the real worktree.
+  const agentCwd = sourceSnapshot?.path ?? (artifactOnly ? ctx.state.dir : ctx.worktree);
   // Only the verdict phase's prompt is instructed to edit the task file (its
   // Code Review section), so only it is granted the external task-file repo as
   // writable. Every other artifact-only phase — pr-description included — gets
@@ -611,7 +622,24 @@ export async function runLoop(options = {}) {
     ...(args.noWorktree ? { worktrees: false } : {}),
   }, args.config ? resolve(cwd, args.config) : undefined);
   if (args.engine && !args.overrideEngine) {
-    config.engines.default = validateAgent({ ...config.engines.default, name: args.engine }, config.adapters);
+    // A model/effort string is vendor-specific — `gpt-5.6-terra` means nothing
+    // to gemini — so switching to a different engine must not inherit the
+    // previous engine's model/effort. Carry them over only when the engine is
+    // unchanged; --model/--effort below can still set them explicitly.
+    const base = args.engine === config.engines.default.name
+      ? config.engines.default
+      : { name: args.engine };
+    config.engines.default = validateAgent({ ...base, name: args.engine }, config.adapters);
+  }
+  if ((args.model || args.effort) && !args.overrideEngine) {
+    config.engines.default = validateAgent(
+      {
+        ...config.engines.default,
+        ...(args.model ? { model: args.model } : {}),
+        ...(args.effort ? { effort: args.effort } : {}),
+      },
+      config.adapters,
+    );
   }
   if (args.overrideEngine && !args.resume) {
     throw new Error('--override-engine requires --resume.');
@@ -735,7 +763,11 @@ export async function runLoop(options = {}) {
     if (!savedAgentSettings) {
       throw new Error('--override-engine requires saved agent settings from an earlier run.');
     }
-    ({ agentSettings, overrides: engineOverrides } = overrideSavedEngines(savedAgentSettings, args.engine, config.adapters));
+    ({ agentSettings, overrides: engineOverrides } = overrideSavedEngines(
+      savedAgentSettings,
+      { engine: args.engine, model: args.model, effort: args.effort },
+      config.adapters,
+    ));
     if (Object.keys(engineOverrides).length > 0) {
       const engineOverride = {
         at: new Date().toISOString(),

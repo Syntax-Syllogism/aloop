@@ -113,12 +113,12 @@ export default { publish: { backend: gitlabBackend({ transport: myMcpTransport }
 ### Bring your own engine
 
 Register an adapter under `adapters` when another CLI should run a phase. Its
-`command({ prompt, cwd, addDirs, readOnlyDirs, permissions, artifactOnly, agent })` function returns `{ command, args }`. For a read-only phase,
-`cwd` is always the run directory and `addDirs` contains only artifact roots;
-`readOnlyDirs` is an optional source-inspection input for adapters that can
-honor it. The runner supplies a permission level and restricts `addDirs`
-accordingly; the adapter must translate `permissions` into its own read-only
-or write-capable invocation flags. It may also provide `efforts`
+`command({ prompt, cwd, addDirs, permissions, artifactOnly, agent })` function
+returns `{ command, args }`. For a read-only phase, `cwd` is a disposable
+read-only source snapshot of the saved worktree and `addDirs` contains only
+writable artifact roots. The runner supplies a permission level and restricts
+`addDirs` accordingly; the adapter must translate `permissions` into its own
+read-only or write-capable invocation flags. It may also provide `efforts`
 validation and `createRenderer()` for streaming output. Custom adapter flags
 are vendor-specific and are not verified by aloop. See the [phase permission
 contract](docs/loop.md#phase-permissions) before enabling unattended runs.

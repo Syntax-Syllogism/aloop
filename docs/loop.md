@@ -43,6 +43,8 @@ earned it.
   -b, --branch <name>     Branch to build on (default: <branchPrefix><name>)
       --base-branch <branch>  Base to branch from and PR against (default: baseBranch config)
   -e, --engine <name>     Default engine: claude | codex | agy | gemini
+  -m, --model <name>      Model for the default engine (overrides config; switching engines without it uses the new engine default)
+      --effort <level>    Reasoning effort for the default engine (overrides config; ignored by engines without effort)
       --override-engine   With --resume and --engine, replace saved agent executables
       --config <path>     Load loop configuration from this file
       --phases a,b,c      Override the configured phase list
@@ -281,7 +283,7 @@ like this:
 export default {
   adapters: {
     opencode: {
-      command({ prompt, cwd, addDirs, readOnlyDirs, permissions, artifactOnly, agent = {} }) {
+      command({ prompt, cwd, addDirs, permissions, artifactOnly, agent = {} }) {
         const writeAccess = permissions.includes('write-worktree')
           && !permissions.includes('read-only')
           && !artifactOnly;
@@ -294,7 +296,7 @@ export default {
       },
     },
     pi: {
-      command({ prompt, cwd, addDirs, readOnlyDirs, permissions, artifactOnly, agent = {} }) {
+      command({ prompt, cwd, addDirs, permissions, artifactOnly, agent = {} }) {
         const writeAccess = permissions.includes('write-worktree')
           && !permissions.includes('read-only')
           && !artifactOnly;
@@ -325,11 +327,16 @@ prompt and write the files requested by it. A resumed run re-reads adapters from
 `loop.config.mjs`; the same config must still define any custom adapter used by
 the saved engine settings.
 
-`--engine` still changes the default executable, but keeps its configured model
-and effort. Dry runs and phase logs print the effective engine settings. They
-are saved in run state on the first real run; `--resume` uses those saved
-settings even if `loop.config.mjs` has changed, so a resumed run remains
-auditable and reproducible.
+`--engine` changes the default executable. It keeps the configured model and
+effort only when the engine is unchanged; switching to a different engine drops
+them, because a model or effort string is vendor-specific (`gpt-5.6-terra` means
+nothing to Gemini) and carrying it over would hand the new engine a name it
+rejects. Set the new engine's model with `--model` (and effort with `--effort`),
+or configure it in `loop.config.mjs`. `--model` and `--effort` also work on their
+own to override just the default engine's model or effort. Dry runs and phase
+logs print the effective engine settings. They are saved in run state on the
+first real run; `--resume` uses those saved settings even if `loop.config.mjs`
+has changed, so a resumed run remains auditable and reproducible.
 
 `--resume --config path/to/loop.config.mjs` deliberately replaces those saved
 settings and every other configurable pipeline value, including engines, phase
@@ -342,10 +349,12 @@ supplied config instead. The runner snapshots every resume override in
 
 To deliberately move an interrupted run to another executable, use
 `--resume --engine <name> --override-engine`. It replaces the saved engine for
-every agent phase while retaining each phase's saved model and effort; the new
-combination is validated before a phase starts. The runner records the before
-and after settings in `state.json`, prints the change at resume time, and adds
-it to each affected phase log header.
+every agent phase, dropping each phase's saved model and effort (they are
+vendor-specific and would not apply to the new engine). Add `--model` and
+`--effort` to set them for the new engine; without them each phase uses the new
+engine's default. The new combination is validated before a phase starts. The
+runner records the before and after settings in `state.json`, prints the change
+at resume time, and adds it to each affected phase log header.
 
 `remote` is the push target for the `publish` phase. Left unset it detects one,
 preferring `origin` — set it explicitly in any repo with several remotes, since
@@ -429,7 +438,7 @@ The built-in phases use these levels:
 
 | Permission | Built-in phases | Agent access and behavior |
 | --- | --- | --- |
-| `read-only` | `gate`, `review`, `pr-description` | Agent phases use an artifact-only invocation rooted at the run directory and receive the run directory plus the task-file artifact directory. Built-in adapters also receive the worktree as a separate source directory for inspection; unaware custom adapters do not receive it through `addDirs`. Shell gates do not invoke an agent adapter. |
+| `read-only` | `gate`, `review`, `pr-description` | Agent phases run from a disposable read-only source snapshot of the saved worktree. They can write only the run artifacts, plus the task-file artifact directory for the verdict/review phase. Shell gates do not invoke an agent adapter. |
 | `write-worktree` | `implement`, `docs`, `address` | Agent phases may modify and commit the worktree. The adapter receives the run directory and any task-file directory needed by the phase. |
 | `publish` | `publish` | Publishing is driver-owned and does not invoke an agent. |
 
@@ -439,18 +448,18 @@ than one value: `read-only` takes precedence, then `write-worktree`, then
 adapter. This keeps an incomplete custom descriptor from gaining write
 access.
 
-The runner passes `permissions`, `artifactOnly`, a permission-filtered
-`addDirs` list, and (for built-in adapters) a separate `readOnlyDirs` list to
-an agent adapter. For artifact-only invocations, built-in
-adapters use their write-capable headless mode with the run directory as the
-working root: Claude `--permission-mode auto`, Codex `--sandbox workspace-write`,
-agy `--mode accept-edits` with `--dangerously-skip-permissions`, and Gemini
-`--approval-mode yolo` with `--skip-trust`. This keeps
-required verdict, review, and PR-description files writable without making the
-worktree the process working directory. A custom adapter that does not consume
-`readOnlyDirs` still starts in the run directory and receives only artifact
-directories, which is the conservative default; its process remains subject
-to the driver's post-review tree check. `write-worktree` maps to Claude
+The runner passes `permissions`, `artifactOnly`, and a permission-filtered
+`addDirs` list to an agent adapter. For artifact-only invocations, the
+working directory is the disposable source snapshot, while the run directory
+and any phase-required task-file directory are the only writable added
+directories. Built-in adapters use their write-capable headless mode so the
+required verdict, review, and PR-description files can be written: Claude
+`--permission-mode auto`, Codex `--sandbox workspace-write`, agy
+`--mode accept-edits` with `--dangerously-skip-permissions`, and Gemini
+`--approval-mode yolo` with `--skip-trust`. A custom adapter receives the same
+`cwd` and `addDirs` contract and must map `permissions` to its own sandbox and
+approval flags; its process remains subject to the driver's post-review tree
+check. `write-worktree` maps to Claude
 `--permission-mode auto`, Codex `--sandbox workspace-write`, agy's
 `--mode accept-edits` with `--dangerously-skip-permissions`, and Gemini's
 `--approval-mode yolo` with `--skip-trust`. Vendor-specific
@@ -512,9 +521,14 @@ records a written rebuttal in
 `{{RUN_DIR}}/response-round-{{ROUND}}.md`; a clean no-commit `address` phase is
 also valid when there were no blocking findings. A dirty worktree always
 stalls, and stdout alone never satisfies the postcondition. The phase is left
-incomplete so `--resume` retries it; the stall points to the phase log. This
-guard does not apply to `docs` or `review`, which may legitimately
-produce no code diff.
+incomplete so `--resume` retries it; the stall points to the phase log. For a
+commit-required phase, aloop persists the phase's initial `HEAD` as its
+baseline. If an operator or another process creates the required clean commit
+after a stall, `--resume` compares the current `HEAD` with that original
+baseline, records the phase as completed, and skips the agent invocation. A
+resume with `--from <phase> --note ...` deliberately forces that phase to run
+and establishes a fresh baseline. This guard does not apply to `docs` or
+`review`, which may legitimately produce no code diff.
 
 Phase control flow is declared by phase descriptors. String names remain a
 shorthand for the built-in descriptors, but list adjacency does not create
@@ -770,8 +784,10 @@ Entries use these conventions:
 - `phase`, `kind`, and `role` identify the configured phase. Roles are
   `agent`, `repair`, `verdict`, `gate`, and `publish`.
 - `inputSha` and `outputSha` are the worktree `HEAD` before and after the phase.
-  Skipped entries use `null` for both values; dry runs create no manifest
-  entries. A stalled precondition can record the same SHA on both sides.
+  A resume completion recognized from a persisted commit baseline uses that
+  baseline as `inputSha` and the current `HEAD` as `outputSha`. Skipped entries
+  use `null` for both values; dry runs create no manifest entries. A stalled
+  precondition can record the same SHA on both sides.
 - `promptHash` is the SHA-256 of the fully rendered prompt text. `configHash`
   is the SHA-256 of the resolved configuration after stable key ordering and
   removal of function-valued fields. Both hashes are deterministic.

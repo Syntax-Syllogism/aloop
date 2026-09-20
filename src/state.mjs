@@ -181,6 +181,7 @@ export class RunState {
       completed: [],
       rounds: {},
       reviewedShas: {},
+      phaseBaselines: {},
       ...seed,
       schemaVersion: STATE_SCHEMA_VERSION,
     };
@@ -384,6 +385,14 @@ export class RunState {
     if (!this.data.completed.includes(name)) this.data.completed.push(name);
     this.data.phases = { ...this.data.phases, [name]: { finishedAt: new Date().toISOString(), ...details } };
     await this.save();
+  }
+
+  async baselineFor(name, compute) {
+    const phaseBaselines = this.data.phaseBaselines ?? {};
+    if (phaseBaselines[name]) return phaseBaselines[name];
+    const baseline = await compute();
+    await this.record({ phaseBaselines: { ...phaseBaselines, [name]: baseline } });
+    return baseline;
   }
 
   async record(patch) {
