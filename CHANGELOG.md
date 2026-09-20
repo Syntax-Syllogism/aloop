@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [0.8.0] - 2026-09-20
+
+### Added
+
+- Eval harness for running code across multiple models
+- JSDoc type checking for validation
+- Live TUI renderer for interactive aloop runs
+- aloop init command for project initialization
+- Guided resume capability to repair failing gates
+
+### Changed
+
+- TUI renderer now runs even with --yes flag
+
+### Fixed
+
+- JSDoc type contracts bound to production boundaries
+- Fixed TUI rendering performance with diff-stat caching
+- Resume repair and downstream attestation restored
+
 ## [0.7.0] - 2026-09-18
 
 ### Added
@@ -16,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trusted, and `--output-format stream-json` so long phases stay watchable.
   Gemini has no reasoning-effort flag, so a configured `effort` is ignored for
   it.
+
+## [0.6.2] - 2026-09-16
+
+### Fixed
+
+- Resolve Windows executables to correct on-disk casing
 
 ## [0.6.0] - 2026-09-14
 
@@ -60,6 +86,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Handle a failed Windows timeout teardown and isolate POSIX tests from
   Windows CI.
 
+## [0.5.2] - 2026-09-13
+
+### Changed
+
+- Internal maintenance and tooling updates
+
+## [0.5.1] - 2026-09-13
+
+### Changed
+
+- Internal maintenance and tooling updates
+
 ## [0.5.0] - 2026-09-12
 
 ### Added
@@ -82,14 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wiki commit preservation with cron scheduling
 - Output streaming for long-running phases to prevent false hang detection
 
-## [Unreleased]
-
 ---
 
 ## Pre-extraction history
 
 History from before the standalone extraction (changesets format), preserved for reference.
-
 
 ## 0.4.6
 
@@ -194,42 +229,3 @@ History from before the standalone extraction (changesets format), preserved for
     rather than assuming `origin` in repos with several remotes.
   - Prompts ship with the package and are overridable per phase from
     `.loop/prompts/` in the consuming project.
-
-## [0.8.0] - 2026-09-20
-
-### Added
-
-- Eval harness for running code across multiple models
-- JSDoc type checking for validation
-- Live TUI renderer for interactive aloop runs
-- aloop init command for project initialization
-- Guided resume capability to repair failing gates
-
-### Changed
-
-- TUI renderer now runs even with --yes flag
-
-### Fixed
-
-- JSDoc type contracts bound to production boundaries
-- Fixed TUI rendering performance with diff-stat caching
-- Resume repair and downstream attestation restored
-
-## [0.6.2] - 2026-09-16
-
-### Fixed
-
-- Resolve Windows executables to correct on-disk casing
-
-## [0.5.2] - 2026-09-13
-
-### Changed
-
-- Internal maintenance and tooling updates
-
-## [0.5.1] - 2026-09-13
-
-### Changed
-
-- Internal maintenance and tooling updates
-
