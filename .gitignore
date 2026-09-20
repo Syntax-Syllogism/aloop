@@ -56,5 +56,7 @@ bin/changelog-prompt.txt
 release.config.mjs
 
 # === private-only: local loop engine-pair configs ===
-loop.config.mjs
+# Anchored to the repo root so it only strips top-level local configs and not
+# the committed presets/work-item/loop.config.mjs (imported by the test suite).
+/loop.config.mjs
 *.loop-config.mjs
