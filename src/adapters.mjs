@@ -413,16 +413,26 @@ const geminiAdapter = {
     // until the process exits, so a multi-minute phase is indistinguishable from
     // a hang. stream-json emits an event per step, which `createRenderer` turns
     // back into readable lines — same reasoning as the claude adapter above.
+    //
+    // The prompt goes on stdin, not `--prompt`. Gemini's Windows launcher is a
+    // `.cmd`/`.ps1` shim, so on Git Bash aloop runs it through `cmd.exe /c`
+    // (see command.mjs windowsSpawnSpec). cmd.exe caps the whole command line at
+    // ~8191 chars and mangles newlines and metacharacters (`% ! & | < >`), so a
+    // real review prompt — work item plus instructions — arrives truncated or
+    // garbled and Gemini "ignores" it. stdin is a pipe cmd.exe never parses, so
+    // the prompt survives intact. `-p ""` still selects headless mode; Gemini
+    // documents `--prompt` as "appended to input on stdin", so an empty flag
+    // leaves the stdin prompt as the whole prompt.
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const args = [
-      '--prompt', prompt,
+      '--prompt', '',
       '--approval-mode', canWrite ? 'yolo' : 'plan',
       '--skip-trust',
       '--output-format', 'stream-json',
     ];
     if (agent.model) args.push('--model', agent.model);
     for (const dir of addDirs) args.push('--include-directories', dir);
-    return { command: 'gemini', args };
+    return { command: 'gemini', args, input: prompt };
   },
   createRenderer: () => createJsonlRenderer(renderGeminiEvent),
 };

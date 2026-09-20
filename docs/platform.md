@@ -37,6 +37,14 @@ through `ComSpec`, and `.ps1` scripts run through Windows PowerShell with a
 non-interactive profile and execution-policy bypass. This lets configured agent
 CLIs and the default shell work when their Windows launchers are on `PATH`.
 
+A `.cmd`/`.bat` shim runs through `cmd.exe`, whose command line is capped at
+about 8191 characters and which mangles newlines and shell metacharacters
+(`% ! & | < >`). A large agent prompt passed as a command-line argument through
+such a shim therefore arrives truncated or garbled. The Gemini adapter avoids
+this by sending its prompt on stdin (an adapter may return an `input` string
+that the runner writes to the child's stdin) instead of on the command line;
+its Windows launcher is a shim, so a command-line prompt would be corrupted.
+
 Command timeouts terminate the Windows process tree with `taskkill /PID /T /F`.
 On POSIX hosts, aloop continues to use detached process groups and group
 signals. A timeout or cancellation therefore cleans up child processes on both

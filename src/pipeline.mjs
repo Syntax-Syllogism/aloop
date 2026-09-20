@@ -491,7 +491,7 @@ async function runAgent(phase, ctx, variables) {
   // writable. Every other artifact-only phase — pr-description included — gets
   // just its own run directory; it has no business touching the task file repo.
   const artifactOnlyDirs = phase.role === 'verdict' ? ctx.artifactDirs : [ctx.state.dir];
-  const { command, args } = adapter.command({
+  const { command, args, input } = adapter.command({
     prompt,
     cwd: agentCwd,
     addDirs: worktreeWrite ? ctx.addDirs : [...artifactOnlyDirs, ...(sourceSnapshot ? [sourceSnapshot.path] : [])],
@@ -539,6 +539,10 @@ async function runAgent(phase, ctx, variables) {
       env: execution.env,
       timeoutMs: ctx.config.timeoutMs,
       activeProcessPath: ctx.activeProcessPath,
+      // Adapters that carry the prompt on stdin (gemini, to dodge the cmd.exe
+      // command-line limit on Windows) return it as `input`; a hermetic wrapper
+      // forwards stdin to the sandboxed process unchanged.
+      input,
       onOutput: (text, stream) => emit(stream === 'stderr' ? text : renderer.write(text)),
     });
   } catch (error) {

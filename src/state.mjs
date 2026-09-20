@@ -37,6 +37,15 @@ function isActiveProcessAlive(activeProcess) {
   return isProcessGroupAlive(activeProcess?.processGroupId) || isProcessAlive(activeProcess?.pid);
 }
 
+async function pathExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function readActiveProcess(dir) {
   try {
     return JSON.parse(await readFile(join(dir, 'active-command.json'), 'utf8'));
@@ -238,7 +247,16 @@ export class RunState {
         await publishLock(path, lockToken, contents);
         return lockToken;
       } catch (error) {
-        if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
+        // POSIX rejects a rename onto the existing (non-empty) lock directory
+        // with EEXIST/ENOTEMPTY — the signal that the lock is already held.
+        // Windows rejects the same rename with EPERM (sometimes EACCES)
+        // instead, so without this a `--resume` that finds any prior lock dir
+        // crashes with "EPERM: operation not permitted, rename". Treat those as
+        // contention too, but only when the lock path is actually present, so a
+        // genuine permission failure still surfaces instead of spinning here.
+        const contended = ['EEXIST', 'ENOTEMPTY'].includes(error.code)
+          || (['EPERM', 'EACCES'].includes(error.code) && await pathExists(path));
+        if (!contended) throw error;
       }
 
       let existing;

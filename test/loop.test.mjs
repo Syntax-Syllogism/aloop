@@ -1092,9 +1092,11 @@ test('adapters place the prompt and every extra directory on the command line', 
     prompt: 'do it', cwd: '/w', addDirs: ['/runs', '/wiki'], timeoutMs: 60000, permissions: ['write-worktree'],
   };
   for (const engine of ['claude', 'codex', 'agy', 'gemini']) {
-    const { command, args } = adapterFor(engine).command(request);
+    const { command, args, input } = adapterFor(engine).command(request);
     assert.equal(command, engine);
-    assert.ok(args.includes('do it'), `${engine} passes the prompt`);
+    // gemini carries the prompt on stdin (`input`) to dodge the cmd.exe
+    // command-line limit on Windows; the others place it on the command line.
+    assert.ok(args.includes('do it') || input === 'do it', `${engine} passes the prompt`);
     assert.ok(args.includes('/runs') && args.includes('/wiki'), `${engine} passes add-dirs`);
   }
   assert.throws(() => adapterFor('gpt'), /Unsupported engine "gpt".*claude, codex, agy, gemini/);
@@ -1390,6 +1392,18 @@ test('the agy renderer turns stream events into readable progress lines', () => 
   );
   // The enormous init tool list and user-input steps render as nothing.
   assert.equal(renderAgyEvent({ event: 'step_update', step_update: { step_type: 'user_input', state: 'DONE' } }), '');
+});
+
+test('the gemini adapter carries the prompt on stdin, not the command line', () => {
+  const result = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['write-worktree'] });
+  // The Windows launcher is a .cmd/.ps1 shim, so on Git Bash the prompt would
+  // ride through cmd.exe, which truncates past ~8191 chars and mangles newlines
+  // and metacharacters. stdin is a pipe cmd.exe never parses.
+  assert.equal(result.input, 'do it', 'prompt travels on stdin');
+  assert.equal(result.args.includes('do it'), false, 'prompt is never an argv element');
+  // `-p ""` still selects headless mode; Gemini appends --prompt to stdin, so an
+  // empty flag leaves the stdin prompt as the whole prompt.
+  assert.equal(result.args[result.args.indexOf('--prompt') + 1], '', 'empty --prompt selects headless mode');
 });
 
 test('the gemini adapter trusts the workspace, auto-approves tools, and streams', () => {

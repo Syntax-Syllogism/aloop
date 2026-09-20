@@ -70,6 +70,12 @@ export interface AdapterCommandOptions {
 export interface AdapterCommand {
   command: string;
   args: string[];
+  /**
+   * Optional stdin for the command. Adapters use it to carry the prompt off the
+   * argument vector (gemini does, to dodge the cmd.exe command-line limit on
+   * Windows) rather than passing it as an argv element.
+   */
+  input?: string;
   [key: string]: unknown;
 }
 
