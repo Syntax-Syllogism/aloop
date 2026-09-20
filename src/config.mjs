@@ -1,3 +1,6 @@
+/** @typedef {import('./types.js').Config} Config */
+/** @typedef {import('./types.js').PhaseDescriptor} PhaseDescriptor */
+
 import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -184,6 +187,7 @@ function toPhase(entry, index) {
  * A custom verdict phase must declare its own `repair` list; merely placing a
  * repair phase after it no longer changes control flow.
  */
+/** @returns {PhaseDescriptor[]} */
 export function normalizePhases(entries, { maxRounds }) {
   const list = entries.map(toPhase);
   const phaseIndexes = new Map();
@@ -215,7 +219,7 @@ export function normalizePhases(entries, { maxRounds }) {
 
   for (let index = 0; index < list.length; index += 1) {
     const phase = list[index];
-    if (!phase.verdict) continue;
+    if (!phase.verdict && !(phase.kind === 'gate' && phase.repair)) continue;
     const repair = phase.repair ?? [];
     if (!Array.isArray(repair)) {
       throw new Error(`Phase "${phase.name}" has an invalid repair transition; expected an array.`);
@@ -233,7 +237,7 @@ export function normalizePhases(entries, { maxRounds }) {
   for (let index = 0; index < list.length; index += 1) {
     const phase = list[index];
     if (phase.role === 'repair' && !consumedRepairs.has(index)) {
-      throw new Error(`Phase "${phase.name}" is a repair phase and must be declared by a phase that emits a verdict.`);
+      throw new Error(`Phase "${phase.name}" is a repair phase and must be declared by a phase that emits a verdict or gate repair transition.`);
     }
     if (!consumedRepairs.has(index)) result.push(phase);
   }
@@ -356,6 +360,7 @@ export async function loadRunsDir(cwd, configPath) {
   return runsDir;
 }
 
+/** @returns {Promise<Config>} */
 export async function loadConfig(cwd, overrides = {}, configPath) {
   const configured = await importConfigFile(cwd, configPath);
   const merged = {

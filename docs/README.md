@@ -17,13 +17,15 @@ perform the work.
 - [Hermetic phase execution](hermetic.md) — opt phases into container runtime
   isolation, network allow-lists, environment forwarding, and publish secrets.
 - [Architecture and module boundaries](architecture.md) — navigate the
-  deterministic driver's composition, phase execution, policy, reporting, and
-  worktree responsibilities.
+  deterministic driver's composition, phase execution, policy, reporting,
+  worktree responsibilities, and shared static contracts.
 - [Publishing](publishing.md) — author the PR description and understand the
   driver's push, PR backend, and verification contract.
 - [Cost and quality metrics](metrics.md) — inspect saved-run usage, duration,
   convergence, stall, and reviewer measurements from the CLI or JSON output.
 - [Operational run commands](operations.md) — list, inspect, cancel, clean up,
-  and diagnose persisted runs.
+  diagnose persisted runs, and run local quality checks.
 - [Run state and recovery](run-state.md) — understand durable run artefacts,
   resume protection, locking, and crash recovery.
+- [Evaluation harness](eval.md) — run a task corpus across a model/config
+  matrix and compare completion, escaped defects, convergence, and cost.

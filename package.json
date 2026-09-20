@@ -1,6 +1,6 @@
 {
   "name": "@syntax-syllogism/aloop",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Syntax & Syllogism agentic loop runner.",
   "type": "module",
   "exports": {
@@ -13,7 +13,8 @@
     "node": ">=22"
   },
   "bin": {
-    "aloop": "bin/loop.mjs"
+    "aloop": "bin/loop.mjs",
+    "aloop-eval": "bin/eval.mjs"
   },
   "files": [
     "bin",
@@ -48,6 +49,11 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3"
   }
 }

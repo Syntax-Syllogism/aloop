@@ -7,14 +7,15 @@ import { promisify } from 'node:util';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseLoopArgs } from '../bin/loop.mjs';
+import { pathToFileURL } from 'node:url';
+import { parseLoopArgs, runOperationalCommand as runCliOperationalCommand } from '../bin/loop.mjs';
 import { defaults, normalizePhases, loadConfig, loadRunsDir } from '../src/config.mjs';
 import { adapterFor, agentForPhase, createJsonlRenderer, engineForPhase, renderAgyEvent, renderClaudeEvent, renderGeminiEvent } from '../src/adapters.mjs';
 import { interpolate, packagePrompts, renderPrompt } from '../src/prompts.mjs';
 import { parseVerdict, formatFindings } from '../src/verdict.mjs';
 import { hashConfig, hashText } from '../src/manifest.mjs';
 import { computeAggregateMetrics, computeRunMetrics } from '../src/metrics.mjs';
-import { getAggregateMetrics, getRunStatus, listRunStatuses, runOperationalCommand } from '../src/operations.mjs';
+import { getAggregateMetrics, getRunStatus, init as initScaffold, listRunStatuses, runOperationalCommand } from '../src/operations.mjs';
 import { slugFor, RunState } from '../src/state.mjs';
 import { GitFacade } from '../src/git.mjs';
 import { githubBackend, parsePullRequestDescription, publish } from '../src/publish.mjs';
@@ -401,6 +402,17 @@ test('normalizePhases keeps retry attempts separate from verdict rounds', () => 
   ], { maxRounds: 3 });
   assert.equal(phases[0].retry.maxAttempts, 2);
   assert.equal(phases[0].maxRounds, 3);
+});
+
+test('normalizePhases resolves a standalone gate repair transition', () => {
+  const phases = normalizePhases([
+    {
+      name: 'gate',
+      repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'] }],
+    },
+  ], { maxRounds: 2 });
+  assert.equal(phases[0].maxRounds, 2);
+  assert.deepEqual(phases[0].repair.map((phase) => phase.name), ['fix-gate']);
 });
 
 test('normalizePhases rejects a repair phase not named by a verdict transition', () => {
@@ -1007,7 +1019,7 @@ test('default prompts contain no work-item-specific references', async () => {
   const forbidden = /WORK_ITEM|## Code Review|## Changelog|IN PROGRESS|AGENTS\.md|CLAUDE\.md/;
   const promptFiles = (await readdir(packagePrompts)).filter((file) => file.endsWith('.md'));
 
-  assert.deepEqual(promptFiles.sort(), ['address.md', 'docs.md', 'implement.md', 'pr-description.md', 'review.md']);
+  assert.deepEqual(promptFiles.sort(), ['address.md', 'docs.md', 'fix-gate.md', 'implement.md', 'pr-description.md', 'review.md']);
   for (const file of promptFiles) {
     const body = await readFile(join(packagePrompts, file), 'utf8');
     assert.doesNotMatch(body, forbidden, `${file} should remain generic`);
@@ -1037,7 +1049,7 @@ test('parseVerdict validates blocking and nit finding shapes', () => {
   for (const [finding, message] of malformedFindings) {
     assert.throws(
       () => parseVerdict(`{"verdict":"CHANGES_REQUESTED","blocking":[${finding}]}`),
-      message,
+      /** @type {any} */ (message),
     );
   }
   assert.throws(
@@ -1678,7 +1690,9 @@ test('read-only commands inspect saved runs when the pipeline config is invalid'
   const original = console.log;
   const lines = [];
   console.log = (message) => lines.push(String(message));
+  /** @type {any} */
   let metrics;
+  /** @type {any} */
   let status;
   try {
     metrics = await runOperationalCommand({ command: 'metrics', json: true, cwd: root });
@@ -1804,8 +1818,8 @@ test('RunState serializes concurrent stale-lock takeover', async () => {
   const rejected = results.filter(({ status }) => status === 'rejected');
   assert.equal(acquired.length, 1, 'exactly one contender may take over the stale lock');
   assert.equal(rejected.length, 1, 'the other contender must observe the new active lock');
-  assert.match(rejected[0].reason.message, /Run already active/);
-  await RunState.releaseLock(runDir, acquired[0].value);
+  assert.match((/** @type {any} */ (rejected[0])).reason.message, /Run already active/);
+  await RunState.releaseLock(runDir, (/** @type {any} */ (acquired[0])).value);
 });
 
 test('RunState refuses unsupported and non-integer state and manifest schema versions', async () => {
@@ -1881,13 +1895,103 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
     maxRounds: undefined,
     from: undefined,
     resume: undefined,
+    note: undefined,
+    noteFile: undefined,
     yes: undefined,
     noWorktree: undefined,
+    noTui: undefined,
     dryRun: undefined,
+    preset: undefined,
+    force: undefined,
+  });
+  assert.deepEqual(parseLoopArgs(['init', '--preset', 'work-item', '--force']), {
+    command: 'init',
+    runName: undefined,
+    task: undefined,
+    taskFile: undefined,
+    name: undefined,
+    branch: undefined,
+    baseBranch: undefined,
+    engine: undefined,
+    overrideEngine: undefined,
+    config: undefined,
+    phases: undefined,
+    maxRounds: undefined,
+    from: undefined,
+    resume: undefined,
+    note: undefined,
+    noteFile: undefined,
+    yes: undefined,
+    noWorktree: undefined,
+    noTui: undefined,
+    dryRun: undefined,
+    json: undefined,
+    metrics: undefined,
+    olderThanDays: undefined,
+    preset: 'work-item',
+    force: true,
   });
   assert.equal(parseLoopArgs(['-f', 'wi.md', '--config', 'configs/fast.mjs']).config, 'configs/fast.mjs');
   assert.equal(parseLoopArgs(['-f', 'wi.md', '--resume', '--engine', 'agy', '--override-engine']).overrideEngine, true);
+  assert.equal(parseLoopArgs(['-f', 'wi.md', '--note', 'finish']).note, 'finish');
+  assert.equal(parseLoopArgs(['-f', 'wi.md', '--note-file', 'note.md']).noteFile, 'note.md');
   assert.throws(() => parseLoopArgs(['-f', 'wi.md', '--max-rounds', 'zero']), /positive integer/);
+});
+
+test('init scaffolds an importable config and complete editable default prompts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loop-init-'));
+  const result = await initScaffold({ cwd: root });
+  const promptNames = (await readdir(packagePrompts)).filter((name) => name.endsWith('.md')).sort();
+
+  assert.equal(result.preset, null);
+  assert.deepEqual((await readdir(join(root, '.loop', 'prompts'))).sort(), promptNames);
+  const configPath = join(root, 'loop.config.mjs');
+  const config = await readFile(configPath, 'utf8');
+  assert.match(config, /REVIEW THESE before your first run/);
+  assert.match(config, /Prompts live in \.loop\/prompts/);
+  assert.match(config, /happy agentic looping/);
+  const loaded = await import(`${pathToFileURL(configPath).href}?t=${Date.now()}`);
+  assert.equal(loaded.default.baseBranch, 'master');
+  assert.deepEqual(loaded.default.gate, []);
+});
+
+test('init uses bundled preset config and overlays its prompts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loop-init-preset-'));
+  const result = await initScaffold({ cwd: root, preset: 'work-item' });
+  const presetPrompt = await readFile(join(dirname(packagePrompts), 'presets', 'work-item', 'prompts', 'implement.md'), 'utf8');
+  const copiedPrompt = await readFile(join(root, '.loop', 'prompts', 'implement.md'), 'utf8');
+  const config = await readFile(join(root, 'loop.config.mjs'), 'utf8');
+
+  assert.equal(result.preset, 'work-item');
+  assert.equal(copiedPrompt, presetPrompt);
+  assert.match(config, /gate: \['npm test'\]/);
+  assert.match(config, /happy agentic looping/);
+});
+
+test('init refuses partial clobbers, supports force, and leaves extra prompts intact', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loop-init-clobber-'));
+  await writeFile(join(root, 'loop.config.mjs'), 'export default {};\n');
+
+  await assert.rejects(initScaffold({ cwd: root }), /Refusing to overwrite existing files:.*loop\.config\.mjs/s);
+  await assert.rejects(readdir(join(root, '.loop', 'prompts')), { code: 'ENOENT' });
+
+  await initScaffold({ cwd: root, force: true });
+  await writeFile(join(root, '.loop', 'prompts', 'custom.md'), 'keep me\n');
+  await initScaffold({ cwd: root, force: true });
+  assert.equal(await readFile(join(root, '.loop', 'prompts', 'custom.md'), 'utf8'), 'keep me\n');
+  await assert.rejects(initScaffold({ cwd: root, preset: 'unknown' }), /Unknown preset "unknown"\. Available: work-item/);
+});
+
+test('init command dispatch returns JSON scaffold results', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loop-init-command-'));
+  const output = [];
+  const result = /** @type {any} */ (await runCliOperationalCommand(
+    parseLoopArgs(['init', '--json']),
+    /** @type {any} */ ({ cwd: root, output: { log: (line) => output.push(line) } }),
+  ));
+
+  assert.equal(result.preset, null);
+  assert.deepEqual(JSON.parse(output[0]), result);
 });
 
 test('a dry run plans every phase without creating state, a worktree, or a branch', async () => {
@@ -3028,6 +3132,90 @@ test('an implement phase that leaves edits uncommitted stalls', async () => {
   assert.match(summary.stalled.reason, /left uncommitted changes/);
 });
 
+test('resume with a note re-drives only the stalled phase and records it in the prompt hash', async () => {
+  const promptCapture = join(await mkdtemp(join(tmpdir(), 'loop-prompts-')), 'prompts.txt');
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const agentScript = `prompt=$1
+printf '%s\\n---\\n' "$prompt" >> ${JSON.stringify(promptCapture)}
+if [ ! -f changed.txt ]; then printf 'changed\\n' > changed.txt; fi
+case "$prompt" in *'commit and stop'*) git add changed.txt && git commit -m 'fix: finish implementation' >/dev/null ;; esac`;
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'note-agent', prompt] }; } } },
+  engines: { default: 'mytool' },
+  phases: ['implement', 'docs'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  const originalExitCode = process.exitCode;
+  console.log = () => {};
+  let initial;
+  let resumed;
+  try {
+    initial = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+    resumed = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, note: 'commit and stop', yes: true } });
+  } finally {
+    console.log = original;
+    process.exitCode = originalExitCode;
+  }
+  assert.match(initial.stalled.reason, /left uncommitted changes/);
+  assert.equal(resumed.stalled, null);
+  const prompts = (await readFile(promptCapture, 'utf8')).split('---\n').filter(Boolean);
+  const notedPrompt = prompts.find((prompt) => prompt.includes('## Operator note (read this first)'));
+  assert.ok(notedPrompt);
+  assert.match(notedPrompt, /commit and stop/);
+  assert.equal(prompts.filter((prompt) => prompt.includes('## Operator note (read this first)')).length, 1);
+  const manifest = JSON.parse(await readFile(join(resumed.runDir, 'manifest.json'), 'utf8'));
+  const initialEntry = manifest.phases.find((entry) => entry.phase === 'implement');
+  const notedEntry = manifest.phases.findLast((entry) => entry.phase === 'implement');
+  assert.notEqual(notedEntry.promptHash, initialEntry.promptHash, 'the note changes the recorded prompt hash');
+});
+
+test('operator notes prefer --note over --note-file and reject blank input', async () => {
+  const { root, workItem } = await repoFixture({ phases: ['implement'] });
+  await writeFile(join(root, 'operator-note.md'), 'from file');
+  const original = console.log;
+  const lines = [];
+  console.log = (line) => lines.push(String(line));
+  try {
+    await runLoop({
+      args: { taskFile: workItem, cwd: root, dryRun: true, yes: true, note: 'from flag', noteFile: 'operator-note.md' },
+    });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /from flag/);
+  assert.doesNotMatch(lines.join('\n'), /from file/);
+  await assert.rejects(
+    runLoop({ args: { taskFile: workItem, cwd: root, dryRun: true, yes: true, note: '   ' } }),
+    /non-whitespace text/,
+  );
+});
+
+test('--from with a note re-runs an already completed phase', async () => {
+  const promptCapture = join(await mkdtemp(join(tmpdir(), 'loop-prompts-')), 'from-prompts.txt');
+  const agentScript = `printf '%s\\n---\\n' "$1" >> ${JSON.stringify(promptCapture)}`;
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'from-agent', prompt] }; } } },
+  engines: { default: 'mytool' },
+  phases: ['docs'],
+  worktrees: false,
+};
+` });
+  const original = console.log;
+  console.log = () => {};
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'docs', note: 'run docs again', yes: true } });
+  } finally {
+    console.log = original;
+  }
+  const prompts = await readFile(promptCapture, 'utf8');
+  assert.equal((prompts.match(/## Operator note \(read this first\)/g) ?? []).length, 1);
+  const state = JSON.parse(await readFile(join(root, '.loop/runs/ss-demo-feature/state.json'), 'utf8'));
+  assert.equal(state.completed.includes('docs'), true);
+});
+
 test('an implement phase that only prints text stalls', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const { root, workItem } = await repoFixture({ config: `export default {
@@ -3669,6 +3857,146 @@ test('a failing gate stalls the run and exits non-zero', async () => {
   assert.match(summary.stalled.reason, /gate failed/);
   assert.deepEqual(summary.phases, [], 'a failing gate is not recorded as a completed phase');
   assert.match(lines.join('\n'), /stalled in "gate"/);
+});
+
+test('a failing gate uses its bounded repair transition and re-gates', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const repairScript = "printf 'fixed\\n' > gate-fixed\ngit add gate-fixed && git commit -m 'fix: repair gate' >/dev/null";
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command() { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(repairScript)}] }; } } },
+  engines: { default: 'mytool' },
+  gate: ['test -f gate-fixed'],
+  phases: [{ name: 'gate', repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'], postconditions: ['clean-tree', 'head-advanced'] }] }],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  console.log = () => {};
+  let summary;
+  try {
+    summary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true, maxRounds: 2 } });
+  } finally {
+    console.log = original;
+  }
+  assert.equal(summary.stalled, null);
+  assert.deepEqual(summary.phases.map((phase) => phase.name), ['gate']);
+  const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
+  assert.deepEqual(manifest.phases.map((entry) => entry.status), ['stalled', 'completed', 'completed']);
+  assert.equal(manifest.phases.at(-1).outputSha, await git(summary.worktree, 'rev-parse', 'HEAD'));
+});
+
+test('a resumed gate repair starts at its saved repair checkpoint before re-gating', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const eventLog = join(await mkdtemp(join(tmpdir(), 'loop-events-')), 'events.log');
+  const repairScript = [`printf 'repair\\n' >> ${JSON.stringify(eventLog)}`, 'printf fixed > gate-fixed', "git add gate-fixed && git commit -m 'fix: repair gate' >/dev/null"].join('\n');
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command() { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(repairScript)}] }; } } },
+  engines: { default: 'mytool' },
+  gate: [${JSON.stringify(`printf 'gate\\n' >> ${eventLog}; test -f gate-fixed`)}],
+  phases: [{ name: 'gate', repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'], postconditions: ['clean-tree', 'head-advanced'] }] }],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  await state.record({
+    pendingRepairs: {
+      gate: {
+        round: 1,
+        reviewedSha: await git(root, 'rev-parse', 'HEAD'),
+        verdict: { blocking: [] },
+        gateOk: false,
+        gateFailure: 'test -f gate-fixed\\ngate was red',
+        nextRepair: 0,
+      },
+    },
+  });
+
+  const original = console.log;
+  console.log = () => {};
+  let summary;
+  try {
+    summary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+
+  assert.equal(summary.stalled, null);
+  assert.deepEqual((await readFile(eventLog, 'utf8')).trim().split('\n'), ['repair', 'gate']);
+  const resumedState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  assert.equal(resumedState.data.pendingRepairs?.gate, undefined, 'the passing re-gate clears the saved checkpoint');
+});
+
+test('a noted completed phase invalidates downstream gate and review attestations', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const gateLog = join(await mkdtemp(join(tmpdir(), 'loop-events-')), 'gates.log');
+  const agentScript = [
+    'prompt=$1',
+    `case "$prompt" in *'Take on the role of a senior developer'*)`,
+    "  verdict_path=$(printf '%s\\n' \"$prompt\" | sed -n 's/.*write this JSON to `\\([^`]*\\)`.*/\\1/p')",
+    "  printf '%s\\n' '{\"verdict\":\"APPROVED\",\"blocking\":[]}' > \"$verdict_path\"",
+    '  ;;',
+    `*'second implementation'*) printf implemented > second.txt; git add second.txt && git commit -m 'feat: implement fixture' >/dev/null ;;`,
+    "*) printf implemented > first.txt; git add first.txt && git commit -m 'feat: implement fixture' >/dev/null ;;",
+    'esac',
+  ].join('\n');
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'note-agent', prompt] }; } } },
+  engines: { default: 'mytool' },
+  gate: [${JSON.stringify(`printf 'gate\\n' >> ${gateLog}`)}],
+  phases: ['implement', 'gate', 'review'],
+  maxRounds: 1,
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+
+  const original = console.log;
+  console.log = () => {};
+  let initial;
+  let resumed;
+  try {
+    initial = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+    resumed = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'implement', note: 'second implementation', yes: true } });
+  } finally {
+    console.log = original;
+  }
+
+  assert.equal(initial.stalled, null);
+  assert.equal(resumed.stalled, null);
+  assert.deepEqual((await readFile(gateLog, 'utf8')).trim().split('\n'), ['gate', 'gate']);
+  const manifest = JSON.parse(await readFile(join(resumed.runDir, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.phases.filter((entry) => entry.phase === 'gate' && entry.status === 'completed').length, 2);
+  assert.equal(manifest.phases.filter((entry) => entry.phase === 'review' && entry.status === 'completed').length, 2);
+  assert.equal(manifest.phases.filter((entry) => entry.phase === 'gate' && entry.status === 'skipped').length, 0);
+  assert.equal(manifest.phases.filter((entry) => entry.phase === 'review' && entry.status === 'skipped').length, 0);
+  const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  assert.equal(state.data.rounds.review, 1, 'the re-run review starts from its first round');
+  assert.equal(state.data.reviewedShas.review[1], await git(resumed.worktree, 'rev-parse', 'HEAD'));
+});
+
+test('a gate repair cap stalls with the last gate output', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command() { return { command: '/bin/sh', args: ['-c', ''] }; } } },
+  engines: { default: 'mytool' },
+  gate: ['printf last-gate >&2; exit 1'],
+  phases: [{ name: 'gate', repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'], postconditions: ['clean-tree'] }] }],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  const originalExitCode = process.exitCode;
+  console.log = () => {};
+  let summary;
+  try {
+    summary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true, maxRounds: 2 } });
+  } finally {
+    console.log = original;
+    process.exitCode = originalExitCode;
+  }
+  assert.match(summary.stalled.reason, /gate failed/);
+  assert.match(summary.stalled.output, /last-gate/);
+  const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.phases.filter((entry) => entry.phase === 'gate').length, 3);
 });
 
 test('gate commands run through a shell so quoting and && survive', async () => {
@@ -5039,8 +5367,10 @@ test('real hermetic runtime mounts the default worktree and enforces network pol
   const server = createServer((request, response) => {
     response.end(request.url === '/hermetic-probe' ? 'ok\n' : 'not found\n');
   });
-  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
-  const port = server.address().port;
+  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', () => resolvePromise()));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const port = address.port;
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-hermetic-trees-'));
   const commitCommand = [
     'git config --global --add safe.directory "$PWD"',

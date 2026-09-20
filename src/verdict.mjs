@@ -1,3 +1,6 @@
+/** @typedef {import('./types.js').Finding} Finding */
+/** @typedef {import('./types.js').Verdict} Verdict */
+
 import { readFile } from 'node:fs/promises';
 
 export const APPROVED = 'APPROVED';
@@ -19,6 +22,7 @@ function extractJson(text) {
   }
 }
 
+/** @param {Finding[]} list */
 function validateFindings(list, label) {
   list.forEach((finding, index) => {
     const prefix = `${label}[${index}] is malformed:`;
@@ -39,6 +43,7 @@ function validateFindings(list, label) {
   });
 }
 
+/** @returns {Finding[]} */
 function parseFindingList(value, label) {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
@@ -55,9 +60,10 @@ function parseFindingList(value, label) {
  * approval ships unreviewed code, and defaulting to changes burns rounds
  * against a reviewer that is not actually reporting.
  */
+/** @returns {Verdict} */
 export function parseVerdict(text) {
   const data = extractJson(text);
-  const verdict = String(data.verdict ?? '').toUpperCase();
+  const verdict = /** @type {Verdict['verdict']} */ (String(data.verdict ?? '').toUpperCase());
   if (![APPROVED, CHANGES_REQUESTED].includes(verdict)) {
     throw new Error(`Verdict must be ${APPROVED} or ${CHANGES_REQUESTED}, got ${JSON.stringify(data.verdict)}.`);
   }
@@ -79,6 +85,7 @@ export function parseVerdict(text) {
   };
 }
 
+/** @returns {Promise<Verdict>} */
 export async function readVerdict(path) {
   let text;
   try {
@@ -92,6 +99,7 @@ export async function readVerdict(path) {
   return parseVerdict(text);
 }
 
+/** @param {Finding[]} findings */
 export function formatFindings(findings) {
   if (!findings.length) return '(none)';
   return findings

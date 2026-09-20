@@ -8,7 +8,7 @@ import { resolveWindowsExecutable, runCommand } from '../src/command.mjs';
 import { openTerminalInput } from '../src/reporter.mjs';
 
 function fakeChild(pid = 1234) {
-  const child = new EventEmitter();
+  const child = /** @type {any} */ (new EventEmitter());
   child.pid = pid;
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
@@ -136,6 +136,7 @@ test('Windows launches a PATH-resolved .cmd fixture through ComSpec', { skip: pr
 
 test('Windows command timeouts terminate the whole process tree with taskkill', async () => {
   const child = fakeChild(4321);
+  /** @type {any} */
   let taskkill;
   const spawnImpl = (command, args, options) => {
     if (command === 'taskkill') {
@@ -153,14 +154,14 @@ test('Windows command timeouts terminate the whole process tree with taskkill', 
   });
   setTimeout(() => taskkill && child.emit('close', null, 'SIGKILL'), 5);
 
-  await assert.rejects(result, (error) => error.code === 'ETIMEDOUT');
+  await assert.rejects(result, (error) => /** @type {any} */ (error).code === 'ETIMEDOUT');
   assert.deepEqual(taskkill.args, ['/PID', '4321', '/T', '/F']);
   assert.equal(child.directlyKilled, undefined);
 });
 
 test('Windows command timeouts fall back when taskkill cannot start', async () => {
   const child = fakeChild(4322);
-  const taskkill = new EventEmitter();
+  const taskkill = /** @type {any} */ (new EventEmitter());
   const spawnImpl = (command) => {
     if (command === 'taskkill') {
       setImmediate(() => taskkill.emit('error', new Error('taskkill unavailable')));
@@ -174,13 +175,13 @@ test('Windows command timeouts fall back when taskkill cannot start', async () =
     timeoutMs: 1,
     resolveExecutable: () => 'C:\\Tools\\claude.exe',
     spawnImpl,
-  }), (error) => error.code === 'ETIMEDOUT');
+  }), (error) => /** @type {any} */ (error).code === 'ETIMEDOUT');
   assert.equal(child.directlyKilled, true);
 });
 
 test('Windows command timeouts fall back when taskkill exits unsuccessfully', async () => {
   const child = fakeChild(4323);
-  const taskkill = new EventEmitter();
+  const taskkill = /** @type {any} */ (new EventEmitter());
   const spawnImpl = (command) => {
     if (command === 'taskkill') {
       setImmediate(() => taskkill.emit('close', 1, null));
@@ -194,7 +195,7 @@ test('Windows command timeouts fall back when taskkill exits unsuccessfully', as
     timeoutMs: 1,
     resolveExecutable: () => 'C:\\Tools\\claude.exe',
     spawnImpl,
-  }), (error) => error.code === 'ETIMEDOUT');
+  }), (error) => /** @type {any} */ (error).code === 'ETIMEDOUT');
   assert.equal(child.directlyKilled, true);
 });
 

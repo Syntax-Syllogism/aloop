@@ -23,5 +23,12 @@ export {
   cleanRuns,
   doctor,
 } from './operations.mjs';
+export {
+  runEval,
+  runEvalCell,
+  summarizeEval,
+  formatEvalTable,
+  formatEvalSummaryTable,
+} from './eval.mjs';
 export { githubBackend } from './publish.mjs';
 export { gitlabBackend, glabTransport, parseGitLabRemoteUrl } from './backends/gitlab.mjs';

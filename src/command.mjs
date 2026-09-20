@@ -2,11 +2,8 @@ import { spawn } from 'node:child_process';
 import { existsSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { win32 as windowsPath } from 'node:path';
 
-export function signalProcessGroup(pid, signal, {
-  platform = process.platform,
-  spawnImpl = spawn,
-  onFailure,
-} = {}) {
+export function signalProcessGroup(pid, signal, options = {}) {
+  const { platform = process.platform, spawnImpl = spawn, onFailure } = /** @type {any} */ (options);
   if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
   if (platform === 'win32') {
     const handleFailure = onFailure ?? (() => {
@@ -63,10 +60,8 @@ function environmentValue(env, name) {
   return key ? env[key] : undefined;
 }
 
-export function resolveWindowsExecutable(command, env = process.env, {
-  fileExists = existsSync,
-  realPath = realpathSync.native,
-} = {}) {
+export function resolveWindowsExecutable(command, env = process.env, options = {}) {
+  const { fileExists = existsSync, realPath = realpathSync.native } = /** @type {any} */ (options);
   const pathEntries = (environmentValue(env, 'PATH') ?? '').split(';').filter(Boolean);
   const pathExtensions = (environmentValue(env, 'PATHEXT') ?? WINDOWS_EXECUTABLE_EXTENSIONS.join(';'))
     .split(';')
@@ -144,7 +139,7 @@ export async function runCommand(command, args = [], options = {}) {
     platform = process.platform,
     spawnImpl = spawn,
     resolveExecutable = resolveWindowsExecutable,
-  } = options;
+  } = /** @type {any} */ (options);
   return new Promise((resolve, reject) => {
     const spawnSpec = platform === 'win32' ? windowsSpawnSpec(command, args, env, resolveExecutable) : { command, args };
     const child = spawnImpl(spawnSpec.command, spawnSpec.args, {

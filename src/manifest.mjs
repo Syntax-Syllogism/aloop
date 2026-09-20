@@ -1,3 +1,5 @@
+/** @typedef {import('./types.js').ManifestEntry} ManifestEntry */
+
 import { createHash } from 'node:crypto';
 import { rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -40,10 +42,12 @@ export function hashConfig(config) {
 }
 
 export class Manifest {
+  /** @param {ManifestEntry[]} [entries] */
   constructor(entries = []) {
     this.entries = [...entries];
   }
 
+  /** @param {ManifestEntry} entry @returns {ManifestEntry} */
   append(entry) {
     const now = new Date().toISOString();
     const recorded = {

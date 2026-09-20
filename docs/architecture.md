@@ -21,10 +21,10 @@ operations that the runner invokes.
 `src/runner.mjs` owns the phase workflow. Given normalized phase descriptors
 and injected operations, it handles phase selection and resume skipping,
 interactive confirmation, clean-tree and publishing guards, retries, verdict
-and repair rounds, checkpoints, and completion or stall reporting. Keeping this
-control flow independent of the concrete operations makes descriptor-driven
-workflow changes easier to reason about without moving CLI setup or persistence
-details.
+and standalone-gate repair rounds, checkpoints, and completion or stall
+reporting. Keeping this control flow independent of the concrete operations
+makes descriptor-driven workflow changes easier to reason about without moving
+CLI setup or persistence details.
 
 ## Deterministic policy
 
@@ -50,12 +50,35 @@ support](platform.md).
 
 `src/reporter.mjs` owns terminal-facing concerns: progress banners, phase and
 summary formatting, terminal confirmation input, and final reporting. It does
-not decide which phases execute.
+not decide which phases execute. Its `banner`/`log` calls fan out to whichever
+renderer is active, which is how `src/tui.mjs` — the live-dashboard renderer
+described in [Agentic loop runner](loop.md) — slots in as a second renderer
+without `runner.mjs` or `pipeline.mjs` knowing which one is live.
 
 `src/worktree.mjs` owns worktree planning, creation, and resume validation. It
 checks a saved worktree through Git before resuming rather than silently
 substituting another checkout. The persisted-worktree and recovery contract is
 documented in [Run state and recovery](run-state.md).
+
+## Static contracts
+
+The runtime remains ESM JavaScript. `tsconfig.json` runs TypeScript in strict,
+no-emit JSDoc-checking mode over the production modules, CLI, and tests. The
+shared contracts are declared in `src/types.d.ts`; importing them in JSDoc with
+`import('./types.js')` adds no runtime dependency or emitted output.
+
+Use those shared contracts when a value crosses a module boundary, such as a
+phase descriptor, adapter, resolved configuration, run state, manifest entry,
+or review verdict. Keep implementation-specific local shapes local rather than
+growing the shared declaration file preemptively. Files marked `// @ts-nocheck`
+remain deliberately outside the checker while they are incrementally typed;
+do not remove that marker without making the file pass the configured strict
+check. Type-only fixtures in `test/type-contracts.test.mjs` exercise the
+contracts with valid examples and expected invalid assignments.
+
+Run `npm run typecheck` after changing the shared declarations, JSDoc imports,
+or a checked JavaScript file. Continuous integration runs the same command
+before the test suite.
 
 ## Related components
 

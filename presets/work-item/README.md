@@ -18,14 +18,16 @@ branches, engines, phases, and `npm test` gate. Adjust it for your repository.
 
 ## Installation
 
-Install the package, create `.loop/prompts/`, and copy the preset prompts into
-the project override directory:
+Install the package, then initialize the project with the preset:
 
 ```sh
-mkdir -p .loop/prompts
-cp -r node_modules/@syntax-syllogism/aloop/presets/work-item/prompts/. .loop/prompts/
+aloop init --preset work-item
 ```
 
-The runner loads project prompt overrides before its packaged defaults. Keep the
-sample config as a starting point for `loop.config.mjs` if its settings match
-your repository.
+This writes the sample config and preset prompts into your project, with the
+packaged defaults filling any prompts the preset does not provide. The runner
+loads project prompt overrides before its packaged defaults.
+
+If you prefer to wire it up by hand, create `.loop/prompts/` and copy the
+contents of `node_modules/@syntax-syllogism/aloop/presets/work-item/prompts/`
+there; copy `loop.config.mjs` separately if its settings match your repository.

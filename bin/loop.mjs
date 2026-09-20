@@ -10,6 +10,7 @@ import {
   doctor,
   getAggregateMetrics,
   getRun,
+  init,
   inspectRun,
   listRuns,
   resolveRunsDir,
@@ -17,7 +18,7 @@ import {
 import { computeRunMetrics } from '../src/metrics.mjs';
 import { runLoop } from '../src/pipeline.mjs';
 
-const commands = new Set(['run', 'list', 'status', 'inspect', 'cancel', 'clean', 'doctor', 'metrics']);
+const commands = new Set(['run', 'list', 'status', 'inspect', 'cancel', 'clean', 'doctor', 'metrics', 'init']);
 
 export function parseLoopArgs(argv) {
   const command = commands.has(argv[0]) ? argv[0] : 'run';
@@ -37,12 +38,17 @@ export function parseLoopArgs(argv) {
       'max-rounds': { type: 'string' },
       from: { type: 'string' },
       resume: { type: 'boolean' },
+      note: { type: 'string' },
+      'note-file': { type: 'string' },
       yes: { type: 'boolean', short: 'y' },
       'no-worktree': { type: 'boolean' },
+      'no-tui': { type: 'boolean' },
       'dry-run': { type: 'boolean' },
       json: { type: 'boolean' },
       metrics: { type: 'boolean' },
       'older-than': { type: 'string' },
+      preset: { type: 'string' },
+      force: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
     allowPositionals: true,
@@ -79,12 +85,17 @@ export function parseLoopArgs(argv) {
     maxRounds,
     from: values.from,
     resume: values.resume,
+    note: values.note,
+    noteFile: values['note-file'],
     yes: values.yes,
     noWorktree: values['no-worktree'],
+    noTui: values['no-tui'],
     dryRun: values['dry-run'],
     json: values.json,
     metrics: values.metrics,
     olderThanDays,
+    preset: values.preset,
+    force: values.force,
   };
 }
 
@@ -100,6 +111,7 @@ export function usage() {
     '  cancel <name>           Stop a run and release its lock',
     '  clean                   Preview/remove completed runs older than 30 days',
     '  doctor                  Check configuration and local tooling',
+    '  init                    Scaffold loop.config.mjs and .loop/prompts',
     '  run                     Start or resume a run (the default)',
     '',
     'Operational options:',
@@ -108,6 +120,10 @@ export function usage() {
     '      --older-than <n>    Clean completed runs older than n days',
     '  -y, --yes               Confirm destructive clean operations',
     '      --dry-run           Preview clean operations without changing files',
+    '',
+    'Init options:',
+    '      --preset <name>     Seed init from a bundled preset (e.g. work-item)',
+    '      --force             Overwrite existing scaffold files',
     '',
     'Run options:',
     '  -t, --task <text>       Inline task description',
@@ -122,7 +138,10 @@ export function usage() {
     '      --max-rounds <n>    Cap on review/repair rounds',
     '      --from <phase>      Start at this phase',
     '      --resume            Skip phases already recorded complete',
+    '      --note <text>       Give the resumed phase an authoritative instruction',
+    '      --note-file <path>  Read the instruction from a file (--note wins)',
     '      --no-worktree       Work in the current checkout instead of a worktree',
+    '      --no-tui            Force plain streaming output (TUI is on by default on a TTY)',
     '  -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)',
     '      --dry-run           Print the plan and rendered prompts, run nothing',
   ].join('\n');
@@ -258,6 +277,16 @@ export async function runOperationalCommand(args, { cwd = process.cwd(), output 
     }
     return result;
   }
+  if (args.command === 'init') {
+    const result = await init({ cwd, preset: args.preset, force: args.force });
+    if (args.json) output.log(JSON.stringify(result, null, 2));
+    else {
+      for (const file of result.created) output.log(`  create  ${file}`);
+      for (const file of result.skipped) output.log(`  skip    ${file} (exists)`);
+      output.log(result.preset ? `Initialized aloop with preset "${result.preset}".` : 'Initialized aloop.');
+    }
+    return result;
+  }
   throw new Error(`Unknown command: ${args.command}`);
 }
 
@@ -270,7 +299,7 @@ if (isMainEntrypoint(import.meta.url)) {
       await runLoop({ args });
     } else {
       const result = await runOperationalCommand(args);
-      if (args.command === 'doctor' && !result.ok) process.exitCode = 1;
+      if (args.command === 'doctor' && !(/** @type {any} */ (result)).ok) process.exitCode = 1;
     }
   } catch (error) {
     console.error(error.message);

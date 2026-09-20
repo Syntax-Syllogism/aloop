@@ -1,6 +1,6 @@
-import { access, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { access, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { adapterFor, agentForPhase } from './adapters.mjs';
 import { runCommand, signalProcessGroup } from './command.mjs';
@@ -8,8 +8,43 @@ import { defaults, loadConfig, loadRunsDir } from './config.mjs';
 import { GitFacade } from './git.mjs';
 import { computeAggregateMetrics, computeRunMetrics, readRunManifests } from './metrics.mjs';
 import { RunState, slugFor } from './state.mjs';
+import { packagePrompts } from './prompts.mjs';
 
 const PULL_REQUEST_URL = /https?:\/\/[^\s"'`<>]+(?:\/pull\/\d+|\/merge_requests\/\d+)[^\s"'`<>]*/i;
+
+const packagePresets = join(dirname(packagePrompts), 'presets');
+
+const CONFIG_HEADER = `// aloop configuration — see docs/loop.md for the full reference.
+//
+// REVIEW THESE before your first run:
+//   baseBranch     the branch you merge into (for example, 'main' or 'master')
+//   remote         set this when your repository has more than one remote
+//   engines        choose the agent that runs each phase
+//
+// SAFE TO CHANGE anytime:
+//   phases         the pipeline stages and their order
+//   gate           commands that must pass before review
+//   branchPrefix, maxRounds, timeoutMs
+//
+// Prompts live in .loop/prompts/ — edit any *.md there to change what each
+// phase tells the agent. Delete a file to fall back to the packaged default.
+`;
+
+const CONFIG_FOOTER = '// happy agentic looping :)\n';
+
+const EMBEDDED_STARTER = `export default {
+  baseBranch: 'master',   // <- set to your default branch
+  branchPrefix: 'feat/',
+  remote: null,           // <- set this if you have more than one remote
+  engines: {
+    default: { name: 'claude' },
+    // review: { name: 'codex' },  // optional: use a different reviewer
+  },
+  phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
+  gate: [],               // <- e.g. ['npm test'] before review
+  maxRounds: 3,
+};
+`;
 
 async function readJson(path, { optional = true } = {}) {
   try {
@@ -417,7 +452,8 @@ async function operationalContext(cwd, configPath, { validate = false } = {}) {
   return { config, repoRoot, rootGit, runsDir: resolve(repoRoot, config.runsDir) };
 }
 
-export async function listRuns({ cwd = process.cwd(), configPath } = {}) {
+export async function listRuns(options = {}) {
+  const { cwd = process.cwd(), configPath } = /** @type {any} */ (options);
   const context = await operationalContext(cwd, configPath);
   let entries;
   try {
@@ -434,7 +470,8 @@ export async function listRuns({ cwd = process.cwd(), configPath } = {}) {
   return runs.sort((a, b) => (b.updatedAt ?? b.startedAt ?? '').localeCompare(a.updatedAt ?? a.startedAt ?? ''));
 }
 
-export async function getRun(name, { cwd = process.cwd(), configPath } = {}) {
+export async function getRun(name, options = {}) {
+  const { cwd = process.cwd(), configPath } = /** @type {any} */ (options);
   const slug = slugFor(name);
   if (!slug) throw new Error('A run name is required.');
   const context = await operationalContext(cwd, configPath);
@@ -453,7 +490,8 @@ export async function inspectRun(name, options = {}) {
   };
 }
 
-export async function cancelRun(name, { cwd = process.cwd(), configPath } = {}) {
+export async function cancelRun(name, options = {}) {
+  const { cwd = process.cwd(), configPath } = /** @type {any} */ (options);
   const context = await operationalContext(cwd, configPath);
   const slug = slugFor(name);
   if (!slug) throw new Error('A run name is required.');
@@ -570,7 +608,8 @@ async function stopProcesses(targets) {
   return waitForProcessesToStop(watched, 5000);
 }
 
-export async function cleanRuns({ cwd = process.cwd(), configPath, olderThanDays = 30, dryRun = false, yes = false } = {}) {
+export async function cleanRuns(options = {}) {
+  const { cwd = process.cwd(), configPath, olderThanDays = 30, dryRun = false, yes = false } = /** @type {any} */ (options);
   const context = await operationalContext(cwd, configPath);
   const runs = await listRuns({ cwd, configPath });
   const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
@@ -603,6 +642,79 @@ export async function cleanRuns({ cwd = process.cwd(), configPath, olderThanDays
   };
 }
 
+async function promptFilesIn(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+    .map((entry) => entry.name)
+    .sort();
+}
+
+async function bundledPresets() {
+  const entries = await readdir(packagePresets, { withFileTypes: true });
+  const presets = new Map();
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const root = join(packagePresets, entry.name);
+    if (await pathExists(join(root, 'loop.config.mjs')) && await isDirectory(join(root, 'prompts'))) {
+      presets.set(entry.name, root);
+    }
+  }
+  return presets;
+}
+
+async function resolvePresetRoot(name) {
+  if (typeof name !== 'string' || !name.trim()) throw new Error('--preset requires a name.');
+  const presets = await bundledPresets();
+  const root = presets.get(name);
+  if (root) return root;
+  const available = [...presets.keys()].sort().join(', ') || '(none)';
+  throw new Error(`Unknown preset "${name}". Available: ${available}.`);
+}
+
+async function renderInitConfig(presetRoot) {
+  const body = presetRoot
+    ? await readFile(join(presetRoot, 'loop.config.mjs'), 'utf8')
+    : EMBEDDED_STARTER;
+  return `${CONFIG_HEADER}\n${body.trimEnd()}\n\n${CONFIG_FOOTER}`;
+}
+
+/**
+ * Scaffold a self-contained aloop configuration and editable prompt overrides.
+ */
+export async function init({ cwd = process.cwd(), preset = null, force = false } = {}) {
+  const presetRoot = preset === null || preset === undefined ? null : await resolvePresetRoot(preset);
+  const promptTargetDir = join(cwd, '.loop', 'prompts');
+  const promptSources = [packagePrompts, ...(presetRoot ? [join(presetRoot, 'prompts')] : [])];
+  const prompts = new Map();
+  for (const sourceDir of promptSources) {
+    for (const name of await promptFilesIn(sourceDir)) prompts.set(name, join(sourceDir, name));
+  }
+
+  const plan = /** @type {any[]} */ ([
+    { target: join(cwd, 'loop.config.mjs'), kind: 'config' },
+    ...[...prompts.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([name, source]) => ({
+      target: join(promptTargetDir, name), source, kind: 'prompt',
+    })),
+  ]);
+  const existing = [];
+  for (const item of plan) {
+    if (await pathExists(item.target)) existing.push(relative(cwd, item.target));
+  }
+  if (existing.length && !force) {
+    const error = new Error(`Refusing to overwrite existing files:\n  ${existing.join('\n  ')}\nRe-run with --force to overwrite.`);
+    error.command = true;
+    throw error;
+  }
+
+  await mkdir(promptTargetDir, { recursive: true });
+  for (const item of plan) {
+    if (item.kind === 'config') await writeFile(item.target, await renderInitConfig(presetRoot), 'utf8');
+    else await copyFile(item.source, item.target);
+  }
+  return { preset: presetRoot ? preset : null, created: plan.map((item) => relative(cwd, item.target)), skipped: [] };
+}
+
 async function checkCommand(command, args, cwd) {
   try {
     await runCommand(command, args, { cwd });
@@ -612,7 +724,8 @@ async function checkCommand(command, args, cwd) {
   }
 }
 
-export async function doctor({ cwd = process.cwd(), configPath } = {}) {
+export async function doctor(options = {}) {
+  const { cwd = process.cwd(), configPath } = /** @type {any} */ (options);
   const checks = [];
   let context;
   try {

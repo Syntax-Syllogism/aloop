@@ -1,3 +1,8 @@
+/** @typedef {import('./types.js').Config} Config */
+/** @typedef {import('./types.js').Operations} Operations */
+/** @typedef {import('./types.js').RunState} RunState */
+/** @typedef {import('./types.js').Summary} Summary */
+
 import { stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { codePhasePostcondition, hasPostcondition, phaseIsSkippable, publishingAttestation } from './policy.mjs';
@@ -60,12 +65,33 @@ async function invalidateGateCompletion(state, reviewedSha) {
   await state.record({ completed: state.data.completed.filter((name) => name !== gate.phase) });
 }
 
-async function runRepairs(phase, ctx, baseVariables, pending, operations) {
+async function invalidateFollowingPhaseState(state, phases, phaseName) {
+  const phaseIndex = phases.findIndex((phase) => phase.name === phaseName);
+  const followingNames = new Set(phases.slice(phaseIndex + 1).map((phase) => phase.name));
+  if (!followingNames.size) return;
+
+  const completed = state.data.completed.filter((name) => !followingNames.has(name));
+  const phaseState = Object.fromEntries(
+    Object.entries(state.data.phases ?? {}).filter(([name]) => !followingNames.has(name)),
+  );
+  const pendingRepairs = Object.fromEntries(
+    Object.entries(state.data.pendingRepairs ?? {}).filter(([name]) => !followingNames.has(name)),
+  );
+  const rounds = Object.fromEntries(
+    Object.entries(state.data.rounds ?? {}).filter(([name]) => !followingNames.has(name)),
+  );
+  const reviewedShas = Object.fromEntries(
+    Object.entries(state.data.reviewedShas ?? {}).filter(([name]) => !followingNames.has(name)),
+  );
+  await state.record({ completed, phases: phaseState, pendingRepairs, rounds, reviewedShas });
+}
+
+async function runRepairs(phase, ctx, baseVariables, pending, operations, { retainCheckpoint = false } = {}) {
   const {
     budgetStatus, manifestEntry, recordBudgetStall, recordManifest, runAgent, runGate, withRetries,
   } = operations;
-  let gateOk = true;
-  let gateFailure = null;
+  let gateOk = pending.gateOk ?? true;
+  let gateFailure = pending.gateFailure ?? null;
   for (let index = pending.nextRepair; index < phase.repair.length; index += 1) {
     const repair = phase.repair[index];
     const budget = budgetStatus(ctx);
@@ -108,12 +134,15 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations) {
       const headBefore = !ctx.dryRun && (hasPostcondition(repair, 'head-advanced') || hasPostcondition(repair, 'head-advanced-or-rebuttal'))
         ? await ctx.git.revParse()
         : null;
-      const result = await withRetries(repair, () => runAgent(repair, ctx, {
+      const repairCtx = ctx.note?.targetPhase === phase.name
+        ? { ...ctx, note: { ...ctx.note, repairPhase: repair.name } }
+        : ctx;
+      const result = await withRetries(repair, () => runAgent(repair, repairCtx, {
         ...baseVariables,
         ROUND: pending.round,
         MAX_ROUNDS: phase.maxRounds,
         VERDICT_FILE: ctx.state.verdictPath(pending.round),
-        FINDINGS: formatFindings(pending.verdict.blocking),
+        FINDINGS: formatFindings(pending.verdict?.blocking ?? []),
         SINCE_SHA: pending.reviewedSha,
         GATE_STATUS: gateOk ? 'passing' : `FAILING\n${gateFailure}`,
       }));
@@ -144,8 +173,75 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations) {
       },
     });
   }
-  await clearPendingRepair(phase, ctx.state);
+  if (!retainCheckpoint) await clearPendingRepair(phase, ctx.state);
   return { gateOk, gateFailure };
+}
+
+async function runGateAttempt(phase, ctx, operations, options = {}) {
+  const { round } = /** @type {any} */ (options);
+  const { manifestEntry, recordManifest, runGate, withRetries } = operations;
+  const startedAt = new Date().toISOString();
+  const inputSha = await ctx.git.revParse();
+  const result = await withRetries(phase, () => runGate(phase, ctx), { failed: (attempt) => !attempt.ok });
+  await recordManifest(ctx, manifestEntry(phase, ctx, {
+    inputSha,
+    outputSha: await ctx.git.revParse(),
+    artifacts: [`${phase.name}.log`],
+    gateReceipts: result.gateReceipts,
+    execution: result.execution,
+    startedAt,
+    completedAt: new Date().toISOString(),
+    durationMs: result.durationMs,
+    status: result.ok ? 'completed' : 'stalled',
+    ...(round === undefined ? {} : { round }),
+  }));
+  return result;
+}
+
+async function runGateRepairLoop(phase, ctx, variables, operations) {
+  let result = null;
+  let pending = ctx.resume ? ctx.state.data.pendingRepairs?.[phase.name] : null;
+  let round = pending?.round ?? 1;
+
+  while (round <= phase.maxRounds) {
+    if (pending) {
+      result = {
+        ok: false,
+        command: phase.name,
+        output: pending.gateFailure ?? '',
+      };
+      const repairResult = await runRepairs(phase, ctx, variables, pending, operations, { retainCheckpoint: true });
+      if (repairResult.stalled) {
+        return { result, stalled: repairResult.stalled, stalledPhase: repairResult.stalledPhase, budgetStall: repairResult.budgetStall };
+      }
+      // The checkpoint's repairs have completed, so re-gate deliberately before
+      // deciding whether another repair round is needed.
+      result = await runGateAttempt(phase, ctx, operations, { round });
+      if (result.ok) {
+        await clearPendingRepair(phase, ctx.state);
+        return { result };
+      }
+      pending = null;
+      round += 1;
+      continue;
+    }
+
+    result ??= await runGateAttempt(phase, ctx, operations);
+    if (result.ok) return { result };
+
+    pending = {
+      round,
+      reviewedSha: await ctx.git.revParse(),
+      verdict: { blocking: [] },
+      gateOk: false,
+      gateFailure: `${result.command}\n${result.output}`,
+      nextRepair: 0,
+    };
+    await ctx.state.record({
+      pendingRepairs: { ...ctx.state.data.pendingRepairs, [phase.name]: pending },
+    });
+  }
+  return { result };
 }
 
 /**
@@ -327,7 +423,16 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
   }
 }
 
-/** Drive phase descriptors using operations supplied by the composition root. */
+/**
+ * Drive phase descriptors using operations supplied by the composition root.
+ *
+ * @param {{
+ *   args: Record<string, any>, config: Config, state: RunState, ctx: any,
+ *   variables: Record<string, unknown>, summary: Summary, remote: string,
+ *   branch: string, baseBranch: string, confirmInput: any,
+ *   terminalOpener: any, operations: Operations,
+ * }} input
+ */
 export async function runPhases({
   args, config, state, ctx, variables, summary, remote, branch, baseBranch,
   confirmInput, terminalOpener, operations,
@@ -343,9 +448,22 @@ export async function runPhases({
   }
 
   const phasesToRun = config.resolvedPhases.slice(startIndex);
+  const noteTarget = args.from ?? (args.resume
+    ? phasesToRun.find((phase) => !state.isComplete(phase.name))?.name
+    : phasesToRun[0]?.name);
+  if (ctx.note) {
+    const target = config.resolvedPhases.find((phase) => phase.name === noteTarget);
+    if (!target) throw new Error('--note needs a phase to run; use --from to target a completed phase.');
+    const hasAgentRepair = target.kind === 'gate' && target.repair?.some((repair) => repair.kind === 'agent');
+    if (target.kind !== 'agent' && !hasAgentRepair) {
+      throw new Error(`--note cannot target ${target.kind} phase "${target.name}" without an agent repair phase.`);
+    }
+    ctx.note = { ...ctx.note, targetPhase: target.name };
+  }
   for (const [phaseIndex, phase] of phasesToRun.entries()) {
     const isFinalPhase = phaseIndex === phasesToRun.length - 1;
-    if (args.resume && state.data.phases?.[phase.name]?.budgetExhausted) {
+    const forceNotedPhase = args.resume && args.from === phase.name && ctx.note?.targetPhase === phase.name;
+    if (args.resume && state.data.phases?.[phase.name]?.budgetExhausted && !forceNotedPhase) {
       const budget = budgetStatus(ctx);
       if (budget) {
         summary.stalled = await recordBudgetStall(ctx, phase, budget);
@@ -356,7 +474,7 @@ export async function runPhases({
       summary.phases.push({ name: phase.name, ok: true });
       continue;
     }
-    if (args.resume && state.isComplete(phase.name)) {
+    if (args.resume && state.isComplete(phase.name) && !forceNotedPhase) {
       log(`\n── ${phase.name}: already complete, skipping`);
       await recordManifest(ctx, manifestEntry(phase, ctx, { status: 'skipped' }));
       continue;
@@ -392,6 +510,9 @@ export async function runPhases({
         await recordManifest(ctx, manifestEntry(phase, ctx, { status: 'skipped' }));
         continue;
       }
+    }
+    if (forceNotedPhase) {
+      await invalidateFollowingPhaseState(state, config.resolvedPhases, phase.name);
     }
     if (!phase.verdict) banner(phase.name);
     if (phase.requiresCleanTree && !ctx.dryRun) {
@@ -439,18 +560,29 @@ export async function runPhases({
         log(`  would run: ${(phase.commands ?? config.gate).join(' && ')}`);
         continue;
       }
-      const startedAt = new Date().toISOString();
-      const inputSha = await ctx.git.revParse();
-      const result = await withRetries(phase, () => runGate(phase, ctx), { failed: (attempt) => !attempt.ok });
-      await recordManifest(ctx, manifestEntry(phase, ctx, {
-        inputSha, outputSha: await ctx.git.revParse(), artifacts: [`${phase.name}.log`],
-        gateReceipts: result.gateReceipts, startedAt, completedAt: new Date().toISOString(),
-        execution: result.execution,
-        durationMs: result.durationMs, status: result.ok ? 'completed' : 'stalled',
-      }));
-      if (!result.ok) {
-        summary.stalled = { phase: phase.name, reason: `gate failed: ${result.command}`, output: result.output };
-        break;
+      if (phase.repair?.length) {
+        const repaired = await runGateRepairLoop(phase, ctx, variables, operations);
+        if (repaired.stalled) {
+          if (!repaired.budgetStall) {
+            await markStalledManifest(ctx, phase, repaired, state.manifest.entries.length - 1);
+          }
+          summary.stalled = {
+            phase: repaired.stalledPhase ?? phase.name,
+            reason: repaired.stalled,
+            output: repaired.result.output,
+          };
+          break;
+        }
+        if (!repaired.result.ok) {
+          summary.stalled = { phase: phase.name, reason: `gate failed: ${repaired.result.command}`, output: repaired.result.output };
+          break;
+        }
+      } else {
+        const result = await runGateAttempt(phase, ctx, operations);
+        if (!result.ok) {
+          summary.stalled = { phase: phase.name, reason: `gate failed: ${result.command}`, output: result.output };
+          break;
+        }
       }
       if (isFinalPhase) {
         const budget = budgetStatus(ctx);

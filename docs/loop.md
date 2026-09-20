@@ -49,10 +49,21 @@ earned it.
       --max-rounds <n>    Cap on review/repair rounds
       --from <phase>      Start at this phase
       --resume            Skip phases already recorded complete
+      --note <text>       Give the target agent an authoritative instruction
+      --note-file <path>  Read that instruction from a file (--note wins)
   -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)
       --no-worktree       Work in the current checkout instead of a worktree
+      --no-tui            Force plain streaming output (TUI is on by default on a TTY)
       --dry-run           Print the plan and rendered prompts, run nothing
 ```
+
+On a TTY, `aloop` shows a live dashboard — phases with their status, the
+current diff, review findings, running cost, and produced artifacts — instead
+of raw streaming output. It is purely a view: it reads the same manifest/state
+the run already persists after each phase and never changes run behavior.
+It automatically steps aside for piped output or CI; pass `--no-tui` to force
+plain streaming on a TTY. `--yes` only skips per-phase confirmation, so an
+unattended run on a real terminal still shows the live dashboard.
 
 `--dry-run` renders every prompt with real values and executes nothing. It
 reports the run directory, worktree, and branch it would use without creating
@@ -83,6 +94,32 @@ some-task-source fetch 123 | aloop --task-file - --name my-spec
 
 Add `--yes` to run unattended. If no controlling terminal is available, the
 runner reports an error and asks for `--yes`; `--dry-run` does not need `--yes`.
+
+## Getting started
+
+Set up a repository with an editable configuration and a full local copy of the
+prompt templates:
+
+```sh
+aloop init
+```
+
+This creates `loop.config.mjs` and `.loop/prompts/*.md` in the current
+directory. Review the comments at the top of the generated config before the
+first run, especially `baseBranch`, `remote`, and `engines`. You can change
+phases and gates at any time, and edit any local prompt to tailor its phase.
+
+To start with one of the bundled presets instead, use its name:
+
+```sh
+aloop init --preset work-item
+```
+
+Preset prompts overlay the packaged defaults, so even a partial preset produces
+a complete `.loop/prompts/` directory. `init` refuses to replace scaffold files
+that already exist. Re-run with `--force` to replace the config and managed
+prompt files; extra prompt files you added are left untouched. Add `--json` for
+an object listing the created files and selected preset.
 
 Windows is supported through Git Bash (Git for Windows), not native
 `cmd.exe`/PowerShell. Ensure Git's `sh.exe` is on `PATH` before starting
@@ -125,6 +162,32 @@ Before reading stdin or recording new task state, the runner rejects conflicting
 explicit `--name` or `--task` values, and conflicting task-file values for a
 saved task-backed run. A matching stdin resume reuses the existing
 `RUN_DIR/task.md` instead of reading stdin again.
+
+### Operator-guided resume
+
+Use `--note` or `--note-file` to give one agent invocation an authoritative
+instruction when resuming a stalled run. The note is prepended to the rendered
+prompt before its hash is recorded, so the manifest retains evidence of the
+exact guided invocation. `--note` takes precedence when both forms are given;
+the file path is resolved from the current directory, and either form must
+contain non-whitespace text.
+
+Without `--from`, the note targets the first phase that will run: the first
+phase in a fresh run, or the first incomplete phase on resume. `--from` targets
+that named phase instead. A noted `--from` phase is run even if it was already
+recorded complete, which is useful for directing a phase to finish preserved
+work:
+
+```sh
+aloop --name my-spec --resume --from implement \
+  --note "The implementation is present; commit it and complete the phase."
+```
+
+Notes are invocation-local and are not saved in `state.json`; a later ordinary
+`--resume` does not receive an earlier note. The target must be an agent phase.
+A repair-enabled gate is the one exception: its note is delivered to each
+agent repair it invokes after a gate failure. A gate without an agent repair and
+a publish phase reject `--note`, because they have no agent prompt to guide.
 
 ## Configuration
 
@@ -461,6 +524,40 @@ shorthand still provides the familiar behavior for
 `['gate', 'review', 'address']`: gate, review, and, while the verdict requests
 changes, address, gate re-check, and another review.
 
+A standalone gate can also declare a `repair` transition. By default, the
+built-in `gate` has no transition and stops on its first failed command. When a
+gate has repairs, aloop records the failed gate attempt, runs the declared
+repair phases, then re-runs the original gate. It repeats that sequence until
+the gate passes or the gate's `maxRounds` limit is exhausted; the final stall
+reports the last gate output. Repair agents receive the failed gate status in
+`GATE_STATUS` and should use normal code-phase postconditions to leave a clean,
+committed repair. Each gate attempt and repair invocation is retained as a
+separate manifest entry.
+
+For example, this opt-in configuration repairs an initially failing gate with
+the shipped `fix-gate` prompt:
+
+```js
+phases: [
+  {
+    name: 'gate',
+    repair: ['fix-gate'],
+  },
+  {
+    name: 'fix-gate',
+    kind: 'agent',
+    role: 'repair',
+    prompt: 'fix-gate',
+    permissions: ['write-worktree'],
+    postconditions: ['clean-tree', 'head-advanced'],
+  },
+],
+```
+
+Like a verdict repair, a gate repair phase must be named by its owning gate's
+`repair` list; merely placing a repair-role phase next to a gate does not create
+a transition.
+
 A descriptor can declare its `kind`, `role`, `inputs`, `outputs`,
 `postconditions`, retry policy, and repair transition. It can also set an agent
 `prompt`, `optional`, `verdict`, per-verdict `maxRounds`, gate `commands`, or
@@ -468,8 +565,8 @@ the `requiresCleanTree` precondition. `inputs` and `outputs` are declarative
 metadata in the normalized plan; the runner does not currently enforce data
 dependencies from those fields. `permissions` controls the adapter's
 permission level and the directories it receives, as described in [Phase
-permissions](#phase-permissions). A verdict phase's `repair` list contains
-phase names or inline descriptors; an inline descriptor can add
+permissions](#phase-permissions). A verdict phase or repair-enabled gate's
+`repair` list contains phase names or inline descriptors; an inline descriptor can add
 transition-only settings such as `recheck`:
 
 ```js
@@ -601,15 +698,15 @@ review/changelog sections can opt into the opinionated work-item flow. The
 package ships it under `presets/work-item/`, including the five prompt
 overrides, a sample `loop.config.mjs`, and installation guidance.
 
-```
-mkdir -p .loop/prompts
-cp -r node_modules/@syntax-syllogism/aloop/presets/work-item/prompts/. .loop/prompts/
+```sh
+aloop init --preset work-item
 ```
 
+The command copies the sample configuration and prompt overrides into the
+project, with packaged defaults filling any prompts the preset does not provide.
 The preset assumes task files live in a separate repository and that another
-workflow commits those task-file updates. Copy its sample configuration as a
-starting point only when its branch, engine, phase, and gate settings match the
-project.
+workflow commits those task-file updates. Use its configuration only when its
+branch, engine, phase, and gate settings match the project.
 
 ## Isolation and state
 

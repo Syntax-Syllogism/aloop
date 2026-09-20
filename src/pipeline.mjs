@@ -1,4 +1,8 @@
-import { appendFile, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+/** @typedef {import('./types.js').Config} Config */
+/** @typedef {import('./types.js').Operations} Operations */
+/** @typedef {import('./types.js').Summary} Summary */
+
+import { appendFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import packageJson from '../package.json' with { type: 'json' };
@@ -11,9 +15,10 @@ import { canonicalizeConfig, hashConfig, hashText } from './manifest.mjs';
 import { computeRunMetrics } from './metrics.mjs';
 import { publish } from './publish.mjs';
 import { renderPrompt } from './prompts.mjs';
-import { banner, describeAgent, ensureConfirmationAvailable, log, openTerminalInput, report } from './reporter.mjs';
+import { banner, describeAgent, ensureConfirmationAvailable, log, openTerminalInput, report, resetRenderer, setRenderer, writeOutput } from './reporter.mjs';
 import { RunState, slugFor } from './state.mjs';
 import { runPhases } from './runner.mjs';
+import { createTuiRenderer, tuiEnabled } from './tui.mjs';
 import { formatFindings } from './verdict.mjs';
 import { planWorktree, resumedWorktree, setupWorktree } from './worktree.mjs';
 
@@ -59,6 +64,18 @@ function configOverrideRecord(config, path) {
     path,
     values,
   };
+}
+
+async function resolveOperatorNote(args, cwd) {
+  const text = args.note ?? (args.noteFile ? await readFile(resolve(cwd, args.noteFile), 'utf8') : null);
+  if (text !== null && !text.trim()) {
+    throw new Error('--note and --note-file must contain non-whitespace text.');
+  }
+  return text === null ? null : { text };
+}
+
+function operatorNoteBlock(text) {
+  return `## Operator note (read this first)\n\nAn operator is resuming this phase and has provided the following instruction. Treat it as authoritative for what remains to be done. Do not redo or revert work that is already complete; do only what is needed to satisfy it and the phase's postconditions.\n\n${text}\n\n---\n\n`;
 }
 
 async function fileExists(path) {
@@ -133,6 +150,7 @@ function engineRecord(agent) {
   };
 }
 
+/** @returns {import('./types.js').ManifestEntry} */
 function manifestEntry(phase, ctx, values = {}) {
   return {
     phase: phase.name,
@@ -273,7 +291,7 @@ async function runGate(phase, ctx) {
         timeoutMs: ctx.config.timeoutMs,
         activeProcessPath: ctx.activeProcessPath,
         onOutput: (text) => {
-          process.stdout.write(text);
+          writeOutput(text);
           void tee(logFile, text);
         },
       });
@@ -344,7 +362,7 @@ async function runPublish(phase, ctx, { remote, branch, base, approvedSha }) {
   return { ok: Boolean(result), result, manifest, failure };
 }
 
-async function withRetries(phase, operation, { failed = () => false } = {}) {
+async function withRetries(phase, operation, { failed = /** @type {(value: any) => boolean} */ (() => false) } = {}) {
   const maxAttempts = phase.retry?.maxAttempts ?? 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -369,7 +387,7 @@ async function runSetup(commands, ctx) {
         timeoutMs: ctx.config.timeoutMs,
         activeProcessPath: ctx.activeProcessPath,
         onOutput: (text) => {
-          process.stdout.write(text);
+          writeOutput(text);
           void tee(logFile, text);
         },
       });
@@ -450,12 +468,16 @@ async function runAgent(phase, ctx, variables) {
   const agentRepo = sourceSnapshot?.path ?? ctx.worktree;
 
   try {
-  const { prompt, path } = await renderPrompt(phase.prompt, {
+  const rendered = await renderPrompt(phase.prompt, {
     ...variables,
     ...(sourceSnapshot ? { REPO: agentRepo } : {}),
   }, {
     projectPromptDir: ctx.promptDir,
   });
+  const receivesOperatorNote = ctx.note
+    && (ctx.note.targetPhase === phase.name || ctx.note.repairPhase === phase.name);
+  const prompt = receivesOperatorNote ? `${operatorNoteBlock(ctx.note.text)}${rendered.prompt}` : rendered.prompt;
+  const { path } = rendered;
   const promptHash = hashText(prompt);
   log(`  engine: ${agent.name}${agent.model ? `   model: ${agent.model}` : ''}${agent.effort ? `   effort: ${agent.effort}` : ''}   prompt: ${path}`);
   if (engineOverride) log(`  resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)}`);
@@ -507,7 +529,7 @@ async function runAgent(phase, ctx, variables) {
   const emit = (text) => {
     if (!text) return;
     bytesEmitted += Buffer.byteLength(text);
-    process.stdout.write(text);
+    writeOutput(text);
     pendingLogWrites.push(tee(logFile, text));
   };
   let commandError;
@@ -573,10 +595,12 @@ export async function runLoop(options = {}) {
   const cwd = args.cwd ?? process.cwd();
   const rootGit = new GitFacade(cwd);
   const repoRoot = await rootGit.toplevel();
+  const operatorNote = await resolveOperatorNote(args, cwd);
 
   if (args.config && args.overrideEngine) {
     throw new Error('--config and --override-engine cannot be used together; configure engines in the supplied config file.');
   }
+  /** @type {Config} */
   const config = await loadConfig(repoRoot, {
     ...(args.maxRounds ? { maxRounds: args.maxRounds } : {}),
     ...(args.phases ? { phases: args.phases } : {}),
@@ -616,6 +640,7 @@ export async function runLoop(options = {}) {
   );
 
   let runStarted = false;
+  let tuiRenderer = null;
   try {
   const persistedName = args.resume ? state.data.name : null;
   if (persistedName && args.name && slugFor(args.name) !== persistedName) {
@@ -787,6 +812,7 @@ export async function runLoop(options = {}) {
     engineOverrides,
     budgetWarnings: new Set(),
     configHash: hashConfig(config),
+    note: operatorNote,
     resume: Boolean(args.resume),
     dryRun: args.dryRun,
     remote,
@@ -835,6 +861,7 @@ export async function runLoop(options = {}) {
   log(`run dir   : ${state.dir}`);
   log(`phases    : ${config.resolvedPhases.map((phase) => phase.name).join(' → ')}`);
 
+  /** @type {Summary} */
   const summary = {
     phases: [],
     stalled: null,
@@ -849,6 +876,24 @@ export async function runLoop(options = {}) {
     pullRequest: state.data.pullRequest ?? state.manifestMetadata.pullRequest ?? null,
   };
 
+  if (!args.dryRun && tuiEnabled({ isTTY: process.stdout.isTTY, noTui: args.noTui })) {
+    tuiRenderer = createTuiRenderer({ config, state, summary });
+    setRenderer(tuiRenderer);
+  }
+
+  const operations = /** @satisfies {Operations} */ ({
+    budgetStatus,
+    markBudgetExhaustedComplete,
+    manifestEntry,
+    markStalledManifest,
+    recordBudgetStall,
+    recordManifest,
+    runAgent,
+    runGate,
+    runPublish,
+    withRetries,
+  });
+
   await runPhases({
     args,
     config,
@@ -861,24 +906,18 @@ export async function runLoop(options = {}) {
     baseBranch,
     confirmInput,
     terminalOpener,
-    operations: {
-      budgetStatus,
-      markBudgetExhaustedComplete,
-      manifestEntry,
-      markStalledManifest,
-      recordBudgetStall,
-      recordManifest,
-      runAgent,
-      runGate,
-      runPublish,
-      withRetries,
-    },
+    operations,
   });
 
   await state.record({
     status: summary.stalled ? 'stalled' : 'completed',
     ...(summary.stalled ? { stalled: summary.stalled } : {}),
   });
+  if (tuiRenderer) {
+    tuiRenderer.stop();
+    resetRenderer();
+    tuiRenderer = null;
+  }
   report(summary, formatFindings);
   return summary;
 
@@ -886,6 +925,10 @@ export async function runLoop(options = {}) {
     if (runStarted && !args.dryRun) await state.record({ status: 'stalled' }).catch(() => {});
     throw error;
   } finally {
+    if (tuiRenderer) {
+      tuiRenderer.stop();
+      resetRenderer();
+    }
     await state.release();
   }
 }

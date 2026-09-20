@@ -83,7 +83,8 @@ function errorText(error) {
  * The default GitLab transport. `glab` is intentionally an external runtime
  * requirement, so consumers can replace this transport with REST or MCP code.
  */
-export function glabTransport({ cwd, runner = runCommand, env } = {}) {
+export function glabTransport(options = {}) {
+  const { cwd, runner = runCommand, env } = /** @type {any} */ (options);
   async function run(args) {
     try {
       return await runner('glab', args, { cwd, ...(env ? { env } : {}) });
@@ -153,9 +154,10 @@ export function glabTransport({ cwd, runner = runCommand, env } = {}) {
 /**
  * Adapt GitLab-native merge request data to aloop's verified pull-request port.
  *
- * @param {{ cwd: string, git?: GitFacade, transport?: GitLabTransport, env?: object }} options
+ * @param {any} options
  */
-export function gitlabBackend({ cwd, git = new GitFacade(cwd), transport, env } = {}) {
+export function gitlabBackend(options = {}) {
+  let { cwd, git = new GitFacade(cwd), transport, env } = options;
   transport ??= glabTransport({ cwd, env });
   const repositories = new Map();
 

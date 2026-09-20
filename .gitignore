@@ -54,3 +54,7 @@ docs/smoke-reports/
 bin/publish.sh
 bin/changelog-prompt.txt
 release.config.mjs
+
+# === private-only: local loop engine-pair configs ===
+loop.config.mjs
+*.loop-config.mjs

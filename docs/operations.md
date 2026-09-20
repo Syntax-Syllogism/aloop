@@ -1,6 +1,6 @@
 ---
 title: Operational run commands
-description: Inspect, cancel, clean up, and diagnose aloop runs.
+description: Inspect, cancel, clean up, diagnose aloop runs, and run local quality checks.
 ---
 
 # Operational run commands
@@ -86,3 +86,16 @@ its own GitLab host-aware authentication precheck before pushing.
 Operational commands resolve runs from the repository root and the configured
 `runsDir`, so using a different current subdirectory does not create a second
 run inventory.
+
+## Checking static contracts
+
+```sh
+npm run typecheck
+```
+
+This performs TypeScript's strict, no-emit JSDoc check over the configured
+source, CLI, and test files. It is the focused validation for changes to
+`src/types.d.ts`, JSDoc type imports, or JavaScript covered by the checker, and
+it runs in CI before the test suite. See [Architecture and module
+boundaries](architecture.md#static-contracts) for the ownership and opt-out
+rules for those contracts.

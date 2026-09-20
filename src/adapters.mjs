@@ -1,3 +1,7 @@
+/** @typedef {import('./types.js').Adapter} Adapter */
+/** @typedef {import('./types.js').Config} Config */
+/** @typedef {import('./types.js').Engine} Engine */
+
 /**
  * Engine adapters.
  *
@@ -305,15 +309,17 @@ export function createJsonlRenderer(renderEvent) {
 }
 
 /** A renderer for engines whose stdout is already meant to be read. */
+/** @returns {import('./types.js').Renderer} */
 export function passthroughRenderer() {
   return { write: (text) => text, end: () => '' };
 }
 
+/** @type {Adapter} */
 const claudeAdapter = {
   name: 'claude',
   version: cliVersion('claude'),
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-  command({ prompt, addDirs, permissions, artifactOnly = false, agent = {} }) {
+  command({ prompt, addDirs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
     // `auto`, not `acceptEdits`, is used for worktree-writing and
     // artifact-only phases: under acceptEdits a non-interactive `-p` run
     // auto-denies every Bash call, because there is no one to answer the
@@ -334,11 +340,12 @@ const claudeAdapter = {
   createRenderer: () => createJsonlRenderer(renderClaudeEvent),
 };
 
+/** @type {Adapter} */
 const codexAdapter = {
   name: 'codex',
   version: cliVersion('codex'),
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-  command({ prompt, cwd, addDirs, permissions, artifactOnly = false, agent = {} }) {
+  command({ prompt, cwd, addDirs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const sandbox = canWrite ? 'workspace-write' : 'read-only';
     const args = ['exec', prompt, '--sandbox', sandbox, '--cd', cwd];
@@ -349,11 +356,12 @@ const codexAdapter = {
   },
 };
 
+/** @type {Adapter} */
 const agyAdapter = {
   name: 'agy',
   version: cliVersion('agy'),
   efforts: ['low', 'medium', 'high'],
-  command({ prompt, addDirs, timeoutMs, permissions, artifactOnly = false, agent = {} }) {
+  command({ prompt, addDirs, timeoutMs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
     // `--dangerously-skip-permissions`, not bare `accept-edits`: in headless
     // `--print` mode agy cannot prompt for the `command` permission its Bash-
     // style tools need, so it auto-denies the first one and exits 0 having done
@@ -382,12 +390,13 @@ const agyAdapter = {
   createRenderer: () => createJsonlRenderer(renderAgyEvent),
 };
 
+/** @type {Adapter} */
 const geminiAdapter = {
   name: 'gemini',
   version: cliVersion('gemini'),
   // Gemini CLI exposes no reasoning-effort flag, so this adapter declares no
   // `efforts`: a configured effort is simply not passed through (see docs).
-  command({ prompt, addDirs, permissions, artifactOnly = false, agent = {} }) {
+  command({ prompt, addDirs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
     // `yolo`, not `plan`/`auto_edit`: in headless `--prompt` mode Gemini cannot
     // interactively approve the shell tools a worktree-writing phase needs to
     // build, test, and commit. `plan` is read-only and `auto_edit` auto-approves
@@ -436,6 +445,7 @@ function validateConfiguredAdapter(name, adapter) {
   return adapter;
 }
 
+/** @returns {Adapter} */
 export function adapterFor(engine, customAdapters = {}) {
   const configuredNames = customAdapters && typeof customAdapters === 'object' ? Object.keys(customAdapters) : [];
   const hasConfiguredAdapter = customAdapters && typeof customAdapters === 'object'
@@ -448,6 +458,7 @@ export function adapterFor(engine, customAdapters = {}) {
   return adapter;
 }
 
+/** @param {Engine} agent @returns {Engine} */
 export function validateAgent(agent, customAdapters = {}) {
   const adapter = adapterFor(agent.name, customAdapters);
   if (agent.effort && adapter.efforts && !adapter.efforts.includes(agent.effort)) {
@@ -457,11 +468,13 @@ export function validateAgent(agent, customAdapters = {}) {
 }
 
 /** Resolve an agent descriptor: per-phase override, else the default. */
+/** @param {Config} config @returns {Engine} */
 export function agentForPhase(config, phaseName) {
   return config.engines[phaseName] ?? config.engines.default;
 }
 
 /** Resolve which executable runs a phase. Retained for string-based callers. */
+/** @param {Config} config */
 export function engineForPhase(config, phaseName) {
   return agentForPhase(config, phaseName).name;
 }

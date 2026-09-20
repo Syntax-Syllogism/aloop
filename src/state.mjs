@@ -1,3 +1,6 @@
+/** @typedef {import('./types.js').RunData} RunData */
+/** @typedef {import('./types.js').ManifestEntry} ManifestEntry */
+
 import { randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { readdirSync, renameSync, rmSync } from 'node:fs';
@@ -145,6 +148,7 @@ export function slugFor(input) {
 }
 
 export class RunState {
+  /** @param {string} dir @param {RunData} data @param {boolean} [readOnly] */
   constructor(dir, data, readOnly = false, manifest = new Manifest(), lockToken = null, manifestMetadata = {}) {
     this.dir = dir;
     this.data = data;
@@ -210,7 +214,7 @@ export class RunState {
       if (create) {
         try {
           const saved = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8'));
-          manifest = new Manifest(saved.phases ?? []);
+          manifest = new Manifest(/** @type {ManifestEntry[]} */ (saved.phases ?? []));
           manifestMetadata = saved;
         } catch (error) {
           if (error.code !== 'ENOENT') throw error;

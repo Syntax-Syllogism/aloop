@@ -25,7 +25,8 @@ export function parsePullRequestDescription(contents) {
   return { title, body };
 }
 
-export function githubBackend({ cwd, git = new GitFacade(cwd), runner = runCommand, env } = {}) {
+export function githubBackend(options = {}) {
+  const { cwd, git = new GitFacade(cwd), runner = runCommand, env } = /** @type {any} */ (options);
   const repositories = new Map();
 
   async function resolveRepository(remote) {
@@ -128,17 +129,8 @@ function assertVerifiedPullRequest(pullRequest, { base, branch, localSha, draft 
  * backend is GitHub's `gh` CLI; other remotes can supply the same precheck,
  * view, create, and update operations without changing this use case.
  */
-export async function publish({
-  git,
-  remote,
-  branch,
-  base,
-  prBodyPath,
-  draft = true,
-  backend = 'github',
-  approvedSha = null,
-  env,
-}) {
+export async function publish(options = {}) {
+  const { git, remote, branch, base, prBodyPath, draft = true, backend = 'github', approvedSha = null, env } = /** @type {any} */ (options);
   if (!git || typeof git.push !== 'function' || typeof git.lsRemote !== 'function') {
     throw new PublishError('Publish requires a GitFacade with push and lsRemote operations.');
   }

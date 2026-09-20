@@ -28,7 +28,13 @@ Interactive confirmations use the Git Bash/Windows console when available. Use
 
 ## Quick start
 
-From a git repository with a `loop.config.mjs` (or with the defaults):
+From a git repository, create the editable configuration and prompt overrides:
+
+```sh
+aloop init
+```
+
+Review the generated `loop.config.mjs`, then start a task:
 
 ```sh
 aloop --task "Add request tracing" --name request-tracing
@@ -67,7 +73,8 @@ complete guide, manifest schema, and verdict contract.
 
 ## Configuration
 
-Create `loop.config.mjs` in the repository being operated on:
+`aloop init` creates a commented `loop.config.mjs` in the repository being
+operated on. Adjust it as needed; for example, a configuration can be:
 
 ```js
 export default {
@@ -125,12 +132,13 @@ placeholder is unresolved.
 For repositories using Markdown work items, install the bundled preset:
 
 ```sh
-mkdir -p .loop/prompts
-cp -r node_modules/@syntax-syllogism/aloop/presets/work-item/prompts/. .loop/prompts/
+aloop init --preset work-item
 ```
 
-The preset includes prompts and a sample configuration. Adapt it to the
-repository's branches and gates before use.
+This creates the preset's sample configuration and prompt overrides. Adapt its
+branches and gates before use. `aloop init` also copies the default prompts, so
+you can edit any `.loop/prompts/<phase>.md` immediately; see
+[`docs/loop.md`](docs/loop.md#getting-started) for overwrite and preset details.
 
 ## Building up to unattended runs
 
@@ -140,6 +148,13 @@ Use this progression:
 2. Watch one representative task through every phase.
 3. Exercise the review loop with `--max-rounds 2`.
 4. Add `-y` only for task shapes whose behavior is already understood.
+
+## Evaluation harness
+
+`aloop-eval <spec.mjs>` runs a task corpus across a model/config matrix, each
+cell in its own throwaway repository, and reports completion, escaped
+defects, convergence, and cost per cell and per config. See
+[`docs/eval.md`](docs/eval.md) for the spec file shape and reported fields.
 
 ## Development
 

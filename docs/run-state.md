@@ -74,6 +74,12 @@ raising the limit lets aloop clear the marker and finalize the run without
 rerunning the completed final action. See [Run budgets](loop.md#run-budgets)
 for configuration and enforcement details.
 
+When a repair-enabled standalone gate fails, its pending repair round is also
+checkpointed in `state.json`. Its manifest keeps the failed and re-run gate
+receipts, repair entries, and their input/output SHAs separately; a successful
+later attempt is therefore evidence of the repaired tree rather than a
+replacement for the original failure.
+
 ## Concurrent-run protection
 
 Real runs acquire a single-host lock in their run directory before loading or

@@ -182,7 +182,7 @@ test('cancel stops a command recorded while the runner is shutting down', async 
   try {
     const result = await cancelRun('handoff', { cwd: root });
     assert.equal(result.status, 'cancelled');
-    const activeProcess = JSON.parse(await readFile(join(state.dir, 'active-command.json')));
+    const activeProcess = JSON.parse((await readFile(join(state.dir, 'active-command.json'))).toString());
     assert.equal(processIsAlive(activeProcess.pid), false);
   } finally {
     if (processIsAlive(runner.pid)) runner.kill('SIGKILL');
@@ -279,7 +279,7 @@ test('operational commands honor a custom runsDir and surface a broken config im
     join(root, 'loop.config.mjs'),
     "import './does-not-exist.mjs';\nexport default { runsDir: '.loop/custom-runs' };\n",
   );
-  await assert.rejects(listRuns({ cwd: root }), (error) => error.code === 'ERR_MODULE_NOT_FOUND');
+  await assert.rejects(listRuns({ cwd: root }), (error) => /** @type {any} */ (error).code === 'ERR_MODULE_NOT_FOUND');
 });
 
 test('doctor keeps configuration errors separate from unavailable tooling', async () => {
