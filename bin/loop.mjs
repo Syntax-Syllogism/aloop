@@ -13,12 +13,16 @@ import {
   init,
   inspectRun,
   listRuns,
+  replayRun,
   resolveRunsDir,
 } from '../src/operations.mjs';
 import { computeRunMetrics } from '../src/metrics.mjs';
 import { runLoop } from '../src/pipeline.mjs';
 
-const commands = new Set(['run', 'list', 'status', 'inspect', 'cancel', 'clean', 'doctor', 'metrics', 'init']);
+/** @typedef {import('../src/types.js').OperationalOutput} OperationalOutput */
+/** @typedef {import('../src/types.js').OperationalResult} OperationalResult */
+
+const commands = new Set(['run', 'list', 'status', 'inspect', 'replay', 'cancel', 'clean', 'doctor', 'metrics', 'init']);
 
 export function parseLoopArgs(argv) {
   const command = commands.has(argv[0]) ? argv[0] : 'run';
@@ -66,10 +70,10 @@ export function parseLoopArgs(argv) {
     throw new Error('--older-than must be a non-negative number of days');
   }
   const [runName] = positionals;
-  if (positionals.length > 1 || (['status', 'inspect', 'cancel'].includes(command) && !runName)) {
+  if (positionals.length > 1 || (['status', 'inspect', 'replay', 'cancel'].includes(command) && !runName)) {
     throw new Error(`${command} requires exactly one run name`);
   }
-  if (command !== 'run' && !['status', 'inspect', 'cancel'].includes(command) && positionals.length) {
+  if (command !== 'run' && !['status', 'inspect', 'replay', 'cancel'].includes(command) && positionals.length) {
     throw new Error(`${command} does not accept positional arguments`);
   }
   return {
@@ -111,6 +115,7 @@ export function usage() {
     '  list                    List persisted runs',
     '  status <name>           Show current phase, verdict, and metrics',
     '  inspect <name>          Show manifest, phase evidence, and metrics',
+    '  replay <name>           Verify recorded prompt inputs and show phase transitions',
     '  metrics                 Show aggregate metrics across runs',
     '  cancel <name>           Stop a run and release its lock',
     '  clean                   Preview/remove completed runs older than 30 days',
@@ -143,6 +148,7 @@ export function usage() {
     '      --phases a,b,c      Override the configured phase list',
     '      --max-rounds <n>    Cap on review/repair rounds',
     '      --from <phase>      Start at this phase',
+    '      --preset <name|path> Activate a bundled preset or external preset directory',
     '      --resume            Skip phases already recorded complete',
     '      --note <text>       Give the resumed phase an authoritative instruction',
     '      --note-file <path>  Read the instruction from a file (--note wins)',
@@ -166,6 +172,7 @@ async function metricsForRun(run) {
   }
 }
 
+/** @param {OperationalOutput} [output] */
 function printList(runs, output = console, includeMetrics = false) {
   if (!runs.length) return output.log('No runs found.');
   const header = ['NAME', 'STATUS', 'PHASE', 'BRANCH', 'UPDATED', 'PR'];
@@ -180,6 +187,7 @@ function printList(runs, output = console, includeMetrics = false) {
   }
 }
 
+/** @param {OperationalOutput} [output] */
 function printMetricsLines(metrics, output = console) {
   output.log(`duration : ${metrics.total.durationMs}ms`);
   output.log(`tokens   : ${formatMetric(metrics.total.tokens)}`);
@@ -187,6 +195,7 @@ function printMetricsLines(metrics, output = console) {
   output.log(`catch    : ${formatMetric(metrics.reviewer.catchRate)}`);
 }
 
+/** @param {OperationalOutput} [output] */
 function printStatus(run, output = console, metrics = null) {
   output.log(`run      : ${run.name}`);
   output.log(`status   : ${run.status}`);
@@ -199,6 +208,7 @@ function printStatus(run, output = console, metrics = null) {
   if (metrics) printMetricsLines(metrics, output);
 }
 
+/** @param {OperationalOutput} [output] */
 function printAggregate(metrics, output = console) {
   output.log(`runs        : ${metrics.runs}`);
   output.log(`duration    : ${metrics.total.durationMs}ms`);
@@ -208,6 +218,19 @@ function printAggregate(metrics, output = console) {
   output.log(`catch       : ${formatMetric(metrics.reviewer.catchRate)}`);
 }
 
+/** @param {OperationalOutput} [output] */
+function printReplay(result, output = console) {
+  output.log(`run      : ${result.name}`);
+  output.log(`base SHA : ${result.baseSha.value ?? '-'} (${result.baseSha.available ? 'available' : 'unavailable'})`);
+  output.log(`worktree : ${result.worktree.path ?? '-'} (${result.worktree.available ? 'available' : 'unavailable'})`);
+  for (const entry of result.timeline) {
+    const prompt = entry.prompt ? ` prompt=${entry.prompt.status}` : '';
+    output.log(`${entry.phase}  ${entry.status}  ${entry.inputSha ?? '-'} → ${entry.outputSha ?? '-'}${prompt}`);
+  }
+  for (const divergence of result.divergences) output.log(`! ${divergence.message}`);
+}
+
+/** @param {OperationalOutput} [output] */
 function printInspect(run, output = console, metrics = null) {
   printStatus(run, output, metrics);
   output.log(`run dir  : ${run.runDir}`);
@@ -219,6 +242,11 @@ function printInspect(run, output = console, metrics = null) {
   }
 }
 
+/**
+ * @param {object} args
+ * @param {{cwd?: string, output?: OperationalOutput}} [options]
+ * @returns {Promise<OperationalResult>}
+ */
 export async function runOperationalCommand(args, { cwd = process.cwd(), output = console } = {}) {
   const options = { cwd, configPath: args.config };
   if (args.command === 'list') {
@@ -243,6 +271,11 @@ export async function runOperationalCommand(args, { cwd = process.cwd(), output 
     const metrics = computeRunMetrics(result.manifest ?? { phases: result.phases });
     if (args.json) output.log(JSON.stringify({ ...result, metrics }, null, 2));
     else printInspect(result, output, metrics);
+    return result;
+  }
+  if (args.command === 'replay') {
+    const result = await replayRun(args.runName, options);
+    if (args.json) output.log(JSON.stringify(result, null, 2)); else printReplay(result, output);
     return result;
   }
   if (args.command === 'metrics') {

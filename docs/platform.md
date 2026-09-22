@@ -5,28 +5,57 @@ description: Supported host environments and platform-specific command and termi
 
 # Platform support
 
-aloop supports Linux and macOS directly. Windows is supported when aloop is
-launched from Git Bash supplied by Git for Windows. WSL is supported through
-its Linux environment.
+aloop supports Linux and macOS directly. Windows is a fully supported tier in
+two modes: launched from Git Bash (POSIX `sh` available), or natively under
+PowerShell with no POSIX shell on `PATH` at all. WSL is supported through its
+Linux environment.
 
-## Windows prerequisites
+## Windows: Git Bash mode
 
 Install Git for Windows, make sure its `sh.exe` is available on `PATH`, and
-launch aloop from a Git Bash terminal. The supported Windows setup is not native
-`cmd.exe` or PowerShell. Use `--yes` for unattended runs or when no interactive
-console is available.
+launch aloop from a Git Bash terminal. Use `--yes` for unattended runs or when
+no interactive console is available.
 
-The configured `shell` runs setup and gate commands with `-c`; it defaults to
-`sh`. Git Bash therefore provides the POSIX shell expected by the default
-configuration:
+A bare command string in `gate`/`setup`/`phase.commands` runs through `sh -c`,
+same as POSIX:
 
 ```js
 export default {
-  shell: 'sh',
   setup: ['npm ci'],
   gate: ['npm test'],
 };
 ```
+
+## Windows: native PowerShell mode (no `sh`)
+
+With no Git Bash (or any POSIX shell) on `PATH`, aloop runs setup and gate
+commands under PowerShell 7+ (`pwsh`), falling back to Windows PowerShell
+(`powershell.exe`) when `pwsh` is not installed. Set `shell` in the config to
+override this auto-detection (e.g. `shell: 'cmd.exe'`).
+
+A bare POSIX command string is not portable to this mode: `&&` with `$VAR`,
+`[[ ]]`, `2>&1`, single-quote semantics, and `foo=bar cmd` env-prefixing all
+differ or fail under PowerShell. Two structured forms exist so one config can
+target both POSIX and native Windows:
+
+- **`{ argv: [...] }`** — runs the given argv directly, no shell involved.
+  Portable by construction; cannot express pipes, `&&`, or redirection.
+- **`{ posix, windows, pwsh, cmd }`** — a per-platform object. On Windows,
+  aloop picks `windows` if present, else `pwsh`, else `cmd`; on POSIX it picks
+  `posix`. A config missing the variant needed on the current host fails at
+  config-load time with an error naming the phase and command index, rather
+  than failing mid-run.
+
+```js
+export default {
+  setup: [{ argv: ['npm', 'ci'] }],
+  gate: [{ posix: 'npm test 2>&1', windows: 'npm test *>&1' }],
+};
+```
+
+The legacy string form keeps working everywhere — including native Windows,
+via the shell resolved above — for commands simple enough not to need the
+structured forms.
 
 ## Windows command execution
 
@@ -67,8 +96,12 @@ some-task-source fetch 123 | aloop --task-file - --name my-spec --yes
 
 ## Verification
 
-The platform seams are covered by `test/platform.test.mjs`. CI runs the full
-regression suite on Ubuntu and the native Windows platform suite on Windows.
-The Windows job is invoked through the runner's Bash shell, and the platform
-suite includes a real `.cmd` launch through `ComSpec`; POSIX-only integration
-fixtures remain in the Ubuntu suite.
+The platform seams are covered by `test/platform.test.mjs`, and the
+structured/per-platform command model by `test/loop.test.mjs`. CI runs three
+jobs: the full regression suite on Ubuntu; the Git Bash Windows job (invoked
+through the runner's Bash shell), which runs the native Windows platform
+suite — including a real `.cmd` launch through `ComSpec` — with Git Bash's
+`sh` present; and a dedicated `windows-native` job that strips Git's `usr\bin`
+from `PATH`, asserts `sh` cannot be resolved, and then runs the same platform
+suite plus the command-model tests entirely under `pwsh`. POSIX-only
+integration fixtures (bash-syntax gate/setup strings) remain Ubuntu-only.

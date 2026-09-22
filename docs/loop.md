@@ -50,6 +50,7 @@ earned it.
       --phases a,b,c      Override the configured phase list
       --max-rounds <n>    Cap on review/repair rounds
       --from <phase>      Start at this phase
+      --preset <name|path> Activate a bundled preset or external preset directory
       --resume            Skip phases already recorded complete
       --note <text>       Give the target agent an authoritative instruction
       --note-file <path>  Read that instruction from a file (--note wins)
@@ -123,13 +124,14 @@ that already exist. Re-run with `--force` to replace the config and managed
 prompt files; extra prompt files you added are left untouched. Add `--json` for
 an object listing the created files and selected preset.
 
-Windows is supported through Git Bash (Git for Windows), not native
-`cmd.exe`/PowerShell. Ensure Git's `sh.exe` is on `PATH` before starting
-aloop; setup and gate commands continue to run through the configured
-`shell -c` seam (default: `sh`). Git Bash's Windows console input is used for
-interactive confirmation when available. WSL works as Linux. See
-[Platform support](platform.md) for the command, timeout, and terminal
-behavior behind this support.
+Windows is a fully supported tier in two modes: Git Bash (Git for Windows),
+where setup/gate command strings run through `sh -c` as on POSIX; and native
+PowerShell with no POSIX shell on `PATH` at all, where they run through `pwsh`
+(falling back to `powershell.exe`). See [Command model](#command-model) below
+for how to write gate/setup/`phase.commands` config that runs unchanged on
+both, and [Platform support](platform.md) for the command, timeout, and
+terminal behavior behind this support. Git Bash's Windows console input is
+used for interactive confirmation when available. WSL works as Linux.
 
 ## Run metrics
 
@@ -211,6 +213,7 @@ export default {
   setup: ['npm ci'],
   maxRounds: 3,
   timeoutMs: 30 * 60 * 1000,
+  preset: null,
   budget: {
     tokens: 100000,
     usd: 5,
@@ -218,6 +221,15 @@ export default {
   },
 };
 ```
+
+`preset` selects a prompt-only preset for every run in the repository. A
+bundled name such as `work-item` resolves to the package's
+`presets/<name>/prompts/` directory; a path resolves to an external preset
+directory containing `prompts/`. The prompt search chain is project
+`.loop/prompts` overrides, then the selected preset, then the packaged default
+prompts. Passing `--preset <name|path>` overrides the config key for that run;
+the preset does not layer any engines, phases, gates, or branches from its
+sample configuration.
 
 Pass `--config path/to/loop.config.mjs` to use a configuration file outside the
 repository (relative paths resolve from your current directory). The supplied
@@ -347,6 +359,13 @@ run. Do not combine it with `--override-engine`: set the desired engines in the
 supplied config instead. The runner snapshots every resume override in
 `state.json`, including its source path and resolved values.
 
+The selected preset value is also saved in `state.json` and reused by
+`--resume`. For an external preset, aloop also saves the original resolution
+directory so a relative path remains pinned when resumed from another `cwd`. A
+conflicting `--resume --preset <name|path>` is rejected so a resumed run remains
+pinned to the prompt set it started with, including when `--config` is supplied.
+Start a new run to select another preset.
+
 To deliberately move an interrupted run to another executable, use
 `--resume --engine <name> --override-engine`. It replaces the saved engine for
 every agent phase, dropping each phase's saved model and effort (they are
@@ -373,21 +392,59 @@ Use `--base-branch feat/a` to build and open a stacked PR on top of another
 local branch. The branch must exist locally; the flag does not fetch remote-only
 refs.
 
-`gate` commands run through `shell -c`, where `shell` defaults to `sh` and can
-be configured in `loop.config.mjs`. Quoting, pipes, `&&`, and environment
-variables all work. They are judged by process exit code on unfiltered output. Prefer
-invoking the compiler directly over a cached wrapper script: a cached build can
-report success without compiling anything, and a wrapper that summarizes output
-can invent a failure the tool never produced.
+`setup` is an optional list of commands run once when the runner adds a new
+worktree, before phase 1. This also covers a fresh worktree for a branch that
+already exists; branch creation and worktree creation are tracked separately.
+It defaults to an empty list, so the generic runner does not assume a package
+manager. Setup runs in the worktree and uses the same timeout as other
+commands; a non-zero exit or timeout aborts the run before any phase starts.
+It is skipped for resumed or reused worktrees and during `--dry-run`.
 
-`setup` is an optional list of shell commands run once when the runner adds a
-new worktree, before phase 1. This also covers a fresh worktree for a branch
-that already exists; branch creation and worktree creation are tracked
-separately. It uses the same configured `shell` as gate commands. It defaults
-to an empty list, so the generic runner does not assume a package manager. Setup
-runs in the worktree and uses the same timeout as other
-commands; a non-zero exit or timeout aborts the run before any phase starts. It
-is skipped for resumed or reused worktrees and during `--dry-run`.
+`gate` and `setup` commands, and a phase's own `commands` override, are judged
+by process exit code on unfiltered output. Prefer invoking the compiler
+directly over a cached wrapper script: a cached build can report success
+without compiling anything, and a wrapper that summarizes output can invent a
+failure the tool never produced.
+
+#### Command model
+
+Each entry in `gate`, `setup`, or a `gate`-kind phase's `commands` accepts one
+of three forms:
+
+- **A shell string** (e.g. `'npm test'`) — the legacy form. It runs through a
+  shell, so quoting, pipes, `&&`, `2>&1`, and environment variables all work.
+  The shell is `shell -c` on POSIX, where `shell` defaults to `sh`; on native
+  Windows (no `sh` on `PATH`) it is PowerShell 7+ (`pwsh`), falling back to
+  Windows PowerShell (`powershell.exe`). `shell` can be set explicitly in
+  `loop.config.mjs` to override auto-detection on either platform. A bare
+  string authored for one shell is not guaranteed to parse under another —
+  `&&` with `$VAR`, `[[ ]]`, `2>&1`, and single-quote semantics all differ
+  between POSIX shells and PowerShell.
+- **`{ argv: [...] }`** — runs the given argv directly, with no shell at all.
+  This is the portable form: identical behavior on every platform, at the
+  cost of not being able to express pipes, `&&`, or redirection (split those
+  into multiple entries, or use the next form).
+- **A per-platform object** — `{ posix: '...', windows: '...' }`, optionally
+  narrowed further with `pwsh`/`cmd` keys for a specific Windows shell. aloop
+  picks the entry matching the host running the config: `posix` on
+  Linux/macOS; on Windows, `windows` if present, else `pwsh`, else `cmd`. A
+  config that only defines `posix` fails to load on Windows (and vice versa)
+  with an error naming the phase and command index — a stalled mid-run
+  failure would be much more expensive to diagnose than a load-time one.
+
+```js
+export default {
+  setup: [{ argv: ['npm', 'ci'] }],
+  gate: [
+    { posix: 'npm test 2>&1', windows: 'npm test *>&1' },
+    { argv: ['node', 'scripts/check-schema.mjs'] },
+  ],
+};
+```
+
+The recorded `command` in gate receipts and logs is always the entry's
+display string (the argv joined with spaces, or the selected shell string),
+regardless of which form authored it.
 
 ### Run budgets
 
@@ -572,6 +629,20 @@ Like a verdict repair, a gate repair phase must be named by its owning gate's
 `repair` list; merely placing a repair-role phase next to a gate does not create
 a transition.
 
+If a standalone gate fails without a configured repair transition, resume it
+explicitly with `--from gate` after fixing the worktree. If review already
+approved that same SHA before the successful gate run, also force a fresh review
+after the gate so the approval is recorded after the passing receipt:
+
+```sh
+aloop --name my-spec --resume --from gate --yes
+aloop --name my-spec --resume --from review \
+  --note "Re-review the current HEAD after the gate passed." --yes
+```
+
+Running only the gate is not enough in that situation: publishing requires the
+passing gate receipt to precede the approved review.
+
 A descriptor can declare its `kind`, `role`, `inputs`, `outputs`,
 `postconditions`, retry policy, and repair transition. It can also set an agent
 `prompt`, `optional`, `verdict`, per-verdict `maxRounds`, gate `commands`, or
@@ -713,14 +784,17 @@ package ships it under `presets/work-item/`, including the five prompt
 overrides, a sample `loop.config.mjs`, and installation guidance.
 
 ```sh
-aloop init --preset work-item
+aloop --preset work-item --task-file ./work-items/example.md
+# or set preset: 'work-item' in loop.config.mjs
 ```
 
-The command copies the sample configuration and prompt overrides into the
-project, with packaged defaults filling any prompts the preset does not provide.
-The preset assumes task files live in a separate repository and that another
-workflow commits those task-file updates. Use its configuration only when its
-branch, engine, phase, and gate settings match the project.
+The run-time preset activates the packaged prompt overrides without copying
+them into `.loop/prompts/`; project prompt files still win per file. The
+`aloop init --preset work-item` command remains useful when you want an editable
+copy of the sample configuration and prompts. The preset assumes task files
+live in a separate repository and that another workflow commits those task-file
+updates. Use its configuration only when its branch, engine, phase, and gate
+settings match the project.
 
 ## Isolation and state
 
@@ -791,6 +865,11 @@ Entries use these conventions:
 - `promptHash` is the SHA-256 of the fully rendered prompt text. `configHash`
   is the SHA-256 of the resolved configuration after stable key ordering and
   removal of function-valued fields. Both hashes are deterministic.
+- Agent entries with a `promptHash` also include `promptInput`: the template
+  name and body, exact interpolation variables, and operator note used for
+  that invocation. `aloop replay <name>` uses those retained inputs to
+  recompute `promptHash`; older entries can omit `promptInput` and are reported
+  as unverifiable during replay.
 - `artifacts` contains paths relative to the run directory, such as phase logs,
   review and response markdown, and verdict JSON files.
 - `gateReceipts` records each gate command that ran with its exit code and

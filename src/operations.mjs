@@ -6,9 +6,10 @@ import { adapterFor, agentForPhase } from './adapters.mjs';
 import { runCommand, signalProcessGroup } from './command.mjs';
 import { defaults, loadConfig, loadRunsDir } from './config.mjs';
 import { GitFacade } from './git.mjs';
+import { hashConfig, hashText } from './manifest.mjs';
 import { computeAggregateMetrics, computeRunMetrics, readRunManifests } from './metrics.mjs';
+import { interpolate, packagePrompts, withOperatorNote } from './prompts.mjs';
 import { RunState, slugFor } from './state.mjs';
-import { packagePrompts } from './prompts.mjs';
 
 const PULL_REQUEST_URL = /https?:\/\/[^\s"'`<>]+(?:\/pull\/\d+|\/merge_requests\/\d+)[^\s"'`<>]*/i;
 
@@ -487,6 +488,97 @@ export async function inspectRun(name, options = {}) {
     state: run.state,
     manifest: run.manifest,
     phases: run.manifest.phases ?? [],
+  };
+}
+
+function replayPrompt(entry) {
+  const input = entry.promptInput;
+  if (!input) {
+    return { status: 'unverifiable', reason: 'prompt inputs were not recorded' };
+  }
+  if (typeof input.templateBody !== 'string' || !input.variables || typeof input.variables !== 'object') {
+    return { status: 'unverifiable', reason: 'prompt input is incomplete' };
+  }
+  try {
+    const actualHash = hashText(withOperatorNote(interpolate(input.templateBody, input.variables), input.operatorNote));
+    return {
+      status: actualHash === entry.promptHash ? 'verified' : 'mismatch',
+      template: input.template ?? null,
+      expectedHash: entry.promptHash,
+      actualHash,
+    };
+  } catch (error) {
+    return { status: 'unverifiable', reason: error.message };
+  }
+}
+
+async function recordedShaAvailability(repoRoot, baseSha) {
+  if (!baseSha) return false;
+  try {
+    await new GitFacade(repoRoot).revParse(`${baseSha}^{commit}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function replayTimeline(phases) {
+  return phases.map((entry) => ({
+    phase: entry.phase,
+    kind: entry.kind ?? null,
+    role: entry.role ?? null,
+    round: entry.round ?? null,
+    status: entry.status ?? 'completed',
+    inputSha: entry.inputSha ?? null,
+    outputSha: entry.outputSha ?? null,
+    verdict: entry.verdict ?? null,
+    gateReceipts: entry.gateReceipts ?? [],
+    prompt: entry.promptHash ? replayPrompt(entry) : null,
+  }));
+}
+
+export async function replayRun(name, options = {}) {
+  const run = await getRun(name, options);
+  const repoRoot = run.summary.repoRoot
+    ?? await new GitFacade(options.cwd ?? process.cwd()).toplevel();
+  const snapshot = await readJson(join(run.summary.runDir, 'snapshot.json'));
+  const phases = run.manifest.phases ?? [];
+  const divergences = [];
+  const baseSha = snapshot?.baseSha ?? null;
+  const baseShaAvailable = await recordedShaAvailability(repoRoot, baseSha);
+  if (!snapshot) {
+    divergences.push({ type: 'snapshot', message: 'snapshot.json is missing' });
+  } else if (!baseShaAvailable) {
+    divergences.push({ type: 'base-sha', message: `Recorded base SHA is unavailable: ${baseSha ?? '(missing)'}` });
+  }
+  const worktree = snapshot?.worktree ?? run.summary.worktree;
+  const worktreeAvailable = worktree ? await pathExists(worktree) : false;
+  if (!worktreeAvailable) {
+    divergences.push({ type: 'worktree', message: `Recorded worktree is unavailable: ${worktree ?? '(missing)'}` });
+  }
+  if (snapshot?.resolvedConfig && snapshot.configHash && hashConfig(snapshot.resolvedConfig) !== snapshot.configHash) {
+    divergences.push({ type: 'config', message: 'Snapshot resolvedConfig does not match its recorded configHash' });
+  }
+  for (const entry of phases) {
+    if (snapshot?.configHash && entry.configHash && entry.configHash !== snapshot.configHash) {
+      divergences.push({ type: 'config', phase: entry.phase, message: `Phase configHash differs from snapshot: ${entry.phase}` });
+    }
+  }
+  const timeline = replayTimeline(phases);
+  for (const entry of timeline) {
+    if (entry.prompt?.status === 'mismatch') {
+      divergences.push({ type: 'prompt-hash', phase: entry.phase, message: `Prompt hash mismatch: ${entry.phase}` });
+    }
+  }
+  return {
+    name: run.summary.name,
+    runId: run.summary.runId,
+    dryRun: true,
+    baseSha: { value: baseSha, available: baseShaAvailable },
+    worktree: { path: worktree ?? null, available: worktreeAvailable },
+    config: snapshot ? { hash: snapshot.configHash ?? null, resolved: snapshot.resolvedConfig ?? null } : null,
+    timeline,
+    divergences,
   };
 }
 

@@ -13,8 +13,12 @@ worktree is later moved or removed. The directory should be ignored by Git.
 ## Artefacts
 
 `state.json` is the runner's checkpoint. It records the run identity, completed
-phases, review-loop progress, resolved branch and worktree, and other values
-needed to resume the same run. `manifest.json` records the resolved task,
+phases, review-loop progress, resolved branch and worktree, selected prompt
+preset, its original path-resolution directory, and other values needed to
+resume the same run. A saved preset is reused on `--resume`, and a conflicting
+`--preset` is rejected; see [Agentic loop runner](loop.md#configuration) for the
+selection and precedence rules.
+`manifest.json` records the resolved task,
 branch, repository, and worktree context once planning has completed, followed
 by one entry for each phase invocation. Logs, verdicts, and repair responses
 are stored alongside them. The `pr-description` phase writes `pr.md` in the
@@ -27,7 +31,11 @@ the base revision, resolved configuration, gate definitions, environment, and
 engine versions captured at startup. Its `promptHashes` field points to
 `manifest.json` with the selector `phases[*].promptHash`; this keeps the
 snapshot tied to the hashes rendered for each actual invocation, including
-repairs and later review rounds.
+repairs and later review rounds. New agent entries also retain the prompt
+template body, interpolation variables, and applicable operator note alongside
+their hash. This lets `aloop replay` re-render and verify the recorded prompt
+without invoking an engine; entries created before those inputs were recorded
+remain inspectable but their prompts are unverifiable.
 
 While setup, a gate, or an agent command is running, `active-command.json`
 records the child PID and, on platforms with process groups, its process-group

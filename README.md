@@ -18,13 +18,23 @@ registry configuration.
 
 ## Platform support
 
-Linux and macOS are supported. Windows is supported when aloop is launched
-from Git Bash (Git for Windows), which provides the POSIX `sh` used for setup
-and gate commands. Install Git for Windows, ensure `sh.exe` is on `PATH`, and
-run aloop from a Git Bash terminal. WSL works as Linux.
+Linux and macOS are supported, and so is Windows, in two fully supported
+modes:
 
-Interactive confirmations use the Git Bash/Windows console when available. Use
-`--yes` for unattended or piped runs when no console input is available.
+- **Git Bash** — launch aloop from a Git Bash (Git for Windows) terminal.
+  `sh.exe` on `PATH` runs setup/gate command *strings* exactly as on POSIX.
+- **Native PowerShell** — no POSIX shell required. Setup/gate commands run
+  under PowerShell 7+ (`pwsh`), falling back to Windows PowerShell
+  (`powershell.exe`); override with `shell:` in the config. Command strings
+  that use POSIX-only syntax (`&&` with `$VAR`, `[[ ]]`, `2>&1`, single-quote
+  semantics) are not portable to PowerShell as-is — use the `argv` or
+  per-platform command forms below for anything beyond a single portable
+  binary invocation.
+
+WSL works as Linux. Interactive confirmations use a TTY when available, and
+otherwise the Windows console (`CONIN$`) under Git Bash. Use `--yes` for
+unattended or piped runs when no console input is available. See
+[`docs/platform.md`](docs/platform.md) for the full platform reference.
 
 ## Quick start
 
@@ -85,12 +95,31 @@ export default {
   },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   gate: ['npm test'],
-  shell: 'sh',
   publish: { backend: 'github', draft: true },
   setup: ['npm ci'],
   maxRounds: 3,
 };
 ```
+
+A bare string such as `'npm test'` runs through the shell (`sh` on POSIX, or
+the native Windows shell — see above) and is not portable to a host that
+lacks that shell. To write a single `gate`/`setup`/`phase.commands` config
+that runs unchanged on POSIX and native Windows, use the structured forms:
+
+```js
+export default {
+  // No shell at all — the portable default for a single command with no
+  // pipes, `&&`, or shell expansion.
+  setup: [{ argv: ['npm', 'ci'] }],
+  // Per-platform variants for anything that needs shell syntax.
+  gate: [{ posix: 'npm test 2>&1', windows: 'npm test *>&1' }],
+  shell: 'pwsh', // optional; overrides the auto-detected native shell
+};
+```
+
+A per-platform entry that omits the variant needed on the current host (for
+example, only `posix` on a native Windows run) fails at config-load time with
+an error naming the offending phase and command index.
 
 Supported built-in engines are `claude`, `codex`, `agy`, and `gemini`. The
 corresponding CLI must already be installed and authenticated. Engine
@@ -132,13 +161,15 @@ placeholder is unresolved.
 For repositories using Markdown work items, install the bundled preset:
 
 ```sh
-aloop init --preset work-item
+aloop --preset work-item --task-file ./work-items/example.md
 ```
 
-This creates the preset's sample configuration and prompt overrides. Adapt its
-branches and gates before use. `aloop init` also copies the default prompts, so
-you can edit any `.loop/prompts/<phase>.md` immediately; see
-[`docs/loop.md`](docs/loop.md#getting-started) for overwrite and preset details.
+You can set `preset: 'work-item'` in `loop.config.mjs` to opt in for every run.
+The runtime preset activates the packaged prompt overrides without copying
+them into `.loop/prompts/`; project prompt files still win per file. Use
+`aloop init --preset work-item` when you want an editable copy of the sample
+configuration and prompts. See [`docs/loop.md`](docs/loop.md#configuration) for
+precedence, external preset paths, and resume behavior.
 
 ## Building up to unattended runs
 

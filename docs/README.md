@@ -23,8 +23,8 @@ perform the work.
   driver's push, PR backend, and verification contract.
 - [Cost and quality metrics](metrics.md) — inspect saved-run usage, duration,
   convergence, stall, and reviewer measurements from the CLI or JSON output.
-- [Operational run commands](operations.md) — list, inspect, cancel, clean up,
-  diagnose persisted runs, and run local quality checks.
+- [Operational run commands](operations.md) — list, inspect, replay, cancel,
+  clean up, diagnose persisted runs, and run local quality checks.
 - [Run state and recovery](run-state.md) — understand durable run artefacts,
   resume protection, locking, and crash recovery.
 - [Evaluation harness](eval.md) — run a task corpus across a model/config

@@ -7,14 +7,14 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import packageJson from '../package.json' with { type: 'json' };
 import { adapterFor, agentForPhase, permissionLevel, PERMISSIONS, passthroughRenderer, validateAgent } from './adapters.mjs';
-import { runCommand } from './command.mjs';
-import { loadConfig } from './config.mjs';
+import { resolveShell, runCommand } from './command.mjs';
+import { loadConfig, normalizeCommandEntry } from './config.mjs';
 import { GitFacade } from './git.mjs';
 import { hermeticEnvironment, hermeticInvocation, hermeticSnapshot } from './hermetic.mjs';
 import { canonicalizeConfig, hashConfig, hashText } from './manifest.mjs';
 import { computeRunMetrics } from './metrics.mjs';
 import { publish } from './publish.mjs';
-import { renderPrompt } from './prompts.mjs';
+import { renderPrompt, resolvePresetPromptDir, withOperatorNote } from './prompts.mjs';
 import { banner, describeAgent, ensureConfirmationAvailable, log, openTerminalInput, report, resetRenderer, setRenderer, writeOutput } from './reporter.mjs';
 import { RunState, slugFor } from './state.mjs';
 import { runPhases } from './runner.mjs';
@@ -85,10 +85,6 @@ async function resolveOperatorNote(args, cwd) {
   return text === null ? null : { text };
 }
 
-function operatorNoteBlock(text) {
-  return `## Operator note (read this first)\n\nAn operator is resuming this phase and has provided the following instruction. Treat it as authoritative for what remains to be done. Do not redo or revert work that is already complete; do only what is needed to satisfy it and the phase's postconditions.\n\n${text}\n\n---\n\n`;
-}
-
 async function fileExists(path) {
   try {
     return (await stat(path)).isFile();
@@ -135,6 +131,25 @@ function phaseInvocation(phase, ctx, { command, args, cwd, mounts }) {
     cwd,
     mounts,
   });
+}
+
+/**
+ * Turn a normalized gate/setup command entry into a `{ command, args }` spawn
+ * spec. `argv` entries run directly, no shell involved. `shell` entries go
+ * through the resolved shell (POSIX `sh -c`; on Windows, `sh` if Git Bash is
+ * on `PATH`, else `pwsh`/`powershell.exe`, or `config.shell` override) since
+ * they are user-authored strings that may use quoting, pipes, `&&`, or env
+ * vars. An entry sourced from a `pwsh`/`cmd` per-platform key carries a
+ * `shellHint` that pins the shell to match, overriding both auto-detection
+ * and `config.shell`.
+ */
+function commandInvocation(normalized, ctx) {
+  if (normalized.kind === 'argv') {
+    return { command: normalized.argv[0], args: normalized.argv.slice(1) };
+  }
+  const shell = resolveShell({ configuredShell: ctx.config.shell, shellHint: normalized.shellHint ?? null });
+  const flag = Array.isArray(shell.flag) ? shell.flag : [shell.flag];
+  return { command: shell.bin, args: [...flag, normalized.shellString] };
 }
 
 function gitMetadataMount(ctx, mode) {
@@ -265,13 +280,14 @@ async function markStalledManifest(ctx, phase, result, startIndex) {
 
 async function runGate(phase, ctx) {
   const commands = phase.commands ?? ctx.config.gate;
+  const normalizedCommands = commands.map((entry, index) => normalizeCommandEntry(entry, { label: `phases.${phase.name}.gate`, index }));
   const logFile = ctx.state.logPath(phase.name);
   await tee(logFile, '');
   const started = performance.now();
   const gateReceipts = [];
   const execution = phaseInvocation(phase, ctx, {
-    command: ctx.config.shell,
-    args: ['-c', commands.join(' && ')],
+    command: ctx.config.shell ?? 'sh',
+    args: ['-c', normalizedCommands.map((entry) => entry.display).join(' && ')],
     cwd: ctx.worktree,
     mounts: [
       { path: ctx.worktree, mode: 'ro' },
@@ -279,16 +295,19 @@ async function runGate(phase, ctx) {
       ...gitMetadataMount(ctx, 'ro'),
     ],
   });
-  for (const command of commands) {
-    log(`  $ ${command}`);
+  for (const normalized of normalizedCommands) {
+    const { display } = normalized;
+    log(`  $ ${display}`);
     const commandStarted = performance.now();
     try {
-      // Gate commands run through a shell on purpose: they are user-authored
-      // strings that routinely need quoting, pipes, `&&`, and env vars, and
-      // naive whitespace splitting mangles all four without complaining.
+      // Shell-form commands run through a shell on purpose: they are
+      // user-authored strings that routinely need quoting, pipes, `&&`, and
+      // env vars, and naive whitespace splitting mangles all four without
+      // complaining. `argv`-form commands run directly, no shell involved.
+      const invocation = commandInvocation(normalized, ctx);
       const commandExecution = phaseInvocation(phase, ctx, {
-        command: ctx.config.shell,
-        args: ['-c', command],
+        command: invocation.command,
+        args: invocation.args,
         cwd: ctx.worktree,
         mounts: [
           { path: ctx.worktree, mode: 'ro' },
@@ -306,17 +325,17 @@ async function runGate(phase, ctx) {
           void tee(logFile, text);
         },
       });
-      gateReceipts.push({ command, exitCode: 0, durationMs: Math.round(performance.now() - commandStarted) });
+      gateReceipts.push({ command: display, exitCode: 0, durationMs: Math.round(performance.now() - commandStarted) });
     } catch (error) {
       await tee(logFile, `\n${error.output ?? error.message}\n`);
       gateReceipts.push({
-        command,
+        command: display,
         exitCode: typeof error.code === 'number' ? error.code : null,
         durationMs: Math.round(performance.now() - commandStarted),
       });
       return {
         ok: false,
-        command,
+        command: display,
         output: error.output ?? error.message,
         gateReceipts,
         durationMs: Math.round(performance.now() - started),
@@ -390,10 +409,13 @@ async function withRetries(phase, operation, { failed = /** @type {(value: any) 
 
 async function runSetup(commands, ctx) {
   const logFile = ctx.state.logPath('setup');
-  for (const command of commands) {
-    log(`  $ ${command}`);
+  const normalizedCommands = commands.map((entry, index) => normalizeCommandEntry(entry, { label: 'setup', index }));
+  for (const normalized of normalizedCommands) {
+    const { display } = normalized;
+    log(`  $ ${display}`);
     try {
-      await runCommand(ctx.config.shell, ['-c', command], {
+      const invocation = commandInvocation(normalized, ctx);
+      await runCommand(invocation.command, invocation.args, {
         cwd: ctx.worktree,
         timeoutMs: ctx.config.timeoutMs,
         activeProcessPath: ctx.activeProcessPath,
@@ -404,7 +426,7 @@ async function runSetup(commands, ctx) {
       });
     } catch (error) {
       const detail = error.output ?? error.message;
-      throw new Error(`Worktree setup failed for \`${command}\`: ${detail}`, { cause: error });
+      throw new Error(`Worktree setup failed for \`${display}\`: ${detail}`, { cause: error });
     }
   }
 }
@@ -479,15 +501,17 @@ async function runAgent(phase, ctx, variables) {
   const agentRepo = sourceSnapshot?.path ?? ctx.worktree;
 
   try {
-  const rendered = await renderPrompt(phase.prompt, {
+  const promptVariables = {
     ...variables,
     ...(sourceSnapshot ? { REPO: agentRepo } : {}),
-  }, {
-    projectPromptDir: ctx.promptDir,
+  };
+  const rendered = await renderPrompt(phase.prompt, promptVariables, {
+    promptDirs: ctx.promptDirs,
   });
   const receivesOperatorNote = ctx.note
     && (ctx.note.targetPhase === phase.name || ctx.note.repairPhase === phase.name);
-  const prompt = receivesOperatorNote ? `${operatorNoteBlock(ctx.note.text)}${rendered.prompt}` : rendered.prompt;
+  const operatorNote = receivesOperatorNote ? ctx.note.text : null;
+  const prompt = withOperatorNote(rendered.prompt, operatorNote);
   const { path } = rendered;
   const promptHash = hashText(prompt);
   log(`  engine: ${agent.name}${agent.model ? `   model: ${agent.model}` : ''}${agent.effort ? `   effort: ${agent.effort}` : ''}   prompt: ${path}`);
@@ -569,6 +593,12 @@ async function runAgent(phase, ctx, variables) {
     inputSha,
     outputSha: await ctx.git.revParse(),
     promptHash,
+    promptInput: {
+      template: phase.prompt,
+      templateBody: rendered.body,
+      variables: promptVariables,
+      operatorNote,
+    },
     artifacts: [`${phase.name}.log`],
     engine: engineRecord(agent),
     startedAt,
@@ -700,6 +730,25 @@ export async function runLoop(options = {}) {
     if (task == null && persistedTask != null) task = persistedTask;
   }
 
+  const requestedPreset = args.preset ?? config.preset ?? null;
+  const configuredPreset = typeof requestedPreset === 'string' && requestedPreset.trim()
+    ? requestedPreset
+    : null;
+  const hasSavedPreset = args.resume && Object.hasOwn(state.data, 'preset');
+  const savedPreset = hasSavedPreset && typeof state.data.preset === 'string' && state.data.preset.trim()
+    ? state.data.preset
+    : hasSavedPreset ? null : undefined;
+  if (hasSavedPreset && args.preset !== undefined && configuredPreset !== savedPreset) {
+    throw new Error(
+      `Saved run used preset "${savedPreset ?? ''}"; cannot resume with --preset "${args.preset}". Start a new run instead.`,
+    );
+  }
+  const preset = hasSavedPreset ? savedPreset : configuredPreset;
+  const presetResolutionCwd = args.resume && typeof state.data.presetCwd === 'string'
+    ? state.data.presetCwd
+    : cwd;
+  const presetPromptDir = await resolvePresetPromptDir(preset, { cwd: presetResolutionCwd });
+
   const persistedBranch = args.resume ? state.data.branch : null;
   if (persistedBranch && args.branch && args.branch !== persistedBranch) {
     throw new Error(
@@ -740,7 +789,7 @@ export async function runLoop(options = {}) {
       await state.record({ taskFile });
     }
   }
-  await state.record({ status: 'running' });
+  await state.record({ status: 'running', preset, presetCwd: preset ? presetResolutionCwd : null });
   runStarted = true;
   const configuredAgentSettings = Object.fromEntries(
     config.resolvedPhases
@@ -853,7 +902,7 @@ export async function runLoop(options = {}) {
     dryRun: args.dryRun,
     remote,
     baseBranch,
-    promptDir: join(repoRoot, config.promptDir),
+    promptDirs: [join(repoRoot, config.promptDir), ...(presetPromptDir ? [presetPromptDir] : [])],
     activeProcessPath: join(state.dir, 'active-command.json'),
   };
 
@@ -893,6 +942,7 @@ export async function runLoop(options = {}) {
   if (taskFile) log(`task file : ${taskFile}`);
   log(`branch    : ${branch}${created ? ' (created)' : ''}`);
   log(`base      : ${baseBranch}`);
+  if (presetPromptDir) log(`preset    : ${preset} (${presetPromptDir})`);
   log(`worktree  : ${worktree}`);
   log(`run dir   : ${state.dir}`);
   log(`phases    : ${config.resolvedPhases.map((phase) => phase.name).join(' → ')}`);

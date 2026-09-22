@@ -91,6 +91,57 @@ export function resolveWindowsExecutable(command, env = process.env, options = {
   return null;
 }
 
+/**
+ * Resolve the shell binary and invocation flag used to run a user-authored
+ * command *string* (as opposed to an `argv` array, which needs no shell at
+ * all). POSIX always uses `sh -c`.
+ *
+ * `shellHint` couples this to an explicit `pwsh`/`cmd` per-platform command
+ * variant (see `normalizeCommandEntry`): a command authored under the `cmd`
+ * key is cmd.exe syntax and must run under `cmd.exe`, not whatever shell
+ * auto-detection would otherwise pick, and likewise `pwsh` always runs under
+ * PowerShell. It wins even over an explicit `configuredShell`, since a
+ * mismatched configured shell would just fail to parse the authored syntax.
+ *
+ * Without a hint, Windows first looks for `sh` (Git Bash / MSYS on `PATH`)
+ * so legacy POSIX command strings keep working unchanged, as they did before
+ * native PowerShell support existed; only when no `sh` is present does it
+ * fall back to PowerShell 7+ (`pwsh`), and then the Windows PowerShell that
+ * ships with every supported Windows release. An explicit `configuredShell`
+ * (`config.shell`) always wins over that auto-detection.
+ */
+export function resolveShell(options = {}) {
+  const {
+    platform = process.platform,
+    env = process.env,
+    configuredShell = null,
+    shellHint = null,
+    resolveExecutable = resolveWindowsExecutable,
+  } = options;
+  if (platform !== 'win32') {
+    return { bin: configuredShell || 'sh', flag: '-c' };
+  }
+  if (shellHint === 'cmd') {
+    return { bin: environmentValue(env, 'ComSpec') || 'cmd.exe', flag: ['/d', '/s', '/c'] };
+  }
+  if (shellHint === 'pwsh') {
+    return resolveExecutable('pwsh', env)
+      ? { bin: 'pwsh', flag: '-Command' }
+      : { bin: 'powershell.exe', flag: '-Command' };
+  }
+  if (configuredShell) {
+    const base = configuredShell.split(/[\\/]/).pop().replace(/\.exe$/i, '').toLowerCase();
+    if (base === 'cmd') return { bin: configuredShell, flag: ['/d', '/s', '/c'] };
+    if (base === 'pwsh' || base === 'powershell') return { bin: configuredShell, flag: '-Command' };
+    return { bin: configuredShell, flag: '-c' };
+  }
+  const sh = resolveExecutable('sh', env);
+  if (sh) return { bin: sh, flag: '-c' };
+  return resolveExecutable('pwsh', env)
+    ? { bin: 'pwsh', flag: '-Command' }
+    : { bin: 'powershell.exe', flag: '-Command' };
+}
+
 function windowsSpawnSpec(command, args, env, resolveExecutable) {
   const resolved = resolveExecutable(command, env) ?? command;
   const extension = windowsPath.extname(resolved).toLowerCase();

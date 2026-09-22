@@ -9,9 +9,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import { parseLoopArgs, runOperationalCommand as runCliOperationalCommand } from '../bin/loop.mjs';
-import { defaults, normalizePhases, loadConfig, loadRunsDir } from '../src/config.mjs';
+import { defaults, normalizeCommandEntry, normalizeCommandList, normalizePhases, loadConfig, loadRunsDir } from '../src/config.mjs';
 import { adapterFor, agentForPhase, createJsonlRenderer, engineForPhase, renderAgyEvent, renderClaudeEvent, renderGeminiEvent } from '../src/adapters.mjs';
-import { interpolate, packagePrompts, renderPrompt } from '../src/prompts.mjs';
+import { interpolate, loadTemplate, packagePresets, packagePrompts, renderPrompt, resolvePresetPromptDir } from '../src/prompts.mjs';
 import { parseVerdict, formatFindings } from '../src/verdict.mjs';
 import { hashConfig, hashText } from '../src/manifest.mjs';
 import { computeAggregateMetrics, computeRunMetrics } from '../src/metrics.mjs';
@@ -676,14 +676,125 @@ test('loadConfig merges overrides over the config file', async () => {
   const config = await loadConfig(root, { maxRounds: 7, engines: { review: 'codex' } });
   assert.equal(config.maxRounds, 7);
   assert.deepEqual(config.setup, []);
-  assert.equal(config.shell, 'sh');
+  assert.equal(config.shell, null);
   assert.equal(engineForPhase(config, 'review'), 'codex');
   assert.equal(engineForPhase(config, 'implement'), 'claude');
 });
 
+test('loadConfig exposes the preset key and defaults it to null', async () => {
+  const { root } = await repoFixture({ config: "export default { preset: 'work-item', gate: ['true'] };\n" });
+  const config = await loadConfig(root);
+  assert.equal(config.preset, 'work-item');
+  assert.equal(defaults.preset, null);
+  const invalidRoot = await repoFixture({ config: "export default { preset: '   ' };\n" });
+  await assert.rejects(loadConfig(invalidRoot.root), /`preset` must be null or a non-empty string/);
+});
+
 test('loadConfig rejects an empty configured shell', async () => {
   const { root } = await repoFixture({ config: 'export default { shell: "  " };\n' });
-  await assert.rejects(loadConfig(root), /`shell` must be a non-empty string/);
+  await assert.rejects(loadConfig(root), /`shell` must be null \(auto-detect\) or a non-empty string/);
+});
+
+test('normalizeCommandEntry accepts string, argv, and per-platform forms', () => {
+  assert.deepEqual(
+    normalizeCommandEntry('npm test', { label: 'gate', index: 0 }),
+    { kind: 'shell', shellString: 'npm test', display: 'npm test' },
+  );
+  assert.deepEqual(
+    normalizeCommandEntry({ argv: ['npm', 'ci'] }, { label: 'setup', index: 0 }),
+    { kind: 'argv', argv: ['npm', 'ci'], display: 'npm ci' },
+  );
+  assert.deepEqual(
+    normalizeCommandEntry({ posix: 'npm test', windows: 'npm.cmd test' }, { label: 'gate', index: 0, platform: 'win32' }),
+    { kind: 'shell', shellString: 'npm.cmd test', display: 'npm.cmd test' },
+  );
+  assert.deepEqual(
+    normalizeCommandEntry({ posix: 'npm test', windows: 'npm.cmd test' }, { label: 'gate', index: 0, platform: 'linux' }),
+    { kind: 'shell', shellString: 'npm test', display: 'npm test' },
+  );
+});
+
+test('normalizeCommandEntry tags pwsh/cmd variants with a shellHint that pins the resolved shell', () => {
+  assert.deepEqual(
+    normalizeCommandEntry({ posix: 'npm test', pwsh: 'npm test' }, { label: 'gate', index: 0, platform: 'win32' }),
+    { kind: 'shell', shellString: 'npm test', display: 'npm test', shellHint: 'pwsh' },
+  );
+  assert.deepEqual(
+    normalizeCommandEntry({ posix: 'npm test', cmd: 'npm test' }, { label: 'gate', index: 0, platform: 'win32' }),
+    { kind: 'shell', shellString: 'npm test', display: 'npm test', shellHint: 'cmd' },
+  );
+  // `windows` is the generic key; it does not pin a specific shell.
+  assert.deepEqual(
+    normalizeCommandEntry({ posix: 'npm test', windows: 'npm test', pwsh: 'npm test' }, { label: 'gate', index: 0, platform: 'win32' }),
+    { kind: 'shell', shellString: 'npm test', display: 'npm test' },
+  );
+});
+
+test('normalizeCommandEntry rejects invalid entries with a phase-named message', () => {
+  assert.throws(
+    () => normalizeCommandEntry('   ', { label: 'gate', index: 2 }),
+    /gate\[2\] must be a non-empty command string/,
+  );
+  assert.throws(
+    () => normalizeCommandEntry({ argv: 'npm ci' }, { label: 'setup', index: 1 }),
+    /setup\[1\]\.argv must be a non-empty array of non-empty strings/,
+  );
+  assert.throws(
+    () => normalizeCommandEntry({ argv: [] }, { label: 'setup', index: 1 }),
+    /setup\[1\]\.argv must be a non-empty array of non-empty strings/,
+  );
+  assert.throws(
+    () => normalizeCommandEntry(42, { label: 'gate', index: 0 }),
+    /gate\[0\] must be a command string, \{ argv: \[\.\.\.\] \}, or a per-platform command object/,
+  );
+  assert.throws(
+    () => normalizeCommandEntry({}, { label: 'gate', index: 0 }),
+    /gate\[0\] must define `argv` or at least one of posix, windows, pwsh, cmd/,
+  );
+});
+
+test('normalizeCommandEntry fails fast when the current platform has no matching variant', () => {
+  assert.throws(
+    () => normalizeCommandEntry({ posix: 'npm test' }, { label: 'phases.gate.gate', index: 0, platform: 'win32' }),
+    /phases\.gate\.gate\[0\] has no `windows` \(or `pwsh`\/`cmd`\) variant.*only posix defined/,
+  );
+  assert.throws(
+    () => normalizeCommandEntry({ windows: 'npm.cmd test' }, { label: 'gate', index: 0, platform: 'linux' }),
+    /gate\[0\] has no `posix` variant.*only windows defined/,
+  );
+});
+
+test('normalizeCommandList validates the whole array and rejects non-array input', () => {
+  assert.deepEqual(
+    normalizeCommandList(['true', { argv: ['npm', 'test'] }], { label: 'gate' }),
+    [
+      { kind: 'shell', shellString: 'true', display: 'true' },
+      { kind: 'argv', argv: ['npm', 'test'], display: 'npm test' },
+    ],
+  );
+  assert.throws(() => normalizeCommandList('true', { label: 'gate' }), /`gate` must be an array of commands/);
+});
+
+test('loadConfig fails fast on a posix-only gate command when the host is Windows', async () => {
+  const originalPlatform = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32' });
+  try {
+    const { root } = await repoFixture({ config: "export default { gate: [{ posix: 'npm test' }] };\n" });
+    await assert.rejects(loadConfig(root), /gate\[0\] has no `windows`/);
+  } finally {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  }
+});
+
+test('loadConfig accepts argv and per-platform gate commands on the current platform', async () => {
+  const { root } = await repoFixture({
+    config: `export default {
+  gate: [{ argv: ['true'] }, { posix: 'true', windows: 'cmd /c exit 0' }],
+};
+`,
+  });
+  const config = await loadConfig(root);
+  assert.deepEqual(config.gate, [{ argv: ['true'] }, { posix: 'true', windows: 'cmd /c exit 0' }]);
 });
 
 test('loadConfig validates run budget limits', async () => {
@@ -978,6 +1089,33 @@ test('custom adapter efforts reject unsupported values', async () => {
 test('interpolate fills variables and rejects unresolved ones', () => {
   assert.equal(interpolate('branch {{BRANCH}}', { BRANCH: 'feat/x' }), 'branch feat/x');
   assert.throws(() => interpolate('{{BRANCH}} {{MISSING}}', { BRANCH: 'x' }), /unresolved variables: MISSING/);
+});
+
+test('preset prompt resolution supports bundled, external, and unset values', async () => {
+  const bundled = await resolvePresetPromptDir('work-item');
+  assert.equal(bundled, join(packagePresets, 'work-item', 'prompts'));
+  assert.equal(await resolvePresetPromptDir(''), null);
+  assert.equal(await resolvePresetPromptDir('   '), null);
+  await assert.rejects(resolvePresetPromptDir('missing'), /Unknown preset "missing"\. Available: work-item/);
+
+  const root = await mkdtemp(join(tmpdir(), 'loop-preset-'));
+  await mkdir(join(root, 'preset', 'prompts'), { recursive: true });
+  assert.equal(await resolvePresetPromptDir('./preset', { cwd: root }), join(root, 'preset', 'prompts'));
+  await assert.rejects(resolvePresetPromptDir('./missing', { cwd: root }), /Preset directory has no prompts/);
+});
+
+test('loadTemplate searches project overrides, preset overrides, then packaged prompts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'loop-prompt-chain-'));
+  const project = join(root, 'project');
+  const preset = join(root, 'preset');
+  await mkdir(project);
+  await mkdir(preset);
+  await writeFile(join(project, 'implement.md'), 'project');
+  await writeFile(join(preset, 'docs.md'), 'preset');
+
+  assert.equal((await loadTemplate('implement', { promptDirs: [project, preset] })).body, 'project');
+  assert.equal((await loadTemplate('docs', { promptDirs: [project, preset] })).body, 'preset');
+  assert.equal((await loadTemplate('review', { promptDirs: [project, preset] })).path, join(packagePrompts, 'review.md'));
 });
 
 test('default prompts render cleanly for every task input mode', async () => {
@@ -1902,6 +2040,7 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
   assert.equal(args.maxRounds, 2);
   assert.equal(args.baseBranch, 'other-branch');
   assert.equal(args.yes, true);
+  assert.equal(parseLoopArgs(['--preset', 'work-item']).preset, 'work-item');
   assert.deepEqual(parseLoopArgs(['status', 'demo', '--json']), {
     command: 'status',
     runName: 'demo',
@@ -2023,6 +2162,87 @@ test('init command dispatch returns JSON scaffold results', async () => {
   assert.deepEqual(JSON.parse(output[0]), result);
 });
 
+test('a run-time preset renders bundled prompts and logs its selection', async () => {
+  const { root, workItem } = await repoFixture({ phases: ['implement'] });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, preset: 'work-item', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+
+  const output = lines.join('\n');
+  assert.match(output, /preset\s+: work-item .*presets[\\/]work-item[\\/]prompts/);
+  assert.match(output, /IN PROGRESS/);
+
+  const genericLines = [];
+  console.log = (message) => genericLines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, phases: ['implement'], dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.doesNotMatch(genericLines.join('\n'), /IN PROGRESS/);
+});
+
+test('a saved preset is reused on resume and rejects a conflicting flag', async () => {
+  const { root, workItem } = await repoFixture({
+    config: "export default { phases: ['gate'], gate: ['true'], worktrees: false, preset: 'work-item' };\n",
+  });
+  await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+
+  const statePath = join(root, '.loop', 'runs', 'ss-demo-feature', 'state.json');
+  const state = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(state.preset, 'work-item');
+
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /preset\s+: work-item/);
+  await assert.rejects(
+    runLoop({ args: { taskFile: workItem, cwd: root, resume: true, preset: 'other', yes: true } }),
+    /Saved run used preset "work-item"; cannot resume with --preset "other"\. Start a new run instead\./,
+  );
+});
+
+test('a relative external preset stays anchored to its original cwd on resume', async () => {
+  const { root, workItem } = await repoFixture({
+    config: "export default { phases: ['gate'], gate: ['true'], worktrees: false };\n",
+  });
+  const initialPreset = join(root, 'preset', 'prompts');
+  const alternatePreset = join(root, 'resume', 'preset', 'prompts');
+  await mkdir(initialPreset, { recursive: true });
+  await mkdir(alternatePreset, { recursive: true });
+
+  await runLoop({ args: { taskFile: workItem, cwd: root, preset: './preset', yes: true } });
+
+  const statePath = join(root, '.loop', 'runs', 'ss-demo-feature', 'state.json');
+  const state = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(state.preset, './preset');
+  assert.equal(state.presetCwd, root);
+
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({
+      args: { taskFile: workItem, cwd: join(root, 'resume'), resume: true, preset: './preset', yes: true },
+    });
+  } finally {
+    console.log = original;
+  }
+
+  assert.ok(lines.includes(`preset    : ./preset (${initialPreset})`));
+  assert.ok(!lines.includes(`preset    : ./preset (${alternatePreset})`));
+});
+
 test('a dry run plans every phase without creating state, a worktree, or a branch', async () => {
   const { root, workItem, worktreeRoot } = await repoFixture();
   const original = console.log;
@@ -2096,6 +2316,10 @@ git commit -m 'feat: implement fixture'
   assert.match(entry.outputSha, /^[0-9a-f]{40}$/);
   assert.notEqual(entry.inputSha, entry.outputSha);
   assert.match(entry.promptHash, /^[0-9a-f]{64}$/);
+  assert.equal(entry.promptInput.template, 'implement');
+  assert.equal(typeof entry.promptInput.templateBody, 'string');
+  assert.equal(entry.promptInput.variables.TASK_NAME, 'ss-demo-feature');
+  assert.equal(entry.promptInput.operatorNote, null);
   assert.match(entry.configHash, /^[0-9a-f]{64}$/);
   assert.deepEqual(entry.engine, { name: 'claude' });
   assert.ok(entry.artifacts.includes('implement.log'));
@@ -4147,6 +4371,71 @@ test('gate commands run through a shell so quoting and && survive', async () => 
   assert.deepEqual(summary.phases.map((phase) => phase.name), ['gate']);
 });
 
+test('gate commands accept argv entries and run without a shell', async () => {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  gate: [{ argv: ['node', '-e', 'process.exit(0)'] }],
+  worktreeRoot: ${JSON.stringify(await mkdtemp(join(tmpdir(), 'loop-trees-')))},
+};
+`,
+  });
+  const original = console.log;
+  console.log = () => {};
+  let summary;
+  try {
+    summary = await runLoop({ args: { taskFile: workItem, cwd: root, phases: ['gate'], yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.equal(summary.stalled, null);
+  assert.deepEqual(summary.phases.map((phase) => phase.name), ['gate']);
+  const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
+  const gateEntry = manifest.phases.find((entry) => entry.phase === 'gate');
+  assert.equal(gateEntry.gateReceipts.length, 1);
+  assert.equal(gateEntry.gateReceipts[0].command, 'node -e process.exit(0)');
+  assert.equal(gateEntry.gateReceipts[0].exitCode, 0);
+});
+
+test('gate commands accept per-platform entries and pick the current platform variant', async () => {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  gate: [{ posix: 'true', windows: 'cmd /c exit 0' }],
+  worktreeRoot: ${JSON.stringify(await mkdtemp(join(tmpdir(), 'loop-trees-')))},
+};
+`,
+  });
+  const original = console.log;
+  console.log = () => {};
+  let summary;
+  try {
+    summary = await runLoop({ args: { taskFile: workItem, cwd: root, phases: ['gate'], yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.equal(summary.stalled, null);
+});
+
+test('setup commands accept argv entries and run without a shell', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  setup: [{ argv: ['node', '-e', "require('fs').writeFileSync('setup-marker', 'ok')"] }],
+  gate: [{ argv: ['node', '-e', "process.exit(require('fs').readFileSync('setup-marker', 'utf8') === 'ok' ? 0 : 1)"] }],
+  phases: ['gate'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const original = console.log;
+  console.log = () => {};
+  let summary;
+  try {
+    summary = await runLoop({ args: { taskFile: workItem, cwd: root, phases: ['gate'], yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.equal(summary.stalled, null);
+  assert.equal(await readFile(join(summary.worktree, 'setup-marker'), 'utf8'), 'ok');
+});
+
 test('configured shell runs setup and gate commands', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const { root, workItem } = await repoFixture({ config: `export default {
@@ -4942,7 +5231,8 @@ esac
   }
 
   assert.equal(summary.stalled.phase, 'publish');
-  assert.match(summary.stalled.reason, /no passing gate receipt preceding its review/);
+  assert.equal(summary.stalled.reason, `current HEAD matches approved review SHA ${await git(summary.worktree, 'rev-parse', 'HEAD')}, but no passing gate receipt for that SHA was recorded before the review`);
+  assert.doesNotMatch(summary.stalled.reason, /publishing requires the approved SHA/);
   assert.doesNotMatch(lines.join('\n'), /Push to/, 'the git agent never runs over an ungated approval');
   const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
   assert.equal(manifest.phases.some((entry) => entry.role === 'gate'), false, 'no gate ran in this partial pipeline');

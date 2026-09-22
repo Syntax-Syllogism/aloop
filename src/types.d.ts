@@ -9,6 +9,16 @@ export interface RetryPolicy {
   maxRounds?: number;
 }
 
+/**
+ * `argv` runs directly with no shell (portable by construction). A
+ * per-platform object picks the variant matching the host at config-load
+ * time; a bare string is the legacy shell-string form.
+ */
+export type CommandEntry =
+  | string
+  | { argv: string[] }
+  | { posix?: string; windows?: string; pwsh?: string; cmd?: string };
+
 export interface HermeticConfig {
   runtime?: string;
   image?: string | null;
@@ -42,7 +52,7 @@ export interface AgentPhase extends PhaseBase {
 
 export interface GatePhase extends PhaseBase {
   kind: 'gate';
-  commands?: string[];
+  commands?: CommandEntry[];
 }
 
 export interface PublishPhase extends PhaseBase {
@@ -111,15 +121,16 @@ export interface Config {
   phases: Array<string | Partial<PhaseDescriptor>>;
   resolvedPhases: PhaseDescriptor[];
   publish: { backend?: string | object; draft?: boolean };
-  gate: string[];
-  setup: string[];
-  shell: string;
+  gate: CommandEntry[];
+  setup: CommandEntry[];
+  shell: string | null;
   maxRounds: number;
   timeoutMs: number;
   budget: Budget;
   worktrees: boolean;
   worktreeRoot: string | null;
   promptDir: string;
+  preset: string | null;
   runsDir: string;
   hermetic: HermeticConfig;
 }
@@ -158,6 +169,12 @@ export interface ManifestEntry {
   outputSha?: string;
   approvedSha?: string;
   usage?: Usage;
+  promptInput?: {
+    template?: string;
+    templateBody?: string;
+    variables?: Record<string, unknown>;
+    operatorNote?: string | null;
+  };
   [key: string]: unknown;
 }
 
@@ -202,6 +219,16 @@ export interface Summary {
   taskFile?: string | null;
   prUrl?: string | null;
   pullRequest?: Record<string, unknown> | null;
+}
+
+export interface OperationalOutput {
+  log(...data: any[]): void;
+  error?: (...data: any[]) => void;
+}
+
+export interface OperationalResult {
+  timeline?: Array<Record<string, any>>;
+  [key: string]: any;
 }
 
 export interface Operations {

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [0.9.0] - 2026-09-22
+
+### Added
+
+- Native Windows (PowerShell, no POSIX shell) support
+- Runtime preset activation
+- Run replay evidence
+
+### Fixed
+
+- Windows PATH handling to preserve System32 directories
+- CI type checking and Windows PATH stripping
+- Shell selection and key binding coupling on Windows
+- Clarified error messages for ungated publish failures
+- Fixed type contract for replay command output
+
 ## [0.8.4] - 2026-09-20
 
 ### Fixed

@@ -43,3 +43,51 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: npm test -- test/platform.test.mjs
+
+  windows-native:
+    name: Windows (native PowerShell, no sh)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      # GitHub's Windows runners ship Git for Windows, which puts sh.exe on PATH
+      # in more than one place (both Git\usr\bin and Git\bin) — exactly the
+      # POSIX shell this job exists to prove aloop does not need. Strip every
+      # PATH entry that actually contains sh.exe so the run is genuinely native,
+      # regardless of where Git installs it. We deliberately key on sh.exe only:
+      # git.exe lives in Git\cmd (no shell), and C:\Windows\System32 ships a
+      # bash.exe (the WSL launcher) but no sh.exe, so System32 — and cmd.exe with
+      # it — must stay on PATH. aloop's shell resolution looks for sh, not bash.
+      - name: Remove Git's POSIX shell from PATH
+        run: |
+          $filtered = ($env:PATH -split ';') | Where-Object {
+            $_ -and -not (Test-Path (Join-Path $_ 'sh.exe'))
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "PATH=$($filtered -join ';')"
+
+      - name: Verify no POSIX shell is on PATH
+        run: |
+          if (Get-Command sh -ErrorAction SilentlyContinue) {
+            Write-Error 'sh is still resolvable on PATH; this job is not exercising the native no-shell path.'
+            exit 1
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test native Windows platform suite
+        run: npm test -- test/platform.test.mjs
+
+      - name: Test structured/per-platform gate and setup commands
+        run: npm test -- --test-name-pattern="normalizeCommandEntry|normalizeCommandList|gate commands accept argv entries|gate commands accept per-platform entries|setup commands accept argv entries|loadConfig fails fast on a posix-only gate command|loadConfig accepts argv and per-platform gate commands" test/loop.test.mjs

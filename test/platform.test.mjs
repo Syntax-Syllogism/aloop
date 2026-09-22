@@ -4,7 +4,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveWindowsExecutable, runCommand } from '../src/command.mjs';
+import { resolveShell, resolveWindowsExecutable, runCommand } from '../src/command.mjs';
 import { openTerminalInput } from '../src/reporter.mjs';
 
 function fakeChild(pid = 1234) {
@@ -197,6 +197,72 @@ test('Windows command timeouts fall back when taskkill exits unsuccessfully', as
     spawnImpl,
   }), (error) => /** @type {any} */ (error).code === 'ETIMEDOUT');
   assert.equal(child.directlyKilled, true);
+});
+
+test('shell resolution defaults to sh -c on POSIX', () => {
+  assert.deepEqual(resolveShell({ platform: 'linux' }), { bin: 'sh', flag: '-c' });
+  assert.deepEqual(resolveShell({ platform: 'linux', configuredShell: 'bash' }), { bin: 'bash', flag: '-c' });
+});
+
+test('shell resolution prefers sh (Git Bash) on Windows when it is on PATH', () => {
+  assert.deepEqual(
+    resolveShell({
+      platform: 'win32',
+      resolveExecutable: (command) => (command === 'sh' ? 'C:\\Program Files\\Git\\bin\\sh.exe' : 'C:\\Tools\\pwsh.exe'),
+    }),
+    { bin: 'C:\\Program Files\\Git\\bin\\sh.exe', flag: '-c' },
+  );
+});
+
+test('shell resolution falls back to pwsh, then powershell.exe, when sh is unavailable', () => {
+  assert.deepEqual(
+    resolveShell({
+      platform: 'win32',
+      resolveExecutable: (command) => (command === 'pwsh' ? 'C:\\Tools\\pwsh.exe' : null),
+    }),
+    { bin: 'pwsh', flag: '-Command' },
+  );
+  assert.deepEqual(
+    resolveShell({ platform: 'win32', resolveExecutable: () => null }),
+    { bin: 'powershell.exe', flag: '-Command' },
+  );
+});
+
+test('shell resolution couples an explicit shellHint to the matching shell, even over config.shell', () => {
+  assert.deepEqual(
+    resolveShell({
+      platform: 'win32',
+      shellHint: 'cmd',
+      env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+      configuredShell: 'pwsh',
+      resolveExecutable: () => 'C:\\Program Files\\Git\\bin\\sh.exe',
+    }),
+    { bin: 'C:\\Windows\\System32\\cmd.exe', flag: ['/d', '/s', '/c'] },
+  );
+  assert.deepEqual(
+    resolveShell({
+      platform: 'win32',
+      shellHint: 'pwsh',
+      configuredShell: 'cmd.exe',
+      resolveExecutable: () => 'C:\\Tools\\pwsh.exe',
+    }),
+    { bin: 'pwsh', flag: '-Command' },
+  );
+});
+
+test('shell resolution honors an explicit config.shell override on Windows', () => {
+  assert.deepEqual(
+    resolveShell({ platform: 'win32', configuredShell: 'cmd.exe', resolveExecutable: () => 'C:\\Tools\\pwsh.exe' }),
+    { bin: 'cmd.exe', flag: ['/d', '/s', '/c'] },
+  );
+  assert.deepEqual(
+    resolveShell({ platform: 'win32', configuredShell: 'powershell.exe' }),
+    { bin: 'powershell.exe', flag: '-Command' },
+  );
+  assert.deepEqual(
+    resolveShell({ platform: 'win32', configuredShell: 'C:\\Tools\\pwsh.exe' }),
+    { bin: 'C:\\Tools\\pwsh.exe', flag: '-Command' },
+  );
 });
 
 test('Windows terminal input prefers a TTY and otherwise opens CONIN$', async () => {

@@ -58,6 +58,12 @@ export function publishingAttestation(state, currentSha) {
   if (!approved) return { approvedSha: null, currentSha, reason: `current HEAD ${currentSha} has no completed approval from a review phase` };
   if (approved.sha !== currentSha) return { approvedSha: approved.sha, currentSha, reason: `current HEAD ${currentSha} does not match the approved review SHA ${approved.sha}` };
   const gatePassed = state.manifest.entries.slice(0, approved.index).some((entry) => entry.role === 'gate' && entry.status === 'completed' && entry.outputSha === approved.sha);
-  if (!gatePassed) return { approvedSha: approved.sha, currentSha, reason: `approved review SHA ${approved.sha} has no passing gate receipt preceding its review` };
+  if (!gatePassed) {
+    return {
+      approvedSha: approved.sha,
+      currentSha,
+      reason: `current HEAD matches approved review SHA ${approved.sha}, but no passing gate receipt for that SHA was recorded before the review`,
+    };
+  }
   return null;
 }

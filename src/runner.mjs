@@ -576,7 +576,7 @@ export async function runPhases({
         if (attestation) {
           log(`  ${attestation.reason}; refusing to publish.`);
           await recordManifest(ctx, manifestEntry(phase, ctx, { inputSha: currentSha, outputSha: currentSha, approvedSha: attestation.approvedSha, status: 'stalled' }));
-          summary.stalled = { phase: phase.name, reason: `${attestation.reason}; publishing requires the approved SHA`, output: `approved SHA: ${attestation.approvedSha ?? '(none)'}\ncurrent HEAD: ${attestation.currentSha}` };
+          summary.stalled = { phase: phase.name, reason: attestation.reason, output: `approved SHA: ${attestation.approvedSha ?? '(none)'}\ncurrent HEAD: ${attestation.currentSha}` };
           break;
         }
       }

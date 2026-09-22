@@ -29,8 +29,10 @@ const defaults = {
   // Commands run once in a newly created worktree before the first phase.
   // An empty list keeps the generic runner package-manager agnostic.
   setup: [],
-  // Shell used for user-authored setup and gate commands.
-  shell: 'sh',
+  // Shell used to run user-authored setup/gate command *strings*. `null` means
+  // "auto": `sh` on POSIX, PowerShell 7+ (falling back to Windows PowerShell)
+  // on Windows. Structured `{ argv }` commands never consult this at all.
+  shell: null,
   maxRounds: 3,
   // Per-command budget. An implement phase on a real work item routinely
   // runs past half an hour; a cap that tight kills healthy runs mid-edit.
@@ -41,6 +43,7 @@ const defaults = {
   worktrees: true,
   worktreeRoot: null,
   promptDir: '.loop/prompts',
+  preset: null,
   runsDir: '.loop/runs',
   // Container execution is opt-in per phase. These are inherited defaults,
   // not an instruction to run every phase in a container.
@@ -138,6 +141,81 @@ async function exists(path) {
   } catch {
     return false;
   }
+}
+
+const PLATFORM_COMMAND_KEYS = ['posix', 'windows', 'pwsh', 'cmd'];
+
+/**
+ * Normalize one `gate`/`setup`/`phase.commands` entry to its execution shape.
+ *
+ * Three authored forms are accepted: a legacy shell string (runs through the
+ * configured/native shell, unchanged for POSIX callers); `{ argv }` (runs
+ * directly, no shell, portable by construction); and a per-platform object
+ * (`{ posix, windows, pwsh, cmd }`) that picks the variant for `platform`.
+ * Resolution happens here, at config-load time, so a config missing the
+ * variant needed on this host fails fast with a phase/index-named error
+ * instead of stalling mid-run.
+ *
+ * @typedef {{ kind: 'shell' | 'argv', argv?: string[], shellString?: string, display: string, shellHint?: 'pwsh' | 'cmd' }} NormalizedCommand
+ *
+ * @param {*} entry
+ * @param {{ label?: string, index?: number, platform?: NodeJS.Platform }} [options]
+ * @returns {NormalizedCommand}
+ */
+export function normalizeCommandEntry(entry, { label, index, platform = process.platform } = {}) {
+  const where = `${label}[${index}]`;
+  if (typeof entry === 'string') {
+    if (!entry.trim()) throw new Error(`${where} must be a non-empty command string.`);
+    return { kind: 'shell', shellString: entry, display: entry };
+  }
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`${where} must be a command string, { argv: [...] }, or a per-platform command object.`);
+  }
+  if (entry.argv !== undefined) {
+    if (!Array.isArray(entry.argv) || entry.argv.length === 0
+      || entry.argv.some((part) => typeof part !== 'string' || !part)) {
+      throw new Error(`${where}.argv must be a non-empty array of non-empty strings.`);
+    }
+    return { kind: 'argv', argv: entry.argv, display: entry.argv.join(' ') };
+  }
+  const present = PLATFORM_COMMAND_KEYS.filter((key) => entry[key] !== undefined);
+  if (present.length === 0) {
+    throw new Error(`${where} must define \`argv\` or at least one of ${PLATFORM_COMMAND_KEYS.join(', ')}.`);
+  }
+  for (const key of present) {
+    if (typeof entry[key] !== 'string' || !entry[key].trim()) {
+      throw new Error(`${where}.${key} must be a non-empty command string.`);
+    }
+  }
+  const isWindows = platform === 'win32';
+  const selectedKey = isWindows
+    ? (entry.windows !== undefined ? 'windows' : entry.pwsh !== undefined ? 'pwsh' : entry.cmd !== undefined ? 'cmd' : undefined)
+    : (entry.posix !== undefined ? 'posix' : undefined);
+  const selected = selectedKey ? entry[selectedKey] : undefined;
+  if (selected === undefined) {
+    const need = isWindows ? '`windows` (or `pwsh`/`cmd`)' : '`posix`';
+    throw new Error(
+      `${where} has no ${need} variant for this platform (only ${present.join(', ')} defined). `
+      + 'Add the missing variant, or use { argv: [...] } for a command that runs unchanged on every platform.',
+    );
+  }
+  // `pwsh`/`cmd` are narrower than the generic `windows` key: they name a
+  // specific shell dialect, so the resolved shell must match the key chosen
+  // here rather than being re-auto-detected at invocation time.
+  const shellHint = selectedKey === 'pwsh' || selectedKey === 'cmd'
+    ? { shellHint: /** @type {'pwsh' | 'cmd'} */ (selectedKey) }
+    : {};
+  return { kind: 'shell', shellString: selected, display: selected, ...shellHint };
+}
+
+/**
+ * @param {unknown} list
+ * @param {{ label?: string, platform?: NodeJS.Platform }} [options]
+ * @returns {NormalizedCommand[]}
+ */
+export function normalizeCommandList(list, { label, platform } = {}) {
+  if (!Array.isArray(list)) throw new Error(`\`${label}\` must be an array of commands.`);
+  return list.map((entry, index) => normalizeCommandEntry(entry, { label, index, platform }));
 }
 
 function toPhase(entry, index) {
@@ -384,11 +462,13 @@ export async function loadConfig(cwd, overrides = {}, configPath) {
   if (merged.publish.draft !== undefined && typeof merged.publish.draft !== 'boolean') {
     throw new Error('`publish.draft` must be a boolean.');
   }
-  if (!Array.isArray(merged.setup) || merged.setup.some((command) => typeof command !== 'string')) {
-    throw new Error('`setup` must be an array of command strings.');
+  normalizeCommandList(merged.setup, { label: 'setup' });
+  normalizeCommandList(merged.gate, { label: 'gate' });
+  if (merged.shell !== null && (typeof merged.shell !== 'string' || !merged.shell.trim())) {
+    throw new Error('`shell` must be null (auto-detect) or a non-empty string.');
   }
-  if (typeof merged.shell !== 'string' || !merged.shell.trim()) {
-    throw new Error('`shell` must be a non-empty string.');
+  if (merged.preset !== null && (typeof merged.preset !== 'string' || !merged.preset.trim())) {
+    throw new Error('`preset` must be null or a non-empty string.');
   }
   merged.resolvedPhases = normalizePhases(merged.phases, { maxRounds: merged.maxRounds });
   for (const phase of merged.resolvedPhases.flatMap((entry) => [entry, ...(entry.repair ?? [])])) {
@@ -396,6 +476,9 @@ export async function loadConfig(cwd, overrides = {}, configPath) {
   }
   assertPublishablePhaseOrder(merged.resolvedPhases);
   const allResolvedPhases = merged.resolvedPhases.flatMap((phase) => [phase, ...(phase.repair ?? [])]);
+  for (const phase of allResolvedPhases) {
+    if (phase.commands !== undefined) normalizeCommandList(phase.commands, { label: `phases.${phase.name}.commands` });
+  }
   if (allResolvedPhases.some((phase) => phase.kind === 'gate' && !(phase.commands ?? merged.gate).length)) {
     throw new Error('The pipeline has a gate phase but no gate commands; set `gate: [...]` in loop.config.mjs.');
   }

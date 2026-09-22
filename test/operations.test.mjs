@@ -5,8 +5,9 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseLoopArgs } from '../bin/loop.mjs';
-import { cancelRun, cleanRuns, doctor, inspectRun, listRuns } from '../src/operations.mjs';
+import { parseLoopArgs, runOperationalCommand } from '../bin/loop.mjs';
+import { hashConfig, hashText } from '../src/manifest.mjs';
+import { cancelRun, cleanRuns, doctor, inspectRun, listRuns, replayRun } from '../src/operations.mjs';
 import { RunState } from '../src/state.mjs';
 
 const exec = promisify(execFile);
@@ -84,6 +85,79 @@ test('operational read commands summarize state and manifest evidence', async ()
   assert.equal(inspected.phases[0].inputSha, 'before');
   assert.deepEqual(inspected.phases[0].gateReceipts, [{ command: 'true', ok: true }]);
   assert.deepEqual(inspected.phases[0].artifacts, ['gate.log']);
+});
+
+async function replayableRun(root, name, { promptHash = hashText('Implement demo.'), baseSha = null, worktree = root } = {}) {
+  const state = await RunState.open(join(root, '.loop/runs'), name, { name, worktree });
+  const resolvedConfig = { promptDir: '.loop/prompts' };
+  state.manifest.append({
+    phase: 'implement',
+    kind: 'agent',
+    role: 'agent',
+    status: 'completed',
+    inputSha: 'before',
+    outputSha: 'after',
+    promptHash,
+    configHash: hashConfig(resolvedConfig),
+    promptInput: {
+      template: 'implement',
+      templateBody: 'Implement {{TASK}}.',
+      variables: { TASK: 'demo' },
+      operatorNote: null,
+    },
+  });
+  state.manifest.append({
+    phase: 'gate',
+    kind: 'gate',
+    role: 'gate',
+    status: 'completed',
+    inputSha: 'after',
+    outputSha: 'after',
+    configHash: hashConfig(resolvedConfig),
+    gateReceipts: [{ command: 'npm test', exitCode: 0 }],
+  });
+  await state.saveSnapshot({
+    baseSha: baseSha ?? await git(root, 'rev-parse', 'HEAD'),
+    configHash: hashConfig(resolvedConfig),
+    resolvedConfig,
+    worktree,
+  });
+  await state.record({ status: 'completed' });
+  await state.release();
+}
+
+test('replay verifies recorded prompt inputs and reconstructs the phase timeline', async () => {
+  const root = await fixture();
+  await replayableRun(root, 'replayable');
+
+  const result = await replayRun('replayable', { cwd: root });
+  assert.equal(result.dryRun, true);
+  assert.equal(result.baseSha.available, true);
+  assert.equal(result.worktree.available, true);
+  assert.equal(result.timeline[0].prompt.status, 'verified');
+  assert.deepEqual(result.timeline[1].gateReceipts, [{ command: 'npm test', exitCode: 0 }]);
+  assert.deepEqual(result.divergences, []);
+
+  const output = [];
+  const cliResult = await runOperationalCommand(
+    parseLoopArgs(['replay', 'replayable', '--json']),
+    { cwd: root, output: { log: (line) => output.push(line) } },
+  );
+  assert.equal(cliResult.timeline[0].prompt.status, 'verified');
+  assert.equal(JSON.parse(output[0]).name, 'replayable');
+});
+
+test('replay reports prompt and Git-state divergence without failing', async () => {
+  const root = await fixture();
+  await replayableRun(root, 'tampered', {
+    promptHash: '0'.repeat(64),
+    baseSha: 'f'.repeat(40),
+    worktree: join(root, 'missing-worktree'),
+  });
+
+  const result = await replayRun('tampered', { cwd: root });
+  assert.equal(result.timeline[0].prompt.status, 'mismatch');
+  assert.deepEqual(result.divergences.map((item) => item.type), ['base-sha', 'worktree', 'prompt-hash']);
 });
 
 test('PR summaries ignore URLs in task and manifest text', async () => {
@@ -255,6 +329,7 @@ test('operational subcommands parse names and machine-readable options', () => {
   assert.equal(parseLoopArgs(['status', 'demo', '--json']).runName, 'demo');
   assert.equal(parseLoopArgs(['clean', '--older-than', '14', '--yes']).olderThanDays, 14);
   assert.equal(parseLoopArgs(['doctor', '--json']).json, true);
+  assert.equal(parseLoopArgs(['replay', 'demo', '--json']).runName, 'demo');
 });
 
 test('operational commands honor a custom runsDir and surface a broken config import', async () => {

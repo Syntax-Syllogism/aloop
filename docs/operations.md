@@ -1,6 +1,6 @@
 ---
 title: Operational run commands
-description: Inspect, cancel, clean up, diagnose aloop runs, and run local quality checks.
+description: Inspect, replay, cancel, clean up, diagnose aloop runs, and run local quality checks.
 ---
 
 # Operational run commands
@@ -34,6 +34,31 @@ verdicts, gate receipts, and artifact paths.
 The derived status can be `running`, `completed`, `stalled`, `cancelled`, or
 `unknown`. A live lock or active command is reported as `running`, which helps
 avoid treating a process that is still shutting down as a stale run.
+
+## Replaying recorded evidence
+
+```sh
+aloop replay my-spec
+aloop replay my-spec --json
+```
+
+`replay` is a dry, read-only reconstruction: it never invokes an agent or
+changes the recorded run. Its JSON timeline retains each phase's status, input
+and output SHAs, verdicts, gate receipts, and prompt-verification result. The
+human-readable view prints a one-line phase summary; use `--json` when an
+audit or automation needs the full evidence fields.
+
+For each new-format agent entry, replay re-renders the saved template body with
+the exact saved variables and applicable operator note, then compares the
+resulting SHA-256 with `promptHash`. A result is `verified`, `mismatch`, or
+`unverifiable`; older entries that did not retain prompt inputs are
+`unverifiable`, rather than treated as verified from their hash alone.
+
+Replay also reports divergences without failing solely because the evidence has
+aged or been tampered with. These include a missing snapshot, unavailable
+recorded base commit or worktree, a configuration-hash inconsistency, and a
+prompt-hash mismatch. The command reports availability; it does not recreate a
+worktree, restore a commit, or make a live re-run.
 
 ## Cancelling an active run
 
