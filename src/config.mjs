@@ -24,6 +24,7 @@ const defaults = {
   adapters: {},
   engines: { default: { name: 'claude' } },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
+  reviewRoles: [],
   publish: { backend: 'github', draft: true },
   gate: [],
   // Commands run once in a newly created worktree before the first phase.
@@ -45,6 +46,10 @@ const defaults = {
   promptDir: '.loop/prompts',
   preset: null,
   runsDir: '.loop/runs',
+  // Display-only. Quiet suppresses raw engine/gate/setup streams on the
+  // terminal (logs are unaffected) and prints a heartbeat instead.
+  quiet: false,
+  heartbeatMinutes: 10,
   // Container execution is opt-in per phase. These are inherited defaults,
   // not an instruction to run every phase in a container.
   hermetic: {
@@ -132,6 +137,12 @@ const builtinPhases = {
     permissions: [PERMISSIONS.PUBLISH],
     retry: { maxAttempts: 1 },
   },
+};
+
+const specializedReviewPrompts = {
+  security: 'review-security',
+  'api-compat': 'review-api',
+  'test-quality': 'review-tests',
 };
 
 async function exists(path) {
@@ -470,8 +481,35 @@ export async function loadConfig(cwd, overrides = {}, configPath) {
   if (merged.preset !== null && (typeof merged.preset !== 'string' || !merged.preset.trim())) {
     throw new Error('`preset` must be null or a non-empty string.');
   }
+  if (typeof merged.quiet !== 'boolean') {
+    throw new Error('`quiet` must be a boolean.');
+  }
+  if (typeof merged.heartbeatMinutes !== 'number' || !Number.isFinite(merged.heartbeatMinutes) || merged.heartbeatMinutes < 0) {
+    throw new Error('`heartbeatMinutes` must be a nonnegative number of minutes.');
+  }
   merged.resolvedPhases = normalizePhases(merged.phases, { maxRounds: merged.maxRounds });
-  for (const phase of merged.resolvedPhases.flatMap((entry) => [entry, ...(entry.repair ?? [])])) {
+  if (!Array.isArray(merged.reviewRoles)
+    || new Set(merged.reviewRoles).size !== merged.reviewRoles.length
+    || merged.reviewRoles.some((role) => !Object.hasOwn(specializedReviewPrompts, role))) {
+    throw new Error('`reviewRoles` must be an array of unique roles: security, api-compat, test-quality.');
+  }
+  if (merged.reviewRoles.length) {
+    const review = merged.resolvedPhases.find((phase) => phase.name === 'review' && phase.verdict);
+    if (!review) throw new Error('`reviewRoles` requires the built-in review phase.');
+    review.reviewers = merged.reviewRoles.map((role) => toPhase({
+      name: `review-${role}`,
+      kind: 'agent',
+      prompt: specializedReviewPrompts[role],
+      verdict: true,
+      reviewGroup: 'review',
+      hermetic: review.hermetic,
+      inputs: ['commit', 'gate-result'],
+      outputs: ['verdict'],
+      postconditions: ['verdict-recorded'],
+      permissions: [PERMISSIONS.READ_ONLY],
+    }, 0));
+  }
+  for (const phase of merged.resolvedPhases.flatMap((entry) => [entry, ...(entry.reviewers ?? []), ...(entry.repair ?? [])])) {
     phase.hermetic = resolvePhaseHermetic(phase.hermetic, merged.hermetic, phase.kind);
   }
   assertPublishablePhaseOrder(merged.resolvedPhases);

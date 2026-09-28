@@ -49,7 +49,8 @@ export async function codePhasePostcondition(phase, ctx, {
 function latestApprovedReview(state) {
   const index = state.manifest.entries.findLastIndex((entry) => entry.role === 'verdict' && entry.status !== 'skipped');
   const entry = index === -1 ? null : state.manifest.entries[index];
-  if (entry?.status !== 'completed' || entry.verdict?.verdict !== APPROVED || typeof entry.verdict.sha !== 'string') return null;
+  if (entry?.status !== 'completed' || entry.verdict?.verdict !== APPROVED
+    || typeof entry.verdict.sha !== 'string' || (entry.reviewGroup && !entry.aggregate)) return null;
   return { index, sha: entry.verdict.sha };
 }
 

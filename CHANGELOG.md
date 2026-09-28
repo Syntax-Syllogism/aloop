@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [0.10.0] - 2026-09-28
+
+### Added
+
+- Print package version with `--version` flag
+- Record the current run phase at entry
+- Specialized review roles with aggregate clearance
+- New `run watch` command for monitoring runs
+- `--quiet` mode with phase transitions and periodic heartbeat output
+
+### Fixed
+
+- Corrected review group metrics, permissions, and isolation
+- Prevented stale repair baselines from skipping address rounds
+- Improved argument and fixture type checking for watch command
+- Isolated watch command arguments from other commands
+
 ## [0.9.0] - 2026-09-22
 
 ### Added

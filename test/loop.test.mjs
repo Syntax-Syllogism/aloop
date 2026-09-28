@@ -45,6 +45,19 @@ test('publishing policy requires a passing gate before the approved review', () 
   assert.match(publishingAttestation({ manifest: { entries: state.manifest.entries.slice(1) } }, sha).reason, /no passing gate receipt/);
 });
 
+test('publishing waits for the aggregate verdict of a reviewer group', () => {
+  const sha = 'b'.repeat(40);
+  /** @type {Array<Record<string, any>>} */
+  const entries = [
+    { role: 'gate', status: 'completed', outputSha: sha },
+    { role: 'verdict', phase: 'review', status: 'completed', reviewGroup: 'review', verdict: { verdict: APPROVED, sha } },
+  ];
+  assert.match(publishingAttestation({ manifest: { entries } }, sha).reason, /no completed approval/);
+  entries.push({ role: 'verdict', phase: 'review', status: 'completed', reviewGroup: 'review', aggregate: true,
+    verdict: { verdict: APPROVED, sha } });
+  assert.equal(publishingAttestation({ manifest: { entries } }, sha), null);
+});
+
 test('reporter formats verdict rounds with singular and plural labels', () => {
   assert.equal(formatPhase({ name: 'review', rounds: 1, verdict: APPROVED }), '  ✓ review (1 round, APPROVED)');
   assert.equal(formatPhase({ name: 'review', rounds: 2, verdict: APPROVED }), '  ✓ review (2 rounds, APPROVED)');
@@ -379,6 +392,112 @@ test('normalizePhases preserves the built-in plan with an explicit repair transi
   assert.deepEqual(phases.find((phase) => phase.name === 'implement').permissions, ['write-worktree']);
   assert.deepEqual(phases.find((phase) => phase.name === 'publish').permissions, ['publish']);
   assert.deepEqual(phases.find((phase) => phase.name === 'implement').postconditions, ['clean-tree', 'head-advanced']);
+});
+
+test('configured review roles use independent verdict descriptors', async () => {
+  const { root } = await repoFixture({ config: `export default {
+    gate: ['git --version'],
+    reviewRoles: ['security', 'api-compat', 'test-quality'],
+  };` });
+  const config = await loadConfig(root);
+  const review = config.resolvedPhases.find((phase) => phase.name === 'review');
+  assert.deepEqual(review.reviewers.map((role) => role.name), [
+    'review-security', 'review-api-compat', 'review-test-quality',
+  ]);
+  assert.deepEqual(review.reviewers.map((role) => role.prompt), [
+    'review-security', 'review-api', 'review-tests',
+  ]);
+  assert.ok(review.reviewers.every((role) => role.verdict && role.permissions.includes('read-only')));
+  assert.ok(review.reviewers.every((role) => role.role !== 'verdict'),
+    'specialized reviewers must not receive task-file write access');
+  assert.deepEqual((await loadConfig((await repoFixture()).root)).resolvedPhases
+    .find((phase) => phase.name === 'review').reviewers, undefined);
+});
+
+test('specialized reviewers inherit the review phase hermetic setting', async () => {
+  const { root } = await repoFixture({ config: `export default {
+    gate: ['git --version'],
+    reviewRoles: ['security'],
+    hermetic: { runtime: 'podman', image: 'aloop:node', network: [] },
+    phases: [{ name: 'review', hermetic: true }],
+  };` });
+  const review = (await loadConfig(root)).resolvedPhases[0];
+  assert.deepEqual(review.reviewers[0].hermetic, review.hermetic);
+});
+
+test('review role selection rejects unknown and duplicate roles', async () => {
+  for (const roles of [['unknown'], ['security', 'security']]) {
+    const { root } = await repoFixture({ config: `export default {
+      gate: ['git --version'], reviewRoles: ${JSON.stringify(roles)},
+    };` });
+    await assert.rejects(loadConfig(root), /reviewRoles.*unique roles/);
+  }
+});
+
+test('specialized blockers enter repair and all reviewers approve the repaired round', async () => {
+  const observeGate = 'node -p "require(\'./.loop/runs/ss-demo-feature/state.json\').currentPhase" >> .loop/runs/ss-demo-feature/observed-phases';
+  const agentScript = `
+const fs = require('node:fs');
+const path = require('node:path');
+const prompt = process.argv[1];
+if (prompt.includes('## Blocking findings')) {
+  const response = prompt.match(/Write any rebuttal to \\x60([^\\x60]+)\\x60/)[1];
+  const runDir = path.dirname(response);
+  const state = JSON.parse(fs.readFileSync(path.join(runDir, 'state.json'), 'utf8'));
+  fs.appendFileSync(path.join(runDir, 'observed-phases'), state.currentPhase + '\\n');
+  fs.writeFileSync(response, 'The finding is disputed after inspection.\\n');
+} else {
+  const verdictPath = prompt.match(/(?:write this|Write) JSON to \\x60([^\\x60]+)\\x60/)[1];
+  const runDir = path.dirname(verdictPath);
+  const state = JSON.parse(fs.readFileSync(path.join(runDir, 'state.json'), 'utf8'));
+  if (new Date(state.phaseStartedAt).toISOString() !== state.phaseStartedAt) process.exit(2);
+  fs.appendFileSync(path.join(runDir, 'observed-phases'), state.currentPhase + '\\n');
+  const securityFirst = verdictPath.includes('review-security') && verdictPath.endsWith('round-1.json');
+  fs.writeFileSync(verdictPath, JSON.stringify(securityFirst
+    ? { verdict: 'CHANGES_REQUESTED', blocking: [{ file: 'README.md', line: 1, issue: 'inspect security boundary' }] }
+    : { verdict: 'APPROVED', blocking: [] }));
+}
+`;
+  const { root, workItem } = await repoFixture({ config: `export default {
+    adapters: { fake: { command({ prompt }) {
+      return { command: process.execPath, args: ['-e', ${JSON.stringify(agentScript)}, prompt] };
+    } } },
+    engines: { default: { name: 'fake', model: 'implementation' }, review: { name: 'fake', model: 'reviewer' } },
+    phases: ['gate', 'review', 'address'],
+    reviewRoles: ['security', 'api-compat', 'test-quality'],
+    gate: [${JSON.stringify(observeGate)}],
+    maxRounds: 2,
+    worktrees: false,
+  };` });
+  await writeFile(join(root, '.gitignore'), '.loop/\n');
+  await git(root, 'add', 'loop.config.mjs');
+  await git(root, 'add', '.gitignore');
+  await git(root, 'commit', '-m', 'test: configure review roles');
+  const original = console.log;
+  console.log = () => {};
+  let summary;
+  try {
+    summary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.equal(summary.stalled, null);
+  assert.equal(summary.phases.find((phase) => phase.name === 'review').rounds, 2);
+  const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
+  const verdicts = manifest.phases.filter((entry) => entry.verdict);
+  assert.deepEqual(verdicts.filter((entry) => entry.round === 1).map((entry) => entry.phase), [
+    'review', 'review-security', 'review-api-compat', 'review-test-quality', 'review',
+  ]);
+  assert.equal(verdicts.find((entry) => entry.phase === 'review-security' && entry.round === 1).verdict.verdict, 'CHANGES_REQUESTED');
+  assert.equal(verdicts.find((entry) => entry.phase === 'review-security' && entry.round === 1).engine.model, 'reviewer');
+  assert.equal(verdicts.findLast((entry) => entry.reviewerSet).verdict.verdict, 'APPROVED');
+  assert.ok(manifest.phases.some((entry) => entry.phase === 'address'));
+  assert.deepEqual((await readFile(join(summary.runDir, 'observed-phases'), 'utf8')).trim().split('\n'), [
+    'gate', 'review', 'review-security', 'review-api-compat', 'review-test-quality', 'address', 'gate', 'review',
+    'review-security', 'review-api-compat', 'review-test-quality',
+  ]);
+  const saved = JSON.parse(await readFile(join(summary.runDir, 'state.json'), 'utf8'));
+  assert.equal(saved.currentPhase, 'review-test-quality');
 });
 
 test('the work-item preset puts docs before the gated review loop', () => {
@@ -875,6 +994,9 @@ test('a normal agent phase honors retry.maxAttempts', async () => {
 const fs = require('node:fs');
 const path = 'attempts';
 const attempt = fs.existsSync(path) ? Number(fs.readFileSync(path, 'utf8')) + 1 : 1;
+const state = JSON.parse(fs.readFileSync('.loop/runs/ss-demo-feature/state.json', 'utf8'));
+if (state.currentPhase !== 'recoverable') process.exit(2);
+fs.appendFileSync('attempt-starts', state.phaseStartedAt + '\\n');
 fs.writeFileSync(path, String(attempt));
 if (attempt < 2) process.exit(1);
 `;
@@ -902,6 +1024,11 @@ if (attempt < 2) process.exit(1);
 
   assert.equal(summary.stalled, null);
   assert.equal(await readFile(join(root, 'attempts'), 'utf8'), '2');
+  const starts = (await readFile(join(root, 'attempt-starts'), 'utf8')).trim().split('\n');
+  assert.equal(new Date(starts[0]).toISOString(), starts[0]);
+  assert.equal(starts[0], starts[1]);
+  const saved = JSON.parse(await readFile(join(summary.runDir, 'state.json'), 'utf8'));
+  assert.equal(saved.currentPhase, 'recoverable');
 });
 
 test('a verdict phase honors retry.maxAttempts independently of maxRounds', async () => {
@@ -1119,7 +1246,7 @@ test('loadTemplate searches project overrides, preset overrides, then packaged p
 });
 
 test('default prompts render cleanly for every task input mode', async () => {
-  const promptNames = ['implement', 'review', 'address', 'docs', 'pr-description'];
+  const promptNames = ['implement', 'review', 'review-security', 'review-api', 'review-tests', 'address', 'docs', 'pr-description'];
   const taskModes = [
     { task: 'Do the inline task.', taskFile: null },
     { task: null, taskFile: '/plans/example.md' },
@@ -1142,6 +1269,7 @@ test('default prompts render cleanly for every task input mode', async () => {
       ROUND: 1,
       MAX_ROUNDS: 3,
       VERDICT_FILE: '/repo/.loop/runs/example/verdict-round-1.json',
+      REVIEW_FILE: '/repo/.loop/runs/example/review-role-round-1.md',
       FINDINGS: '(none)',
       GATE_STATUS: 'passing',
       SINCE_SHA: '(none)',
@@ -1158,7 +1286,7 @@ test('default prompts contain no work-item-specific references', async () => {
   const forbidden = /WORK_ITEM|## Code Review|## Changelog|IN PROGRESS|AGENTS\.md|CLAUDE\.md/;
   const promptFiles = (await readdir(packagePrompts)).filter((file) => file.endsWith('.md'));
 
-  assert.deepEqual(promptFiles.sort(), ['address.md', 'docs.md', 'fix-gate.md', 'implement.md', 'pr-description.md', 'review.md']);
+  assert.deepEqual(promptFiles.sort(), ['address.md', 'docs.md', 'fix-gate.md', 'implement.md', 'pr-description.md', 'review-api.md', 'review-security.md', 'review-tests.md', 'review.md']);
   for (const file of promptFiles) {
     const body = await readFile(join(packagePrompts, file), 'utf8');
     assert.doesNotMatch(body, forbidden, `${file} should remain generic`);
@@ -1736,6 +1864,34 @@ test('run metrics aggregate phase usage and reviewer convergence', () => {
   assert.equal(metrics.reviewer.findingsClearedPerRound, 1);
 });
 
+test('review group metrics count only aggregate verdicts and real agent usage', () => {
+  const verdict = (phase, round, result, blocking = []) => ({
+    phase, round, reviewGroup: 'review', status: 'completed', durationMs: 10,
+    tokens: 2, cost: 0.02, verdict: { verdict: result, blocking },
+  });
+  const blocked = [{ issue: 'fix security finding' }];
+  const entries = [
+    verdict('review', 1, 'APPROVED'),
+    verdict('review-security', 1, 'CHANGES_REQUESTED', blocked),
+    { ...verdict('review', 1, 'CHANGES_REQUESTED', blocked), aggregate: true,
+      tokens: undefined, cost: undefined },
+    verdict('review', 2, 'APPROVED'),
+    verdict('review-security', 2, 'APPROVED'),
+    { ...verdict('review', 2, 'APPROVED'), aggregate: true,
+      tokens: undefined, cost: undefined },
+  ];
+  const metrics = computeRunMetrics({ phases: entries });
+  assert.equal(metrics.reviewer.rounds, 2);
+  assert.equal(metrics.reviewer.approvals, 1);
+  assert.equal(metrics.reviewer.changesRequested, 1);
+  assert.equal(metrics.reviewer.findingsCleared, 1);
+  assert.equal(metrics.convergence.roundsToConverge, 2);
+  assert.equal(metrics.convergence.roundsObserved, 2);
+  assert.equal(metrics.phases.review.entries, 2);
+  assert.equal(metrics.total.tokens, 8);
+  assert.equal(metrics.total.cost, 0.08);
+});
+
 test('metrics preserve unknown usage while reporting duration', () => {
   const metrics = computeRunMetrics({ phases: [
     { phase: 'gate', role: 'gate', status: 'completed', durationMs: 42, gateReceipts: [] },
@@ -1913,6 +2069,9 @@ test('a read-only RunState stays in memory and ignores persisted state', async (
   const preview = await openFixtureState(runs, 'demo', { branch: 'feat/planned' }, { readOnly: true });
   assert.equal(preview.data.branch, 'feat/planned');
   assert.equal(preview.data.task, undefined);
+  await preview.enterPhase('implement');
+  assert.equal(preview.data.currentPhase, undefined);
+  assert.equal((JSON.parse(await readFile(persisted.path, 'utf8'))).currentPhase, undefined);
 
   await openFixtureState(runs, 'uncreated', {}, { readOnly: true });
   await assert.rejects(readdir(join(runs, 'uncreated')), { code: 'ENOENT' });
@@ -2066,9 +2225,19 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
     yes: undefined,
     noWorktree: undefined,
     noTui: undefined,
+    quiet: undefined,
+    noQuiet: undefined,
+    heartbeatMinutes: undefined,
     dryRun: undefined,
     preset: undefined,
     force: undefined,
+    runNames: undefined,
+    repo: undefined,
+    intervalMs: undefined,
+    once: undefined,
+    timeoutMs: undefined,
+    only: undefined,
+    initial: undefined,
   });
   assert.deepEqual(parseLoopArgs(['init', '--preset', 'work-item', '--force']), {
     command: 'init',
@@ -2092,12 +2261,22 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
     yes: undefined,
     noWorktree: undefined,
     noTui: undefined,
+    quiet: undefined,
+    noQuiet: undefined,
+    heartbeatMinutes: undefined,
     dryRun: undefined,
     json: undefined,
     metrics: undefined,
     olderThanDays: undefined,
     preset: 'work-item',
     force: true,
+    runNames: undefined,
+    repo: undefined,
+    intervalMs: undefined,
+    once: undefined,
+    timeoutMs: undefined,
+    only: undefined,
+    initial: undefined,
   });
   assert.equal(parseLoopArgs(['-f', 'wi.md', '--config', 'configs/fast.mjs']).config, 'configs/fast.mjs');
   assert.equal(parseLoopArgs(['-f', 'wi.md', '--resume', '--engine', 'agy', '--override-engine']).overrideEngine, true);
@@ -4006,6 +4185,66 @@ if (prompt.includes('Machine-readable verdict')) {
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   assert.equal(state.data.pendingRepairs.review.round, 1, 'the last round is checkpointed as owed');
   assert.equal(state.data.pendingRepairs.review.nextRepair, 0);
+});
+
+test('a resumed repair reruns the agent when HEAD is still the reviewed tree', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const attemptsPath = join(await mkdtemp(join(tmpdir(), 'loop-attempts-')), 'count');
+  const { root, workItem } = await repoFixture({ config: `export default {
+  gate: ['true'],
+  phases: ['review', 'address'],
+  maxRounds: 1,
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
+  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+const promptIndex = process.argv.indexOf('-p');
+const prompt = promptIndex < 0 ? null : process.argv[promptIndex + 1];
+if (prompt?.includes('Machine-readable verdict')) {
+  const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
+  writeFileSync(verdictPath, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ file: 'src/x.mjs', line: 1, issue: 'fix it' }] }));
+} else if (prompt) {
+  appendFileSync(${JSON.stringify(attemptsPath)}, 'x');
+  execFileSync('git', ['commit', '--allow-empty', '-m', 'fix: address findings']);
+}
+`, { mode: 0o755 });
+
+  const originalPath = process.env.PATH;
+  const originalExitCode = process.exitCode;
+  const original = console.log;
+  console.log = () => {};
+  process.env.PATH = `${binDir}:${originalPath}`;
+  try {
+    const first = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+    assert.equal(first.stalled.reason, 'round cap reached');
+
+    // Reproduce the stuck state: an earlier round's repair commit already sits
+    // on top of that round's stale baseline, and the latest review saw it.
+    const staleBaseline = await git(first.worktree, 'rev-parse', 'HEAD');
+    await git(first.worktree, 'commit', '--allow-empty', '-m', 'fix: earlier round repair');
+    const reviewedSha = await git(first.worktree, 'rev-parse', 'HEAD');
+    const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+    await state.record({
+      phaseBaselines: { ...state.data.phaseBaselines, address: staleBaseline },
+      reviewedShas: { review: { 1: reviewedSha } },
+      pendingRepairs: { review: { ...state.data.pendingRepairs.review, reviewedSha } },
+    });
+
+    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, maxRounds: 2, yes: true } });
+  } finally {
+    process.env.PATH = originalPath;
+    process.exitCode = originalExitCode;
+    console.log = original;
+  }
+
+  assert.equal(await readFile(attemptsPath, 'utf8'), 'x', 'resume must invoke the address agent');
+  const resumed = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  assert.equal(resumed.data.phaseBaselines.address, undefined, 'a completed repair clears its baseline');
+  const reviewed = resumed.data.reviewedShas.review;
+  assert.notEqual(reviewed[2], reviewed[1], 'round 2 reviews a new tree');
 });
 
 test('a dry-run resume with a raised cap ignores an owed repair', async () => {
@@ -5958,4 +6197,113 @@ test('real hermetic runtime mounts the default worktree and enforces network pol
   } finally {
     await new Promise((resolvePromise) => server.close(resolvePromise));
   }
+});
+
+async function captureTerminal(run) {
+  const originalLog = console.log;
+  const originalWrite = process.stdout.write;
+  const originalExitCode = process.exitCode;
+  const chunks = [];
+  console.log = (message = '') => chunks.push(`${message}\n`);
+  // Only capture text; the test runner's own binary traffic passes through.
+  process.stdout.write = /** @type {any} */ ((chunk, ...rest) => {
+    if (typeof chunk === 'string') {
+      chunks.push(chunk);
+      return true;
+    }
+    return originalWrite.call(process.stdout, chunk, ...rest);
+  });
+  try {
+    const summary = await run();
+    return { summary, text: chunks.join('') };
+  } finally {
+    console.log = originalLog;
+    process.stdout.write = originalWrite;
+    process.exitCode = originalExitCode;
+  }
+}
+
+test('--quiet hides setup and gate streams on the terminal but keeps them in logs', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  setup: ["printf 'SETUP-%s\\n' SENTINEL"],
+  gate: ["printf 'GATE-%s\\n' SENTINEL"],
+  phases: ['gate'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const { summary, text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, quiet: true } }));
+  assert.equal(summary.stalled, null);
+  assert.doesNotMatch(text, /SETUP-SENTINEL/);
+  assert.doesNotMatch(text, /GATE-SENTINEL/);
+  assert.match(text, /output {4}: quiet \(heartbeat every 10m; full logs in /);
+  assert.match(text, /\[\d\d:\d\d\] ── gate ─/);
+  assert.match(text, /── summary ─/);
+  assert.match(text, /Pipeline finished/);
+  assert.match(await readFile(join(summary.runDir, 'setup.log'), 'utf8'), /SETUP-SENTINEL/);
+  assert.match(await readFile(join(summary.runDir, 'gate.log'), 'utf8'), /GATE-SENTINEL/);
+});
+
+test('without --quiet, non-TTY output still streams raw gate output', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  gate: ["printf 'GATE-%s\\n' SENTINEL"],
+  phases: ['gate'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const { text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, noTui: true } }));
+  assert.match(text, /GATE-SENTINEL/);
+  assert.doesNotMatch(text, /output {4}: quiet/);
+});
+
+test('config quiet: true is honored and --quiet disables the TUI on a TTY', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  gate: ["printf 'GATE-%s\\n' SENTINEL"],
+  phases: ['gate'],
+  quiet: true,
+  heartbeatMinutes: 0,
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const originalTTY = process.stdout.isTTY;
+  process.stdout.isTTY = true;
+  let result;
+  try {
+    result = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }));
+  } finally {
+    process.stdout.isTTY = originalTTY;
+  }
+  assert.doesNotMatch(result.text, /\x1b\[2J/, 'the TUI must not paint');
+  assert.doesNotMatch(result.text, /GATE-SENTINEL/);
+  assert.match(result.text, /output {4}: quiet \(heartbeat off;/);
+});
+
+test('--no-quiet overrides config quiet: true', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  gate: ["printf 'GATE-%s\\n' SENTINEL"],
+  phases: ['gate'],
+  quiet: true,
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const { text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, noTui: true, noQuiet: true } }));
+  assert.match(text, /GATE-SENTINEL/);
+});
+
+test('a stalled run under --quiet still prints the stall report with the output tail', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({ config: `export default {
+  gate: ["printf 'STALL-%s\\n' TAIL; exit 1"],
+  phases: ['gate'],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+  const { summary, text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, quiet: true } }));
+  assert.equal(summary.stalled.phase, 'gate');
+  assert.match(text, /✗ stalled in "gate"/);
+  assert.match(text, /STALL-TAIL/);
+  assert.match(text, /Resume: {3}aloop/);
 });

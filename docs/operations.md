@@ -26,14 +26,73 @@ aloop inspect my-spec
 
 `list` shows persisted runs newest first with their name, derived status,
 current phase, branch, update time, and pull-request URL when one was recorded.
-`status` prints the same summary for one run. `inspect` adds the run directory,
+`status` prints the same summary for one run, including when that phase started.
+`inspect` adds the run directory,
 full saved state and manifest in JSON mode, or per-phase evidence in human
 mode, including input/output SHAs, prompt and configuration hashes, engine,
 verdicts, gate receipts, and artifact paths.
 
-The derived status can be `running`, `completed`, `stalled`, `cancelled`, or
-`unknown`. A live lock or active command is reported as `running`, which helps
-avoid treating a process that is still shutting down as a stale run.
+The derived status can be `running`, `interrupted`, `completed`, `stalled`,
+`cancelled`, or `unknown`. A live lock or active command is reported as
+`running`, which helps avoid treating a process that is still shutting down as
+a stale run. A persisted `running` state with no live runner or command is
+reported as `interrupted`; resume it with `aloop --name <name> --resume`, or
+use `aloop cancel <name>` to mark it cancelled.
+
+## Watching runs
+
+`watch` polls one or more repositories and writes one compact NDJSON object per
+observed change. It writes no run output or manifest contents. Polling defaults
+to every 15 seconds; set `--interval` to at least 1 second. Changes that begin
+and end between polls are coalesced, so only the net state is reported.
+
+```sh
+# Stream changes from multiple repositories
+aloop watch --repo ../warden-core --repo ../warden-app
+
+# Wake a caller after the next status-related change, with an idle limit
+aloop watch --once --timeout 30m --only status --repo ../warden-app
+
+# Include a snapshot so changes between starting aloop and watch are visible
+aloop watch --initial --repo .
+```
+
+Positional run names restrict events to matching run slugs. `--repo` is
+repeatable and defaults to the current directory. `--config` applies to each
+repository. `--only status` suppresses phase-only events. `--initial` writes a
+`snapshot` event for every run found on the first poll; snapshots do not end
+`--once` or reset its idle timeout.
+
+Every line has a `type` and UTC `at` timestamp. Event types are:
+
+| Type | Meaning | `from` / `to` |
+| --- | --- | --- |
+| `snapshot` | Existing run included by `--initial` | `null` |
+| `appeared` | Run first observed after startup | `null` |
+| `removed` | Previously observed run disappeared | `null` |
+| `status` | Derived status changed; carries the latest phase | Previous / current status |
+| `phase` | A new phase or sub-phase started without a status change | Previous / current phase |
+| `timeout` | Idle timeout elapsed | Not applicable |
+
+Run events include `repo`, `name`, `status`, `currentPhase`, `phaseStartedAt`, `verdict`,
+`gateStatus`, `branch`, `prUrl`, and `runDir`. A stalled run includes only its
+phase and a reason truncated to 300 characters. Status and phase changing in
+the same poll produces one `status` event. Reviewers and repair phases appear
+under their own names, including transitions back to review or gate on later
+attempts. A phase that starts and finishes between polls may be missed; changing
+only `phaseStartedAt` does not emit a new event. Runs created before phase entry
+was recorded report the last non-skipped manifest phase (completed or stalled)
+with a null `phaseStartedAt`. A timeout line includes `idleMs`.
+
+Exit codes are `0` for a `--once` event or a clean signal exit, `1` for startup
+errors, and `2` when `--timeout` elapses. Without `--once` or `--timeout`, the
+command streams until stopped. For example, a background caller can invoke
+`aloop watch --once --timeout 20m --only status --repo <repo>` and start it
+again after each event; this keeps the monitor asleep between changes.
+
+`aloop watch --initial` provides a race-free starting snapshot: start the
+watcher before launching runs, then consume both the initial state and later
+events from the same process.
 
 ## Replaying recorded evidence
 

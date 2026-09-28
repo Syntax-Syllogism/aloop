@@ -67,9 +67,12 @@ function usageTotals(entries) {
   };
 }
 
+function reviewVerdicts(entries) {
+  return entries.filter((entry) => entry.verdict && (!entry.reviewGroup || entry.aggregate));
+}
+
 function reviewerMetrics(entries) {
-  const rounds = entries
-    .filter((entry) => entry.verdict && (entry.role === 'verdict' || entry.verdict.verdict))
+  const rounds = reviewVerdicts(entries)
     .sort((a, b) => (roundFor(a) ?? Number.MAX_SAFE_INTEGER) - (roundFor(b) ?? Number.MAX_SAFE_INTEGER));
   const approvals = rounds.filter((entry) => entry.verdict.verdict === 'APPROVED').length;
   const caught = rounds.filter((entry) => entry.verdict.verdict === 'CHANGES_REQUESTED').length;
@@ -95,11 +98,11 @@ function reviewerMetrics(entries) {
 }
 
 function convergenceMetrics(entries, reviewer) {
-  const reviewRounds = entries
-    .filter((entry) => entry.verdict && (entry.role === 'verdict' || entry.verdict.verdict))
+  const reviews = reviewVerdicts(entries);
+  const reviewRounds = reviews
     .map(roundFor)
     .filter((round) => round !== null);
-  const approval = entries
+  const approval = reviews
     .filter((entry) => entry.verdict?.verdict === 'APPROVED')
     .map(roundFor)
     .filter((round) => round !== null)
@@ -118,12 +121,13 @@ function convergenceMetrics(entries, reviewer) {
 /** Compute run-level cost, convergence, and reviewer metrics from one manifest. */
 export function computeRunMetrics(manifest) {
   const entries = entriesFrom(manifest);
-  const names = [...new Set(entries.map((entry) => entry.phase).filter(Boolean))];
+  const activity = entries.filter((entry) => !entry.aggregate);
+  const names = [...new Set(activity.map((entry) => entry.phase).filter(Boolean))];
   const phases = Object.fromEntries(names.map((name) => [
     name,
-    phaseSummary(name, entries.filter((entry) => entry.phase === name)),
+    phaseSummary(name, activity.filter((entry) => entry.phase === name)),
   ]));
-  const totalEntries = entries.filter((entry) => entry.status !== 'skipped');
+  const totalEntries = activity.filter((entry) => entry.status !== 'skipped');
   const total = usageTotals(totalEntries);
   const reviewer = reviewerMetrics(entries);
   return {

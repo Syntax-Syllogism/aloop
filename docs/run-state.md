@@ -18,6 +18,13 @@ preset, its original path-resolution directory, and other values needed to
 resume the same run. A saved preset is reused on `--resume`, and a conflicting
 `--preset` is rejected; see [Agentic loop runner](loop.md#configuration) for the
 selection and precedence rules.
+`currentPhase` and `phaseStartedAt` record the phase or sub-phase most recently
+entered and its UTC start time. The runner updates them before each top-level
+phase, review agent, repair agent or gate attempt begins. They remain in state
+after completion, a stall, or a crash, so the last active phase stays visible.
+Older runs without these fields use the last non-skipped manifest entry as a
+fallback. That entry records the last completed or stalled phase, so it may not
+identify the phase currently running. Its `phaseStartedAt` is `null`.
 `manifest.json` records the resolved task,
 branch, repository, and worktree context once planning has completed, followed
 by one entry for each phase invocation. Logs, verdicts, and repair responses
@@ -122,7 +129,14 @@ without starting a phase:
 aloop list
 aloop status my-spec
 aloop inspect my-spec
+aloop watch --initial
 ```
+
+A persisted `status: "running"` with no live runner or active command is
+derived as `interrupted`, which identifies a runner lost to a kill, crash, or
+reboot. Continue it with `aloop --name my-spec --resume`; use
+`aloop cancel my-spec` to record cancellation when it should not be resumed.
+`aloop watch` reports this derived status so an external monitor can react.
 
 An active run can be stopped with `aloop cancel <name>`. Cancellation waits for
 the recorded command and runner to stop before recording `status: "cancelled"`
@@ -130,4 +144,4 @@ and releasing the lock, while retaining the run directory and worktree for
 inspection. Completed run directories can be previewed and removed with
 `aloop clean`; cleanup also removes an external worktree associated with a
 selected completed run. It never selects active, stalled, cancelled, or
-unknown runs.
+unknown runs. Interrupted runs are also excluded from cleanup.

@@ -2,6 +2,7 @@ import { access, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 
 import { constants } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import { adapterFor, agentForPhase } from './adapters.mjs';
 import { runCommand, signalProcessGroup } from './command.mjs';
 import { defaults, loadConfig, loadRunsDir } from './config.mjs';
@@ -26,6 +27,7 @@ const CONFIG_HEADER = `// aloop configuration — see docs/loop.md for the full 
 //   phases         the pipeline stages and their order
 //   gate           commands that must pass before review
 //   branchPrefix, maxRounds, timeoutMs
+//   quiet, heartbeatMinutes  terminal output only; never changes the run
 //
 // Prompts live in .loop/prompts/ — edit any *.md there to change what each
 // phase tells the agent. Delete a file to fall back to the packaged default.
@@ -88,10 +90,6 @@ function statusFor(state, manifest, locked) {
   return 'unknown';
 }
 
-function currentPhase(manifest) {
-  return manifest?.phases?.at(-1)?.phase ?? null;
-}
-
 async function runInfo(runsDir, name) {
   const dir = join(runsDir, name);
   if (!(await isDirectory(dir))) throw new Error(`Run "${name}" was not found in ${runsDir}.`);
@@ -106,7 +104,8 @@ async function runInfo(runsDir, name) {
     name,
     runId: state?.runId ?? manifest.runId ?? null,
     status: statusFor(state, manifest, locked),
-    phase: currentPhase(manifest),
+    phase: deriveCurrentPhase(state ?? {}, manifest.phases ?? []),
+    phaseStartedAt: state?.phaseStartedAt ?? null,
     branch: state?.branch ?? manifest.branch ?? null,
     worktree: state?.worktree ?? manifest.worktree ?? null,
     startedAt: state?.startedAt ?? manifest.startedAt ?? null,
@@ -131,6 +130,7 @@ export async function getRunStatus(runsDir, name) {
     runId: info.runId,
     status: info.status,
     phase: info.phase,
+    phaseStartedAt: info.phaseStartedAt,
     branch: info.branch,
     startedAt: info.startedAt,
     updatedAt: info.updatedAt,
@@ -153,6 +153,7 @@ function getRunStatusFields(info) {
     runId: info.runId,
     status: info.status,
     phase: info.phase,
+    phaseStartedAt: info.phaseStartedAt,
     branch: info.branch,
     worktree: info.worktree,
     startedAt: info.startedAt,
@@ -205,6 +206,7 @@ function printRunTable(runs, includeMetrics) {
 function printStatus(status) {
   console.log(`${status.name}: ${status.status}`);
   console.log(`phase: ${status.phase ?? '-'}`);
+  console.log(`started: ${status.phaseStartedAt ?? '-'}`);
   console.log(`branch: ${status.branch ?? '-'}`);
   console.log(`duration: ${status.metrics.total.durationMs}ms`);
   console.log(`tokens: ${formatValue(status.metrics.total.tokens)}`);
@@ -357,6 +359,7 @@ function canonicalPrUrl(state, manifest) {
 
 function deriveStatus(data, manifest, lock) {
   if (lock.active) return 'running';
+  if (data.status === 'running') return 'interrupted';
   if (data.status) return data.status;
   if (data.cancelledAt) return 'cancelled';
   const stalled = latestEntry(manifest.phases, (entry) => entry.status === 'stalled');
@@ -367,6 +370,7 @@ function deriveStatus(data, manifest, lock) {
 
 function deriveCurrentPhase(data, phases) {
   if (data.currentPhase) return data.currentPhase;
+  // Older runs only expose the last finished phase through the manifest.
   return latestEntry(phases, (entry) => entry.status !== 'skipped')?.phase ?? null;
 }
 
@@ -381,11 +385,13 @@ function deriveGateStatus(phases) {
 
 function summarizeRun(slug, runDir, state, manifest, lock) {
   const phases = manifest.phases ?? [];
+  const stalled = state.stalled;
+  const status = deriveStatus(state, { phases }, lock);
   return {
     name: state.name ?? manifest.name ?? slug,
     slug,
     runId: state.runId ?? null,
-    status: deriveStatus(state, { phases }, lock),
+    status,
     branch: state.branch ?? manifest.branch ?? null,
     baseBranch: state.baseBranch ?? manifest.baseBranch ?? null,
     worktree: state.worktree ?? manifest.worktree ?? null,
@@ -393,9 +399,14 @@ function summarizeRun(slug, runDir, state, manifest, lock) {
     startedAt: state.startedAt ?? manifest.startedAt ?? null,
     updatedAt: state.updatedAt ?? manifest.updatedAt ?? null,
     currentPhase: deriveCurrentPhase(state, phases),
+    phaseStartedAt: state.phaseStartedAt ?? null,
     verdict: deriveVerdict(state, phases),
     gateStatus: deriveGateStatus(phases),
     prUrl: canonicalPrUrl(state, manifest),
+    stalled: status === 'stalled' && stalled ? {
+      phase: stalled.phase ?? null,
+      reason: typeof stalled.reason === 'string' ? stalled.reason.slice(0, 300) : '',
+    } : null,
     runDir,
     lock: {
       present: lock.present,
@@ -453,22 +464,120 @@ async function operationalContext(cwd, configPath, { validate = false } = {}) {
   return { config, repoRoot, rootGit, runsDir: resolve(repoRoot, config.runsDir) };
 }
 
-export async function listRuns(options = {}) {
-  const { cwd = process.cwd(), configPath } = /** @type {any} */ (options);
-  const context = await operationalContext(cwd, configPath);
+async function listRunsIn(runsDir) {
   let entries;
   try {
-    entries = await readdir(context.runsDir, { withFileTypes: true });
+    entries = await readdir(runsDir, { withFileTypes: true });
   } catch (error) {
     if (error.code === 'ENOENT') return [];
     throw error;
   }
   const runs = [];
   for (const entry of entries.filter((candidate) => candidate.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
-    const run = await readRun(context.runsDir, entry.name);
+    const run = await readRun(runsDir, entry.name);
     if (run) runs.push(run.summary);
   }
   return runs.sort((a, b) => (b.updatedAt ?? b.startedAt ?? '').localeCompare(a.updatedAt ?? a.startedAt ?? ''));
+}
+
+export async function listRuns(options = {}) {
+  const { cwd = process.cwd(), configPath } = /** @type {any} */ (options);
+  const context = await operationalContext(cwd, configPath);
+  return listRunsIn(context.runsDir);
+}
+
+function watchEvent(type, repoRoot, run, at, from = null, to = null) {
+  return {
+    type,
+    at: at.toISOString(),
+    repo: repoRoot,
+    name: run.name,
+    from,
+    to,
+    status: run.status,
+    currentPhase: run.currentPhase,
+    phaseStartedAt: run.phaseStartedAt ?? null,
+    verdict: run.verdict,
+    gateStatus: run.gateStatus,
+    branch: run.branch,
+    prUrl: run.prUrl,
+    ...(run.stalled ? { stalled: run.stalled } : {}),
+    runDir: run.runDir,
+  };
+}
+
+/**
+ * Poll persisted run state and yield compact events for net changes.
+ * @param {{repos: string[], configPath?: string, names?: string[], intervalMs?: number,
+ *   initial?: boolean, signal?: AbortSignal, now?: () => Date,
+ *   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>,
+ *   warn?: (message: string) => void}} options
+ */
+export async function* watchRuns(options) {
+  const { repos, configPath, names = [], intervalMs = 15_000, initial = false,
+    signal, now = () => new Date(), sleep = (ms, abortSignal) => delay(ms, undefined, { signal: abortSignal }),
+    warn = (message) => console.error(message) } = options;
+  const hasNameFilter = names.length > 0;
+  const wanted = new Set(names.map((name) => slugFor(name)).filter(Boolean));
+  const resolvedConfigPath = configPath ? resolve(configPath) : undefined;
+  const contexts = [];
+  const seenRoots = new Set();
+  for (const repo of repos) {
+    const context = await operationalContext(repo, resolvedConfigPath);
+    if (seenRoots.has(context.repoRoot)) continue;
+    seenRoots.add(context.repoRoot);
+    contexts.push(context);
+  }
+
+  const previous = new Map();
+  const initializedRoots = new Set();
+  while (!signal?.aborted) {
+    for (const context of contexts) {
+      let runs;
+      try {
+        runs = await listRunsIn(context.runsDir);
+      } catch (error) {
+        warn(`aloop watch: could not read runs in ${context.repoRoot}: ${error.message}`);
+        continue;
+      }
+      const current = new Map(runs
+        .filter((run) => !hasNameFilter || wanted.has(run.slug))
+        .map((run) => [`${context.repoRoot}\0${run.slug}`, run]));
+      const priorForRepo = new Map([...previous].filter(([key]) => key.startsWith(`${context.repoRoot}\0`)));
+      const at = now();
+
+      for (const [key, run] of current) {
+        const prior = previous.get(key);
+        if (!prior) {
+          if (!initializedRoots.has(context.repoRoot)) {
+            if (initial) yield watchEvent('snapshot', context.repoRoot, run, at);
+          } else {
+            yield watchEvent('appeared', context.repoRoot, run, at);
+          }
+          continue;
+        }
+        if (prior.status !== run.status) {
+          yield watchEvent('status', context.repoRoot, run, at, prior.status, run.status);
+        } else if (prior.currentPhase !== run.currentPhase) {
+          yield watchEvent('phase', context.repoRoot, run, at, prior.currentPhase, run.currentPhase);
+        }
+      }
+      if (initializedRoots.has(context.repoRoot)) {
+        for (const [key, run] of priorForRepo) {
+          if (!current.has(key)) yield watchEvent('removed', context.repoRoot, run, at);
+        }
+      }
+      for (const [key, run] of current) previous.set(key, run);
+      for (const key of priorForRepo.keys()) if (!current.has(key)) previous.delete(key);
+      initializedRoots.add(context.repoRoot);
+    }
+    try {
+      await sleep(intervalMs, signal);
+    } catch (error) {
+      if (error.name === 'AbortError' || signal?.aborted) return;
+      throw error;
+    }
+  }
 }
 
 export async function getRun(name, options = {}) {
@@ -589,7 +698,7 @@ export async function cancelRun(name, options = {}) {
   if (!slug) throw new Error('A run name is required.');
   const run = await readRun(context.runsDir, slug);
   if (!run) throw new Error(`Run "${name}" was not found in ${context.runsDir}.`);
-  if (!run.lock.active || run.state.status === 'completed') {
+  if ((!run.lock.active && run.summary.status !== 'interrupted') || run.state.status === 'completed') {
     throw new Error(`Run "${name}" is not active and cannot be cancelled.`);
   }
 

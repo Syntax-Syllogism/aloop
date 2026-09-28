@@ -30,6 +30,8 @@ that split:
 aloop --task-file ./work-items/afmt-clippy-cleanup.md
 ```
 
+Run `aloop --version` to print the installed package version.
+
 The runner confirms before each phase by default. At a prompt, Enter or `y`
 runs the phase and `q` stops the run. Any other answer is a skip request, but
 only optional phases may be skipped: declining a required phase explains that
@@ -57,6 +59,9 @@ earned it.
   -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)
       --no-worktree       Work in the current checkout instead of a worktree
       --no-tui            Force plain streaming output (TUI is on by default on a TTY)
+      --quiet             Print only phase transitions, status lines, and a periodic heartbeat (disables the TUI)
+      --no-quiet          Override quiet: true from the config
+      --heartbeat <min>   Heartbeat interval in minutes for quiet mode (default 10; 0 = transitions only; implies --quiet)
       --dry-run           Print the plan and rendered prompts, run nothing
 ```
 
@@ -67,6 +72,30 @@ the run already persists after each phase and never changes run behavior.
 It automatically steps aside for piped output or CI; pass `--no-tui` to force
 plain streaming on a TTY. `--yes` only skips per-phase confirmation, so an
 unattended run on a real terminal still shows the live dashboard.
+
+### Quiet mode
+
+`--quiet` is for callers that read a run's stdout — an orchestrating agent
+running several loops in the background, say — and only need to know whether
+it is still moving. Raw agent, gate, and setup streams are not printed; they
+are still written byte-for-byte to the per-phase logs in the run directory.
+What still prints: the run header, phase banners (prefixed with `[HH:MM]`),
+status lines such as skips, verdicts, and refusal reasons, confirmation
+prompts, and the final summary or stall report (including its output tail).
+Every `heartbeatMinutes` (default 10) it adds one heartbeat line; the timer
+restarts at each phase transition:
+
+```text
+[14:12] implement · 10m in phase · 10m total · last: Running npm test -- drift
+```
+
+`last:` is the most recent non-empty output line, with ANSI escapes removed
+and cut to 120 characters. `--heartbeat 0` (or `heartbeatMinutes: 0`) prints
+transitions only. Quiet disables the TUI on a terminal and is ignored by
+`--dry-run`. Precedence is `--no-quiet`, then `--quiet`/`--heartbeat <min>`
+(which implies quiet), then the config's `quiet` and `heartbeatMinutes`. Both
+keys are display-only: they are left out of the run's configuration hash, so
+toggling them between a run and its `--resume` is not a configuration change.
 
 `--dry-run` renders every prompt with real values and executes nothing. It
 reports the run directory, worktree, and branch it would use without creating
@@ -208,12 +237,15 @@ export default {
     review: { name: 'codex', effort: 'high' },
   },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
+  reviewRoles: [], // optional: security, api-compat, test-quality
   gate: ['npm test'],
   publish: { backend: 'github', draft: true },
   setup: ['npm ci'],
   maxRounds: 3,
   timeoutMs: 30 * 60 * 1000,
   preset: null,
+  quiet: false,
+  heartbeatMinutes: 10,
   budget: {
     tokens: 100000,
     usd: 5,
@@ -230,6 +262,9 @@ directory containing `prompts/`. The prompt search chain is project
 prompts. Passing `--preset <name|path>` overrides the config key for that run;
 the preset does not layer any engines, phases, gates, or branches from its
 sample configuration.
+
+`quiet` and `heartbeatMinutes` set the default terminal output mode; see
+[Quiet mode](#quiet-mode). `heartbeatMinutes` must be a nonnegative number.
 
 Pass `--config path/to/loop.config.mjs` to use a configuration file outside the
 repository (relative paths resolve from your current directory). The supplied
@@ -738,6 +773,25 @@ the last gate re-check was red. If a reviewer nevertheless approves with a red
 repair gate, the run stalls and reports that gate failure instead of attempting
 a repair phase without findings.
 
+Set `reviewRoles` in `loop.config.mjs` to any subset of `security`,
+`api-compat`, and `test-quality`, for example
+`reviewRoles: ['security', 'test-quality']`. The default empty list runs only
+the generalist reviewer. Duplicate or unknown roles are rejected, and a
+non-empty selection requires a verdict phase named `review` in the resolved
+phase list. The roles run after the generalist, in configuration order. Each
+selected role has its own prompt, fresh agent invocation, verdict file, and
+manifest entry. All reviewers examine the same commit in each round. Clearance
+requires every reviewer to approve; the loop combines their blockers for one
+`address` repair, reruns the gate, and invokes every reviewer again. The
+generalist artifact names remain unchanged;
+specialized roles write `verdict-review-<role>-round-<n>.json` and
+`review-review-<role>-round-<n>.md`. A final aggregate verdict entry records
+the reviewer set and protects publishing from an incomplete review group.
+The role prompts are `review-security.md`, `review-api.md`, and
+`review-tests.md`, respectively. Project prompt overrides use those filenames.
+Specialized reviewers inherit the `review` engine unless an engine is configured
+for their phase name (for example, `review-security`).
+
 ## Stopping conditions
 
 The run stops and reports when the round cap is reached, a standalone gate
@@ -766,7 +820,7 @@ improvise around it. Available variables are:
 - Task: `TASK`, `TASK_FILE`, `TASK_NAME`, `TASK_DIR`, `TASK_CONTEXT`.
 - Repository: `BRANCH`, `BASE_BRANCH`, `REPO`, `REMOTE`.
 - Run: `RUN_DIR`, `GATE_COMMANDS`.
-- Verdict loop: `ROUND`, `MAX_ROUNDS`, `VERDICT_FILE`, `FINDINGS`,
+- Verdict loop: `ROUND`, `MAX_ROUNDS`, `VERDICT_FILE`, `REVIEW_FILE`, `FINDINGS`,
   `GATE_STATUS`, and `SINCE_SHA`.
 
 `TASK`, `TASK_FILE`, and `TASK_CONTEXT` are empty when no corresponding input
@@ -886,6 +940,8 @@ Entries use these conventions:
   round that produced them.
 - `verdict` appears on verdict entries and includes the parsed verdict fields
   plus `sha`, binding that verdict to the reviewed `HEAD`.
+- A configured reviewer group records each role's verdict separately, followed
+  by an aggregate verdict with `aggregate: true` and `reviewerSet`.
 - Publish entries may include `approvedSha`, `remoteSha`, `prUrl`, and the
   verified `pullRequest` object. The top-level manifest and state also retain
   the final PR URL and metadata after a successful publish.

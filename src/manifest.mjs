@@ -37,8 +37,15 @@ export function hashText(text) {
   return sha256(String(text));
 }
 
+// Terminal-display settings are per-invocation, not run identity: toggling
+// quiet between a run and its `--resume` must not read as a config change.
+const DISPLAY_ONLY_KEYS = ['quiet', 'heartbeatMinutes'];
+
 export function hashConfig(config) {
-  return sha256(JSON.stringify(canonicalize(config)));
+  const hashed = config && typeof config === 'object' && !Array.isArray(config)
+    ? Object.fromEntries(Object.entries(config).filter(([key]) => !DISPLAY_ONLY_KEYS.includes(key)))
+    : config;
+  return sha256(JSON.stringify(canonicalize(hashed)));
 }
 
 export class Manifest {

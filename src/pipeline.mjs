@@ -18,6 +18,7 @@ import { renderPrompt, resolvePresetPromptDir, withOperatorNote } from './prompt
 import { banner, describeAgent, ensureConfirmationAvailable, log, openTerminalInput, report, resetRenderer, setRenderer, writeOutput } from './reporter.mjs';
 import { RunState, slugFor } from './state.mjs';
 import { runPhases } from './runner.mjs';
+import { createQuietRenderer, resolveQuiet } from './quiet.mjs';
 import { createTuiRenderer, tuiEnabled } from './tui.mjs';
 import { formatFindings } from './verdict.mjs';
 import { planWorktree, resumedWorktree, setupWorktree } from './worktree.mjs';
@@ -492,7 +493,10 @@ async function runAgent(phase, ctx, variables) {
   const startedAt = new Date().toISOString();
   const started = performance.now();
   const inputSha = ctx.dryRun ? null : await ctx.git.revParse();
-  const agent = ctx.agentSettings[phase.name] ?? agentForPhase(ctx.config, phase.name);
+  const agent = ctx.agentSettings[phase.name]
+    ?? (phase.reviewGroup
+      ? ctx.agentSettings[phase.reviewGroup] ?? agentForPhase(ctx.config, phase.reviewGroup)
+      : agentForPhase(ctx.config, phase.name));
   const engineOverride = ctx.engineOverrides[phase.name];
   const adapter = adapterFor(agent.name, ctx.config.adapters);
   const worktreeWrite = permissionLevel(phase.permissions) === PERMISSIONS.WRITE_WORKTREE;
@@ -702,7 +706,8 @@ export async function runLoop(options = {}) {
   );
 
   let runStarted = false;
-  let tuiRenderer = null;
+  // Whichever alternate renderer (quiet or TUI) is live; stopped exactly once.
+  let activeRenderer = null;
   try {
   const persistedName = args.resume ? state.data.name : null;
   if (persistedName && args.name && slugFor(args.name) !== persistedName) {
@@ -793,9 +798,10 @@ export async function runLoop(options = {}) {
   runStarted = true;
   const configuredAgentSettings = Object.fromEntries(
     config.resolvedPhases
-      .flatMap((phase) => [phase, ...(phase.repair ?? [])])
+      .flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])])
       .filter((phase) => phase.kind === 'agent')
-      .map((phase) => [phase.name, agentForPhase(config, phase.name)]),
+      .map((phase) => [phase.name,
+        config.engines[phase.name] ?? (phase.reviewGroup ? agentForPhase(config, phase.reviewGroup) : agentForPhase(config, phase.name))]),
   );
   const savedAgentSettings = args.resume && !args.config ? state.data.agentSettings : null;
   if (savedAgentSettings) {
@@ -906,6 +912,15 @@ export async function runLoop(options = {}) {
     activeProcessPath: join(state.dir, 'active-command.json'),
   };
 
+  // Quiet goes in before setup: `npm ci` and friends are the noisiest output
+  // of a fresh run. Dry runs keep plain output — their rendered prompts are
+  // the point.
+  const quiet = resolveQuiet(args, config);
+  if (!args.dryRun && quiet.enabled) {
+    activeRenderer = createQuietRenderer({ heartbeatMs: quiet.heartbeatMs });
+    setRenderer(activeRenderer);
+  }
+
   if (worktreeCreated && !args.dryRun && config.setup.length) {
     log(`setup     : ${config.setup.join(' && ')}`);
     await runSetup(config.setup, ctx);
@@ -946,6 +961,10 @@ export async function runLoop(options = {}) {
   log(`worktree  : ${worktree}`);
   log(`run dir   : ${state.dir}`);
   log(`phases    : ${config.resolvedPhases.map((phase) => phase.name).join(' → ')}`);
+  if (!args.dryRun && quiet.enabled) {
+    const heartbeat = quiet.heartbeatMs > 0 ? `heartbeat every ${quiet.heartbeatMs / 60000}m` : 'heartbeat off';
+    log(`output    : quiet (${heartbeat}; full logs in ${state.dir})`);
+  }
 
   /** @type {Summary} */
   const summary = {
@@ -962,9 +981,9 @@ export async function runLoop(options = {}) {
     pullRequest: state.data.pullRequest ?? state.manifestMetadata.pullRequest ?? null,
   };
 
-  if (!args.dryRun && tuiEnabled({ isTTY: process.stdout.isTTY, noTui: args.noTui })) {
-    tuiRenderer = createTuiRenderer({ config, state, summary });
-    setRenderer(tuiRenderer);
+  if (!args.dryRun && !quiet.enabled && tuiEnabled({ isTTY: process.stdout.isTTY, noTui: args.noTui })) {
+    activeRenderer = createTuiRenderer({ config, state, summary });
+    setRenderer(activeRenderer);
   }
 
   const operations = /** @satisfies {Operations} */ ({
@@ -995,24 +1014,26 @@ export async function runLoop(options = {}) {
     operations,
   });
 
+  // Keep the last entered phase and its start time for completed or stalled runs.
   await state.record({
     status: summary.stalled ? 'stalled' : 'completed',
     ...(summary.stalled ? { stalled: summary.stalled } : {}),
   });
-  if (tuiRenderer) {
-    tuiRenderer.stop();
+  if (activeRenderer) {
+    activeRenderer.stop();
     resetRenderer();
-    tuiRenderer = null;
+    activeRenderer = null;
   }
   report(summary, formatFindings);
   return summary;
 
   } catch (error) {
+    // A crash also retains the phase that was running for later inspection.
     if (runStarted && !args.dryRun) await state.record({ status: 'stalled' }).catch(() => {});
     throw error;
   } finally {
-    if (tuiRenderer) {
-      tuiRenderer.stop();
+    if (activeRenderer) {
+      activeRenderer.stop();
       resetRenderer();
     }
     await state.release();

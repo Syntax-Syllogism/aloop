@@ -1,13 +1,13 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseLoopArgs, runOperationalCommand } from '../bin/loop.mjs';
+import { parseLoopArgs, runOperationalCommand, watchCommand } from '../bin/loop.mjs';
 import { hashConfig, hashText } from '../src/manifest.mjs';
-import { cancelRun, cleanRuns, doctor, inspectRun, listRuns, replayRun } from '../src/operations.mjs';
+import { cancelRun, cleanRuns, doctor, getRun, getRunStatus, inspectRun, listRuns, replayRun, watchRuns } from '../src/operations.mjs';
 import { RunState } from '../src/state.mjs';
 
 const exec = promisify(execFile);
@@ -85,6 +85,36 @@ test('operational read commands summarize state and manifest evidence', async ()
   assert.equal(inspected.phases[0].inputSha, 'before');
   assert.deepEqual(inspected.phases[0].gateReceipts, [{ command: 'true', ok: true }]);
   assert.deepEqual(inspected.phases[0].artifacts, ['gate.log']);
+});
+
+test('status, list, and watch prefer the entered phase over the finished manifest phase', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'in-flight', { name: 'in-flight' });
+  state.manifest.append({ phase: 'gate', kind: 'gate', status: 'completed' });
+  await state.record({ status: 'running' });
+  await state.enterPhase('review');
+  const startedAt = state.data.phaseStartedAt;
+  assert.equal(new Date(startedAt).toISOString(), startedAt);
+  const [listed] = await listRuns({ cwd: root });
+  assert.equal(listed.currentPhase, 'review');
+  assert.equal(listed.phaseStartedAt, startedAt);
+  const status = await getRunStatus(join(root, '.loop/runs'), 'in-flight');
+  assert.equal(status.phase, 'review');
+  assert.equal(status.phaseStartedAt, startedAt);
+  const lines = [];
+  await runOperationalCommand(parseLoopArgs(['status', 'in-flight']), {
+    cwd: root, output: { log: (line) => lines.push(line) },
+  });
+  assert.ok(lines.includes(`phase    : review`));
+  assert.ok(lines.includes(`started  : ${startedAt}`));
+  const events = [];
+  const controller = new AbortController();
+  for await (const event of watchRuns({ repos: [root], initial: true, signal: controller.signal,
+    sleep: async () => controller.abort(),
+  })) events.push(event);
+  assert.equal(events[0].currentPhase, 'review');
+  assert.equal(events[0].phaseStartedAt, startedAt);
+  await state.release();
 });
 
 async function replayableRun(root, name, { promptHash = hashText('Implement demo.'), baseSha = null, worktree = root } = {}) {
@@ -369,4 +399,278 @@ test('doctor keeps configuration errors separate from unavailable tooling', asyn
   assert.equal(result.checks.find((check) => check.name === 'config').ok, true);
   assert.equal(result.checks.find((check) => check.name === 'engine missing-engine').ok, false);
   assert.equal(result.ok, false);
+});
+
+test('watch parsing accepts multiple names and repos and validates watch-only options', () => {
+  const args = parseLoopArgs(['watch', 'alpha', 'beta', '--repo', '.', '--repo', '../other', '--interval', '2', '--timeout', '1.5m', '--only', 'status', '--initial']);
+  assert.deepEqual(args.runNames, ['alpha', 'beta']);
+  assert.deepEqual(args.repo, ['.', '../other']);
+  assert.equal(args.intervalMs, 2000);
+  assert.equal(args.timeoutMs, 90_000);
+  assert.equal(args.initial, true);
+  assert.throws(() => parseLoopArgs(['watch', '--interval', '0']), /--interval must be a positive number of seconds/);
+  assert.throws(() => parseLoopArgs(['watch', '--timeout', 'soon']), /--timeout must be a duration/);
+  assert.throws(() => parseLoopArgs(['watch', '--only', 'phase']), /--only must be status/);
+  assert.throws(() => parseLoopArgs(['list', '--once']), /only valid with watch/);
+});
+
+test('watch snapshots existing runs and coalesces simultaneous status and phase changes', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'watched', { name: 'watched', branch: 'feat/watched' });
+  state.manifest.append({ phase: 'implement', kind: 'agent', status: 'completed' });
+  await state.record({ status: 'running', currentPhase: 'implement', phaseStartedAt: '2026-09-28T10:00:00.000Z' });
+  const controller = new AbortController();
+  let sleeps = 0;
+  const events = [];
+  for await (const event of watchRuns({
+    repos: [root], initial: true, signal: controller.signal, intervalMs: 1,
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        await state.release();
+        state.manifest.append({ phase: 'gate', kind: 'gate', status: 'completed' });
+        await state.record({ status: 'stalled', currentPhase: 'gate', phaseStartedAt: '2026-09-28T10:01:00.000Z', stalled: { phase: 'gate', reason: 'round cap reached', findings: ['private detail'] } });
+      } else controller.abort();
+    },
+  })) events.push(event);
+
+  assert.equal(events[0].type, 'snapshot');
+  assert.deepEqual(events.slice(1).map(({ type, from, to }) => ({ type, from, to })), [
+    { type: 'status', from: 'running', to: 'stalled' },
+  ]);
+  assert.equal(events[1].currentPhase, 'gate');
+  assert.equal(events[1].phaseStartedAt, '2026-09-28T10:01:00.000Z');
+  assert.deepEqual(events[1].stalled, { phase: 'gate', reason: 'round cap reached' });
+  assert.equal(JSON.stringify(events[1]).includes('private detail'), false);
+  assert.equal(events[1].repo, root);
+});
+
+test('watch emits phase-only changes when status stays the same', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'phase-only', { name: 'phase-only' });
+  await state.record({ status: 'running', currentPhase: 'implement' });
+  const controller = new AbortController();
+  const events = [];
+  let sleeps = 0;
+  for await (const event of watchRuns({
+    repos: [root], signal: controller.signal,
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) await state.record({ status: 'running', currentPhase: 'gate' });
+      else controller.abort();
+    },
+  })) events.push(event);
+  await state.release();
+
+  assert.deepEqual(events.map(({ type, from, to }) => ({ type, from, to })), [
+    { type: 'phase', from: 'implement', to: 'gate' },
+  ]);
+});
+
+test('watch does not emit a phase event for a new start time with the same phase', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'same-phase', { name: 'same-phase' });
+  await state.record({ status: 'running', currentPhase: 'gate', phaseStartedAt: '2026-09-28T10:00:00.000Z' });
+  const controller = new AbortController();
+  const events = [];
+  let sleeps = 0;
+  for await (const event of watchRuns({ repos: [root], signal: controller.signal,
+    sleep: async () => {
+      if (++sleeps === 1) await state.enterPhase('gate');
+      else controller.abort();
+    },
+  })) events.push(event);
+  assert.deepEqual(events, []);
+  await state.release();
+});
+
+test('watch --only status ignores phase events and --once waits past initial snapshots', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'filtered', { name: 'filtered' });
+  await state.record({ status: 'running', currentPhase: 'implement' });
+  const output = [];
+  let snapshotWritten;
+  const snapshot = new Promise((resolve) => { snapshotWritten = resolve; });
+  let settled = false;
+  const watching = watchCommand(parseLoopArgs([
+    'watch', '--only', 'status', '--initial', '--once', '--interval', '1',
+  ]), {
+    cwd: root,
+    output: {
+      write: (line, callback) => { output.push(line); snapshotWritten(); callback?.(); },
+      error: (line) => output.push(line),
+    },
+  }).finally(() => { settled = true; });
+
+  await snapshot;
+  state.manifest.append({ phase: 'gate', kind: 'gate', status: 'completed' });
+  await state.record({ status: 'running', currentPhase: 'gate' });
+  // Hold the phase-only change across at least one 1s poll before completing.
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+  assert.deepEqual(output.map((line) => JSON.parse(line).type), ['snapshot']);
+  assert.equal(settled, false);
+
+  await state.record({ status: 'completed', currentPhase: 'gate' });
+  await state.release();
+  const result = await watching;
+
+  assert.equal(result, 0);
+  assert.deepEqual(output.map((line) => JSON.parse(line).type), ['snapshot', 'status']);
+  assert.equal(JSON.parse(output[1]).to, 'completed');
+});
+
+test('watch recovers after a transient unreadable run manifest', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'recover', { name: 'recover' });
+  await state.record({ status: 'running', currentPhase: 'implement' });
+  const manifestPath = join(state.dir, 'manifest.json');
+  const manifest = await readFile(manifestPath, 'utf8');
+  const controller = new AbortController();
+  const events = [];
+  const warnings = [];
+  let sleeps = 0;
+  for await (const event of watchRuns({
+    repos: [root], initial: true, signal: controller.signal,
+    warn: (message) => warnings.push(message),
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) await writeFile(manifestPath, '{ invalid json');
+      else if (sleeps === 2) await writeFile(manifestPath, manifest);
+      else controller.abort();
+    },
+  })) events.push(event);
+  await state.release();
+
+  assert.deepEqual(events.map(({ type }) => type), ['snapshot']);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /could not read runs/);
+});
+
+test('watch keeps a persisted running run active while its command child lives', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'child-active', { name: 'child-active' });
+  await state.record({ status: 'running', currentPhase: 'implement' });
+  await state.release();
+  const child = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  await writeFile(join(state.dir, 'active-command.json'), `${JSON.stringify({ pid: child.pid, processGroupId: child.pid })}\n`);
+  const controller = new AbortController();
+  const events = [];
+
+  try {
+    for await (const event of watchRuns({
+      repos: [root], initial: true, signal: controller.signal,
+      sleep: async () => controller.abort(),
+    })) events.push(event);
+  } finally {
+    process.kill(-child.pid, 'SIGKILL');
+  }
+
+  assert.equal(events[0].status, 'running');
+  assert.notEqual(events[0].status, 'interrupted');
+});
+
+test('watch omits stale stalled details after a stalled run resumes', async () => {
+  const root = await fixture();
+  const runsDir = join(root, '.loop/runs');
+  const state = await RunState.open(runsDir, 'resumed', { name: 'resumed' });
+  await state.record({ status: 'stalled', currentPhase: 'review', stalled: { phase: 'review', reason: 'round cap reached' } });
+  await state.release();
+  const controller = new AbortController();
+  const events = [];
+  let sleeps = 0;
+  for await (const event of watchRuns({
+    repos: [root], initial: true, signal: controller.signal,
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        const resumed = await RunState.open(runsDir, 'resumed', { name: 'resumed' }, { resume: true });
+        await resumed.record({ status: 'running', currentPhase: 'address' });
+      } else {
+        controller.abort();
+      }
+    },
+  })) events.push(event);
+
+  assert.equal(events[0].status, 'stalled');
+  assert.deepEqual(events[0].stalled, { phase: 'review', reason: 'round cap reached' });
+  assert.equal(events[1].status, 'running');
+  assert.equal(Object.hasOwn(events[1], 'stalled'), false);
+});
+
+test('watch detects a persisted running state with no live lock as interrupted', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'interrupted', { name: 'interrupted' });
+  await state.record({ status: 'running', currentPhase: 'implement' });
+  await state.release();
+
+  assert.equal((await getRun('interrupted', { cwd: root })).summary.status, 'interrupted');
+  assert.equal((await listRuns({ cwd: root }))[0].status, 'interrupted');
+  const controller = new AbortController();
+  const events = [];
+  for await (const event of watchRuns({
+    repos: [root], initial: true, signal: controller.signal,
+    sleep: async () => controller.abort(),
+  })) events.push(event);
+  assert.equal(events[0].type, 'snapshot');
+  assert.equal(events[0].status, 'interrupted');
+  assert.equal((await cancelRun('interrupted', { cwd: root })).status, 'cancelled');
+});
+
+test('watch timeout emits one NDJSON timeout event and returns exit code 2', async () => {
+  const root = await fixture();
+  const output = [];
+  const result = await watchCommand(parseLoopArgs(['watch', '--timeout', '0.01s']), {
+    cwd: root,
+    output: { write: (line, callback) => { output.push(line); callback?.(); }, error: (line) => output.push(line) },
+  });
+  assert.equal(result, 2);
+  assert.equal(JSON.parse(output[0]).type, 'timeout');
+});
+
+test('watch reports appeared and removed runs independently across repositories', async () => {
+  const first = await fixture();
+  const second = await fixture();
+  const controller = new AbortController();
+  let sleeps = 0;
+  const events = [];
+  for await (const event of watchRuns({
+    repos: [first, second], names: ['same-name'], signal: controller.signal, intervalMs: 1,
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        for (const root of [first, second]) {
+          const state = await RunState.open(join(root, '.loop/runs'), 'same-name', { name: 'same-name' });
+          await state.record({ status: 'running' });
+          await state.release();
+        }
+      } else if (sleeps === 2) {
+        await rm(join(first, '.loop/runs/same-name'), { recursive: true });
+      } else controller.abort();
+    },
+  })) events.push(event);
+
+  assert.deepEqual(events.map(({ type, repo, name }) => ({ type, repo, name })), [
+    { type: 'appeared', repo: first, name: 'same-name' },
+    { type: 'appeared', repo: second, name: 'same-name' },
+    { type: 'removed', repo: first, name: 'same-name' },
+  ]);
+});
+
+test('watch --once exits after the first appeared event', async () => {
+  const root = await fixture();
+  const output = [];
+  const createRun = async () => {
+    const state = await RunState.open(join(root, '.loop/runs'), 'new-run', { name: 'new-run' });
+    await state.record({ status: 'running' });
+    await state.release();
+  };
+  const creation = new Promise((resolve) => setTimeout(() => createRun().then(resolve), 300));
+  const result = await watchCommand(parseLoopArgs(['watch', '--once', '--interval', '1']), {
+    cwd: root,
+    output: { write: (line, callback) => { output.push(line); callback?.(); }, error: (line) => output.push(line) },
+  });
+  await creation;
+  assert.equal(result, 0);
+  assert.equal(JSON.parse(output[0]).type, 'appeared');
+  assert.equal(output.length, 1);
 });

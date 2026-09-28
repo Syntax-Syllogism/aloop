@@ -54,6 +54,12 @@ not decide which phases execute. Its `banner`/`log` calls fan out to whichever
 renderer is active, which is how `src/tui.mjs` — the live-dashboard renderer
 described in [Agentic loop runner](loop.md) — slots in as a second renderer
 without `runner.mjs` or `pipeline.mjs` knowing which one is live.
+`src/quiet.mjs` is the third: the [quiet mode](loop.md#quiet-mode) renderer,
+which drops raw engine, gate, and setup output from the terminal and prints
+phase transitions, `log` lines, and a periodic heartbeat. `pipeline.mjs`
+selects at most one alternate renderer per run (quiet takes precedence over
+the TUI) and stops it before the final `report`, which always prints as plain
+text.
 
 `src/worktree.mjs` owns worktree planning, creation, and resume validation. It
 checks a saved worktree through Git before resuming rather than silently

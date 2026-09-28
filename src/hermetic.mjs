@@ -140,7 +140,7 @@ export function hermeticEnvironment(settings, source = process.env) {
 
 export function hermeticSnapshot(config) {
   const phases = config.resolvedPhases
-    .flatMap((phase) => [phase, ...(phase.repair ?? [])])
+    .flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])])
     .map((phase) => ({
       name: phase.name,
       enabled: Boolean(phase.hermetic),

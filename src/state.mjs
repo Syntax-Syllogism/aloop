@@ -381,6 +381,12 @@ export class RunState {
     return this.data.completed.includes(name);
   }
 
+  /** Record the phase or sub-phase that is starting now. */
+  async enterPhase(name) {
+    if (this.readOnly) return;
+    await this.record({ currentPhase: name, phaseStartedAt: new Date().toISOString() });
+  }
+
   async markComplete(name, details = {}) {
     if (!this.data.completed.includes(name)) this.data.completed.push(name);
     this.data.phases = { ...this.data.phases, [name]: { finishedAt: new Date().toISOString(), ...details } };
@@ -393,6 +399,12 @@ export class RunState {
     const baseline = await compute();
     await this.record({ phaseBaselines: { ...phaseBaselines, [name]: baseline } });
     return baseline;
+  }
+
+  async clearBaseline(name) {
+    if (!this.data.phaseBaselines?.[name]) return;
+    const { [name]: _cleared, ...phaseBaselines } = this.data.phaseBaselines;
+    await this.record({ phaseBaselines });
   }
 
   async record(patch) {

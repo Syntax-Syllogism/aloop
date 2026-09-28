@@ -41,6 +41,8 @@ export interface PhaseBase {
   repair?: PhaseDescriptor[];
   recheck?: boolean;
   verdict?: boolean;
+  reviewers?: AgentPhase[];
+  reviewGroup?: string;
   role?: PhaseRole;
   hermetic?: HermeticConfig | null;
 }
@@ -133,6 +135,8 @@ export interface Config {
   preset: string | null;
   runsDir: string;
   hermetic: HermeticConfig;
+  quiet: boolean;
+  heartbeatMinutes: number;
 }
 
 export interface Finding {
@@ -185,6 +189,8 @@ export interface RunData {
   rounds: Record<string, number>;
   reviewedShas: Record<string, string>;
   phaseBaselines?: Record<string, string>;
+  currentPhase?: string | null;
+  phaseStartedAt?: string | null;
   phases?: Record<string, Record<string, any>>;
   pendingRepairs?: Record<string, any>;
   [key: string]: any;
@@ -201,8 +207,10 @@ export interface RunState {
   logPath(name: string): string;
   verdictPath(round: number): string;
   isComplete(name: string): boolean;
+  enterPhase(name: string): Promise<void>;
   markComplete(name: string, details?: Record<string, unknown>): Promise<void>;
   baselineFor(name: string, compute: () => Promise<string>): Promise<string>;
+  clearBaseline(name: string): Promise<void>;
   record(patch: Record<string, unknown>): Promise<void>;
   saveManifest(manifest: Record<string, unknown>): Promise<void>;
 }

@@ -2,7 +2,7 @@
 
 import { parseArgs } from 'node:util';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { isMainEntrypoint } from '../src/entrypoint.mjs';
 import {
   cancelRun,
@@ -15,6 +15,7 @@ import {
   listRuns,
   replayRun,
   resolveRunsDir,
+  watchRuns,
 } from '../src/operations.mjs';
 import { computeRunMetrics } from '../src/metrics.mjs';
 import { runLoop } from '../src/pipeline.mjs';
@@ -22,7 +23,19 @@ import { runLoop } from '../src/pipeline.mjs';
 /** @typedef {import('../src/types.js').OperationalOutput} OperationalOutput */
 /** @typedef {import('../src/types.js').OperationalResult} OperationalResult */
 
-const commands = new Set(['run', 'list', 'status', 'inspect', 'replay', 'cancel', 'clean', 'doctor', 'metrics', 'init']);
+const commands = new Set(['run', 'list', 'status', 'inspect', 'replay', 'cancel', 'clean', 'doctor', 'metrics', 'init', 'watch']);
+
+function parseDuration(text) {
+  const match = /^(\d+(?:\.\d+)?)(s|m|h)?$/.exec(text);
+  if (!match) throw new Error('--timeout must be a duration like 90s, 10m, or 1h');
+  const value = Number(match[1]);
+  const multiplier = match[2] === 'h' ? 3_600_000 : match[2] === 'm' ? 60_000 : 1_000;
+  const milliseconds = value * multiplier;
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    throw new Error('--timeout must be a duration like 90s, 10m, or 1h');
+  }
+  return milliseconds;
+}
 
 export function parseLoopArgs(argv) {
   const command = commands.has(argv[0]) ? argv[0] : 'run';
@@ -40,6 +53,12 @@ export function parseLoopArgs(argv) {
       effort: { type: 'string' },
       'override-engine': { type: 'boolean' },
       config: { type: 'string' },
+      repo: { type: 'string', multiple: true },
+      interval: { type: 'string' },
+      once: { type: 'boolean' },
+      timeout: { type: 'string' },
+      only: { type: 'string' },
+      initial: { type: 'boolean' },
       phases: { type: 'string' },
       'max-rounds': { type: 'string' },
       from: { type: 'string' },
@@ -49,6 +68,9 @@ export function parseLoopArgs(argv) {
       yes: { type: 'boolean', short: 'y' },
       'no-worktree': { type: 'boolean' },
       'no-tui': { type: 'boolean' },
+      quiet: { type: 'boolean' },
+      'no-quiet': { type: 'boolean' },
+      heartbeat: { type: 'string' },
       'dry-run': { type: 'boolean' },
       json: { type: 'boolean' },
       metrics: { type: 'boolean' },
@@ -56,11 +78,13 @@ export function parseLoopArgs(argv) {
       preset: { type: 'string' },
       force: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
+      version: { type: 'boolean' },
     },
     allowPositionals: true,
     strict: true,
   });
   if (values.help) return { command, help: true };
+  if (values.version) return { command, version: true };
   const maxRounds = values['max-rounds'] ? Number(values['max-rounds']) : undefined;
   if (maxRounds !== undefined && (!Number.isInteger(maxRounds) || maxRounds < 1)) {
     throw new Error('--max-rounds must be a positive integer');
@@ -69,16 +93,37 @@ export function parseLoopArgs(argv) {
   if (olderThanDays !== undefined && (!Number.isFinite(olderThanDays) || olderThanDays < 0)) {
     throw new Error('--older-than must be a non-negative number of days');
   }
+  const heartbeatMinutes = values.heartbeat === undefined ? undefined : Number(values.heartbeat);
+  if (heartbeatMinutes !== undefined && (values.heartbeat.trim() === '' || !Number.isFinite(heartbeatMinutes) || heartbeatMinutes < 0)) {
+    throw new Error('--heartbeat must be a non-negative number of minutes');
+  }
+  if (values.quiet && values['no-quiet']) {
+    throw new Error('--quiet and --no-quiet are mutually exclusive');
+  }
+  const watchOptionsUsed = values.repo !== undefined || values.interval !== undefined || values.once
+    || values.timeout !== undefined || values.only !== undefined || values.initial;
+  if (command !== 'watch' && watchOptionsUsed) {
+    throw new Error('--repo, --interval, --once, --timeout, --only, and --initial are only valid with watch');
+  }
+  const intervalSeconds = values.interval === undefined ? undefined : Number(values.interval);
+  if (intervalSeconds !== undefined && (!Number.isFinite(intervalSeconds) || intervalSeconds < 1)) {
+    throw new Error('--interval must be a positive number of seconds');
+  }
+  const timeoutMs = values.timeout === undefined ? undefined : parseDuration(values.timeout);
+  if (values.only !== undefined && values.only !== 'status') {
+    throw new Error('--only must be status');
+  }
   const [runName] = positionals;
-  if (positionals.length > 1 || (['status', 'inspect', 'replay', 'cancel'].includes(command) && !runName)) {
+  if ((command !== 'watch' && positionals.length > 1) || (['status', 'inspect', 'replay', 'cancel'].includes(command) && !runName)) {
     throw new Error(`${command} requires exactly one run name`);
   }
-  if (command !== 'run' && !['status', 'inspect', 'replay', 'cancel'].includes(command) && positionals.length) {
+  if (command !== 'run' && command !== 'watch' && !['status', 'inspect', 'replay', 'cancel'].includes(command) && positionals.length) {
     throw new Error(`${command} does not accept positional arguments`);
   }
   return {
     command,
     runName,
+    runNames: command === 'watch' ? positionals : undefined,
     task: values.task,
     taskFile: values['task-file'],
     name: values.name,
@@ -98,12 +143,21 @@ export function parseLoopArgs(argv) {
     yes: values.yes,
     noWorktree: values['no-worktree'],
     noTui: values['no-tui'],
+    quiet: values.quiet,
+    noQuiet: values['no-quiet'],
+    heartbeatMinutes,
     dryRun: values['dry-run'],
     json: values.json,
     metrics: values.metrics,
     olderThanDays,
     preset: values.preset,
     force: values.force,
+    repo: values.repo,
+    intervalMs: intervalSeconds === undefined ? undefined : intervalSeconds * 1000,
+    once: values.once,
+    timeoutMs,
+    only: values.only,
+    initial: values.initial,
   };
 }
 
@@ -120,8 +174,13 @@ export function usage() {
     '  cancel <name>           Stop a run and release its lock',
     '  clean                   Preview/remove completed runs older than 30 days',
     '  doctor                  Check configuration and local tooling',
+    '  watch [names...]        Stream run status/phase changes as NDJSON',
     '  init                    Scaffold loop.config.mjs and .loop/prompts',
     '  run                     Start or resume a run (the default)',
+    '',
+    'General options:',
+    '  -h, --help              Show this help',
+    '      --version           Print the package version',
     '',
     'Operational options:',
     '      --json              Emit machine-readable JSON',
@@ -129,6 +188,14 @@ export function usage() {
     '      --older-than <n>    Clean completed runs older than n days',
     '  -y, --yes               Confirm destructive clean operations',
     '      --dry-run           Preview clean operations without changing files',
+    '',
+    'Watch options:',
+    '      --repo <path>       Repository to watch (repeatable; default: cwd)',
+    '      --interval <secs>   Poll interval, at least 1 second (default: 15)',
+    '      --once              Exit after the first non-snapshot event',
+    '      --timeout <duration> Exit with code 2 after an idle timeout (e.g. 10m)',
+    '      --only status       Suppress phase-only events',
+    '      --initial           Emit a snapshot of existing runs',
     '',
     'Init options:',
     '      --preset <name>     Seed init from a bundled preset (e.g. work-item)',
@@ -154,9 +221,114 @@ export function usage() {
     '      --note-file <path>  Read the instruction from a file (--note wins)',
     '      --no-worktree       Work in the current checkout instead of a worktree',
     '      --no-tui            Force plain streaming output (TUI is on by default on a TTY)',
+    '      --quiet             Print only phase transitions, status lines, and a periodic heartbeat (disables the TUI)',
+    '      --no-quiet          Override quiet: true from the config',
+    '      --heartbeat <min>   Heartbeat interval in minutes for quiet mode (default 10; 0 = transitions only; implies --quiet)',
     '  -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)',
     '      --dry-run           Print the plan and rendered prompts, run nothing',
   ].join('\n');
+}
+
+function writeWatchLine(output, event) {
+  return new Promise((resolveWrite, rejectWrite) => {
+    const line = `${JSON.stringify(event)}\n`;
+    try {
+      output.write(line, (error) => error ? rejectWrite(error) : resolveWrite());
+      if (output.write.length < 2) resolveWrite();
+    } catch (error) {
+      rejectWrite(error);
+    }
+  });
+}
+
+/**
+ * @param {ReturnType<typeof parseLoopArgs>} args
+ * @param {{
+ *   cwd?: string,
+ *   output?: {
+ *     write: (line: string, callback?: (error?: Error | null) => void) => unknown,
+ *     error?: (message: string) => void,
+ *     on?: (event: 'error', listener: (error: NodeJS.ErrnoException) => void) => unknown,
+ *     removeListener?: (event: 'error', listener: (error: NodeJS.ErrnoException) => void) => unknown,
+ *   },
+ *   signal?: AbortSignal,
+ * }} [options]
+ */
+export async function watchCommand(args, { cwd = process.cwd(), output = process.stdout, signal } = {}) {
+  const writeError = output.error ?? console.error;
+  const swallowBrokenPipe = (error) => {
+    if (error.code !== 'EPIPE') writeError(error.message);
+  };
+  output.on?.('error', swallowBrokenPipe);
+  const controller = new AbortController();
+  const watchSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  const now = () => new Date();
+  const timeoutMs = args.timeoutMs;
+  let lastEventAt = Date.now();
+  const repos = args.repo?.length ? args.repo.map((repo) => resolve(cwd, repo)) : [resolve(cwd)];
+  const iterator = watchRuns({
+    repos,
+    configPath: args.config ? resolve(cwd, args.config) : undefined,
+    names: args.runNames,
+    intervalMs: args.intervalMs ?? 15_000,
+    initial: args.initial,
+    signal: watchSignal,
+    warn: (message) => writeError(message),
+  });
+  let next = iterator.next();
+  try {
+    while (true) {
+      let timer;
+      let timeoutHandle;
+      let timeoutWon = false;
+      if (timeoutMs !== undefined) {
+        const remaining = Math.max(0, timeoutMs - (Date.now() - lastEventAt));
+        timer = new Promise((resolveTimer) => {
+          timeoutHandle = setTimeout(() => {
+            timeoutWon = true;
+            resolveTimer(null);
+          }, remaining).unref?.();
+        });
+      }
+      const result = timeoutMs === undefined ? await next : await Promise.race([next, timer]);
+      if (timeoutHandle && !timeoutWon) clearTimeout(timeoutHandle);
+      if (timeoutWon) {
+        controller.abort();
+        await iterator.return();
+        await writeWatchLine(output, { type: 'timeout', at: now().toISOString(), idleMs: Date.now() - lastEventAt });
+        return 2;
+      }
+      if (result.done) return 0;
+      const event = result.value;
+      if (args.only === 'status' && event.type === 'phase') {
+        next = iterator.next();
+        continue;
+      }
+      try {
+        await writeWatchLine(output, event);
+      } catch (error) {
+        if (error.code === 'EPIPE') return 0;
+        throw error;
+      }
+      if (event.type !== 'snapshot') {
+        lastEventAt = Date.now();
+        if (args.once) {
+          controller.abort();
+          await iterator.return();
+          return 0;
+        }
+      }
+      next = iterator.next();
+    }
+  } catch (error) {
+    if (signal?.aborted || error.name === 'AbortError' || error.code === 'EPIPE') return 0;
+    writeError(error.message);
+    return 1;
+  } finally {
+    controller.abort();
+    await iterator.return().catch(() => {});
+    output.removeListener?.('error', swallowBrokenPipe);
+  }
 }
 
 function formatMetric(value) {
@@ -200,6 +372,7 @@ function printStatus(run, output = console, metrics = null) {
   output.log(`run      : ${run.name}`);
   output.log(`status   : ${run.status}`);
   output.log(`phase    : ${run.currentPhase ?? '-'}`);
+  output.log(`started  : ${run.phaseStartedAt ?? '-'}`);
   output.log(`verdict  : ${run.verdict ?? '-'}`);
   output.log(`gate     : ${run.gateStatus ?? '-'}`);
   output.log(`branch   : ${run.branch ?? '-'}`);
@@ -334,8 +507,22 @@ if (isMainEntrypoint(import.meta.url)) {
     const args = parseLoopArgs(process.argv.slice(2));
     if (args.help) {
       console.log(usage());
+    } else if (args.version) {
+      const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+      console.log(version);
     } else if (args.command === 'run') {
       await runLoop({ args });
+    } else if (args.command === 'watch') {
+      const controller = new AbortController();
+      const stop = () => controller.abort();
+      process.once('SIGINT', stop);
+      process.once('SIGTERM', stop);
+      try {
+        process.exitCode = await watchCommand(args, { cwd: process.cwd(), output: process.stdout, signal: controller.signal });
+      } finally {
+        process.removeListener('SIGINT', stop);
+        process.removeListener('SIGTERM', stop);
+      }
     } else {
       const result = await runOperationalCommand(args);
       if (args.command === 'doctor' && !(/** @type {any} */ (result)).ok) process.exitCode = 1;
