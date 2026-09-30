@@ -5,19 +5,13 @@ description: Supported host environments and platform-specific command and termi
 
 # Platform support
 
-aloop supports Linux and macOS directly. Windows is a fully supported tier in
-two modes: launched from Git Bash (POSIX `sh` available), or natively under
-PowerShell with no POSIX shell on `PATH` at all. WSL is supported through its
-Linux environment.
+aloop runs directly on Linux and macOS. Windows is fully supported in two modes: from Git Bash (with a POSIX `sh`), or natively under PowerShell with no POSIX shell on `PATH`. WSL works through its Linux environment.
 
 ## Windows: Git Bash mode
 
-Install Git for Windows, make sure its `sh.exe` is available on `PATH`, and
-launch aloop from a Git Bash terminal. Use `--yes` for unattended runs or when
-no interactive console is available.
+Install Git for Windows, make sure its `sh.exe` is on `PATH`, and start aloop from a Git Bash terminal. Use `--yes` for unattended runs or when there's no interactive console.
 
-A bare command string in `gate`/`setup`/`phase.commands` runs through `sh -c`,
-same as POSIX:
+A plain command string in `gate`, `setup`, or `phase.commands` runs through `sh -c`, as on POSIX:
 
 ```js
 export default {
@@ -26,25 +20,14 @@ export default {
 };
 ```
 
-## Windows: native PowerShell mode (no `sh`)
+## Windows: native PowerShell mode
 
-With no Git Bash (or any POSIX shell) on `PATH`, aloop runs setup and gate
-commands under PowerShell 7+ (`pwsh`), falling back to Windows PowerShell
-(`powershell.exe`) when `pwsh` is not installed. Set `shell` in the config to
-override this auto-detection (e.g. `shell: 'cmd.exe'`).
+If no Git Bash or other POSIX shell is on `PATH`, aloop runs setup and gate commands under PowerShell 7+ (`pwsh`). It falls back to Windows PowerShell (`powershell.exe`) if `pwsh` isn't installed. To override the detected shell, set `shell` in the config, for example `shell: 'cmd.exe'`.
 
-A bare POSIX command string is not portable to this mode: `&&` with `$VAR`,
-`[[ ]]`, `2>&1`, single-quote semantics, and `foo=bar cmd` env-prefixing all
-differ or fail under PowerShell. Two structured forms exist so one config can
-target both POSIX and native Windows:
+A plain POSIX command string often won't work here. `&&` with `$VAR`, `[[ ]]`, `2>&1`, single-quote rules, and `foo=bar cmd` env prefixes all behave differently or fail in PowerShell. Two structured forms let one config target both POSIX and native Windows:
 
-- **`{ argv: [...] }`** — runs the given argv directly, no shell involved.
-  Portable by construction; cannot express pipes, `&&`, or redirection.
-- **`{ posix, windows, pwsh, cmd }`** — a per-platform object. On Windows,
-  aloop picks `windows` if present, else `pwsh`, else `cmd`; on POSIX it picks
-  `posix`. A config missing the variant needed on the current host fails at
-  config-load time with an error naming the phase and command index, rather
-  than failing mid-run.
+- **`{ argv: [...] }`** runs the argv directly, with no shell. It's portable by design, but can't express pipes, `&&`, or redirection.
+- **`{ posix, windows, pwsh, cmd }`** is a per-platform object. On Windows, aloop uses `windows` if present, then `pwsh`, then `cmd`. On POSIX it uses `posix`. If the variant for the current host is missing, config loading fails up front with an error naming the phase and command index, instead of failing mid-run.
 
 ```js
 export default {
@@ -53,42 +36,27 @@ export default {
 };
 ```
 
-The legacy string form keeps working everywhere — including native Windows,
-via the shell resolved above — for commands simple enough not to need the
-structured forms.
+Plain strings still work everywhere, including native Windows through the shell above, as long as the command is simple enough.
 
 ## Windows command execution
 
-The shared command runner resolves extensionless commands through the Windows
-`PATH` and `PATHEXT` environment variables. Executables are tried in path and
-extension order. Direct `.exe` commands run as-is; `.cmd` and `.bat` shims run
-through `ComSpec`, and `.ps1` scripts run through Windows PowerShell with a
-non-interactive profile and execution-policy bypass. This lets configured agent
-CLIs and the default shell work when their Windows launchers are on `PATH`.
+The command runner finds extensionless commands through the Windows `PATH` and `PATHEXT` variables, trying executables in path and extension order:
 
-A `.cmd`/`.bat` shim runs through `cmd.exe`, whose command line is capped at
-about 8191 characters and which mangles newlines and shell metacharacters
-(`% ! & | < >`). A large agent prompt passed as a command-line argument through
-such a shim therefore arrives truncated or garbled. The Gemini adapter avoids
-this by sending its prompt on stdin (an adapter may return an `input` string
-that the runner writes to the child's stdin) instead of on the command line;
-its Windows launcher is a shim, so a command-line prompt would be corrupted.
+- `.exe` files run directly.
+- `.cmd` and `.bat` shims run through `ComSpec`.
+- `.ps1` scripts run through Windows PowerShell with a non-interactive profile and execution-policy bypass.
 
-Command timeouts terminate the Windows process tree with `taskkill /PID /T /F`.
-On POSIX hosts, aloop continues to use detached process groups and group
-signals. A timeout or cancellation therefore cleans up child processes on both
-platform families.
+This lets agent CLIs and the default shell work when their Windows launchers are on `PATH`.
+
+A `.cmd` or `.bat` shim runs through `cmd.exe`. That limits the command line to about 8191 characters and mangles newlines and metacharacters (`% ! & | < >`). A large prompt passed as an argument through such a shim arrives truncated or garbled. The Gemini adapter avoids this by sending its prompt on stdin instead. An adapter can return an `input` string, and the runner writes it to the child's stdin. Gemini's Windows launcher is a shim, so a prompt on the command line would be corrupted.
+
+On timeout, aloop ends the Windows process tree with `taskkill /PID /T /F`. On POSIX it uses detached process groups and group signals. Either way, a timeout or cancellation cleans up child processes.
 
 ## Interactive confirmation
 
-When confirmation is required, aloop uses standard input when it is a TTY. On
-Windows, a non-TTY Git Bash invocation falls back to the Windows console input
-device (`CONIN$`). If no terminal can be opened, aloop reports an actionable
-error and asks the operator to rerun with `--yes`.
+When aloop needs confirmation, it reads from standard input if that's a TTY. On Windows under Git Bash without a TTY, it falls back to the console input device (`CONIN$`). If no terminal can be opened, it reports an error and asks you to rerun with `--yes`.
 
-Piped task input does not provide confirmation input by itself. A piped run can
-still remain interactive when Git Bash exposes its console, or it can run
-unattended with `--yes`:
+Piped task input doesn't provide confirmation input. A piped run can stay interactive if Git Bash exposes its console, or it can run unattended with `--yes`:
 
 ```sh
 some-task-source fetch 123 | aloop --task-file - --name my-spec --yes
@@ -96,12 +64,10 @@ some-task-source fetch 123 | aloop --task-file - --name my-spec --yes
 
 ## Verification
 
-The platform seams are covered by `test/platform.test.mjs`, and the
-structured/per-platform command model by `test/loop.test.mjs`. CI runs three
-jobs: the full regression suite on Ubuntu; the Git Bash Windows job (invoked
-through the runner's Bash shell), which runs the native Windows platform
-suite — including a real `.cmd` launch through `ComSpec` — with Git Bash's
-`sh` present; and a dedicated `windows-native` job that strips Git's `usr\bin`
-from `PATH`, asserts `sh` cannot be resolved, and then runs the same platform
-suite plus the command-model tests entirely under `pwsh`. POSIX-only
-integration fixtures (bash-syntax gate/setup strings) remain Ubuntu-only.
+`test/platform.test.mjs` covers the platform seams, and `test/loop.test.mjs` covers the structured and per-platform command model. CI runs three jobs:
+
+- The full regression suite on Ubuntu.
+- A Git Bash Windows job, run through the runner's Bash shell. It runs the native Windows platform suite, including a real `.cmd` launch through `ComSpec`, with Git Bash's `sh` present.
+- A `windows-native` job. It strips Git's `usr\bin` from `PATH`, asserts that `sh` can't be found, then runs the same platform suite and the command-model tests entirely under `pwsh`.
+
+POSIX-only integration fixtures (bash-syntax gate and setup strings) run only on Ubuntu.

@@ -937,7 +937,9 @@ export async function runLoop(options = {}) {
     REPO: worktree,
     RUN_DIR: state.dir,
     REMOTE: remote,
-    GATE_COMMANDS: config.gate.join('\n') || '(none configured)',
+    GATE_COMMANDS: config.gate
+      .map((entry, index) => normalizeCommandEntry(entry, { label: 'gate', index }).display)
+      .join('\n') || '(none configured)',
   };
 
   if (!args.dryRun && !(await state.hasSnapshot())) {

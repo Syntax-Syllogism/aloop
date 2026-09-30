@@ -5,15 +5,11 @@ description: Configure optional runtime isolation, network policy, environment f
 
 # Hermetic phase execution
 
-Hermetic execution is an opt-in runtime boundary around individual phases. Host
-execution remains the default. When enabled, aloop wraps an agent or gate
-command in the configured container runtime, mounts only the paths required by
-that phase, and records the resolved execution policy in the run evidence.
+Hermetic execution is an opt-in container boundary around individual phases. By default, phases run on the host. When you enable it, aloop wraps an agent or gate command in your container runtime, mounts only the paths that phase needs, and records the resolved policy in the run evidence.
 
 ## Configuration
 
-Set run-level defaults in `loop.config.mjs`, then opt phases in with
-`hermetic: true` or a phase-specific object:
+Set run-level defaults in `loop.config.mjs`, then opt phases in with `hermetic: true` or a phase-specific object:
 
 ```js
 export default {
@@ -36,74 +32,35 @@ export default {
 };
 ```
 
-The run-level `hermetic` object only defines defaults; it does not enable
-container execution. A phase set to `false`, or with no `hermetic` field, runs
-on the host. An enabled phase must resolve an image. `network` and `networks`
-are accepted as aliases; normalized configuration stores `networks`.
+The run-level `hermetic` object only sets defaults. It doesn't turn on container execution. A phase with `hermetic: false`, or no `hermetic` field, runs on the host. An enabled phase must resolve an image.
 
-- `runtime` is the executable used to launch the container, such as `docker`
-  or `podman`.
-- `image` is required for an enabled phase.
-- An empty `network`/`networks` list becomes runtime network `none`. Named
-  networks are an explicit allow-list; `none` cannot be combined with another
-  network.
-- `env` contains host environment variable names that may be forwarded when
-  present. Values are not copied into saved configuration or snapshots.
-- `secrets` contains required host environment variable names. Missing secrets
-  fail closed, and secrets may only be declared on the `publish` phase.
+- `runtime`: the executable that launches the container, such as `docker` or `podman`.
+- `image`: required for an enabled phase.
+- `network` (alias `networks`; stored as `networks`): an empty list becomes runtime network `none`. Named networks form an explicit allow-list. `none` can't be combined with another network.
+- `env`: names of host environment variables to forward when they're set. Values are never copied into saved configuration or snapshots.
+- `secrets`: names of host environment variables that must exist. A missing secret fails the run. Secrets can only be declared on the `publish` phase.
 
-The runtime executable must be available to the host, and the image must be
-available locally or pullable by that runtime. The image must contain the
-executable and dependencies required by the selected agent adapter or gate
-command. Custom adapters do not need a container-specific command format:
-aloop wraps their returned command and arguments.
+The runtime must be installed on the host, and the image must be available locally or pullable. It must contain everything the selected agent adapter or gate command needs. Custom adapters need no container-specific command format, because aloop wraps whatever command and arguments they return.
 
 ## Phase boundaries
 
-For agent and gate phases, the runtime receives the command with its absolute
-working directory unchanged, so the host paths are bind-mounted at the same
-paths inside the container.
+For agent and gate phases, the command keeps its absolute working directory. Host paths are bind-mounted at the same paths inside the container.
 
-- A `write-worktree` agent receives the worktree read-write, plus its required
-  run and task-file artifact directories read-write.
-- A `read-only` agent receives the worktree read-only for inspection, a
-  disposable read-only source snapshot, and writable run artifacts. This
-  preserves the artifact-only behavior described in [Agentic loop
-  runner](loop.md#phase-permissions).
-- A gate receives the worktree read-only and the run directory read-write.
-  Each configured gate command is wrapped separately.
-- `setup` commands, operational subcommands, and the runtime launcher itself
-  remain host processes.
+- A `write-worktree` agent gets the worktree read-write, plus its run and task-file artifact directories read-write.
+- A `read-only` agent gets the worktree read-only, a disposable read-only source snapshot, and writable run artifacts. This keeps the artifact-only behavior described in the [loop guide](loop.md#phase-permissions).
+- A gate gets the worktree read-only and the run directory read-write. Each gate command is wrapped separately.
+- `setup` commands, operational subcommands, and the runtime launcher stay on the host.
 
-The `publish` phase is driver-owned and is not run inside the configured
-runtime. Its hermetic settings apply an environment allow-list to Git push,
-remote-SHA verification, and the built-in GitHub `gh` or GitLab `glab` backend.
-This is where declared publish credentials can be used without exposing them
-to agent phases. In-process custom backend objects are rejected when hermetic
-publish filtering is enabled because arbitrary backend code cannot be given a
-reliable process-level credential boundary.
+The `publish` phase is owned by the driver and doesn't run inside the container. Its hermetic settings apply an environment allow-list to Git push, remote-SHA verification, and the built-in GitHub (`gh`) or GitLab (`glab`) backend. That's where declared publish credentials get used, without being exposed to agent phases. In-process custom backend objects are rejected when hermetic publish filtering is on, because arbitrary backend code can't be given a reliable credential boundary.
 
-## Network and credential behavior
+## Network and credentials
 
-No network is available to an enabled agent or gate unless its phase declares a
-runtime network. This is independent of the phase permission level: permissions
-control mounted paths and worktree writes, while hermetic settings control the
-runtime boundary and environment.
+An enabled agent or gate has no network unless its phase declares one. This is separate from the phase permission level. Permissions control mounted paths and worktree writes. Hermetic settings control the runtime boundary and environment.
 
-Only `PATH` and declared environment names are passed to a hermetic command.
-Secret names are required to exist in the host environment before publish
-starts, and only their values plus other declared environment values are
-forwarded. Secret values are not written to logs, manifests, or snapshots.
+A hermetic command receives only `PATH` and the environment names you declared. Secrets must exist in the host environment before publish starts. Their values, along with other declared values, are forwarded, and never written to logs, manifests, or snapshots.
 
 ## Run evidence
 
-The immutable `snapshot.json` records the configured runtime, default image,
-and each phase's enabled state and resolved runtime, image, network, environment,
-and secret-name policies. Agent and gate manifest entries also include their
-effective execution policy (`host` or the resolved hermetic settings). These
-records describe the boundary without persisting environment values.
+The immutable `snapshot.json` records the runtime, the default image, and each phase's enabled state and resolved runtime, image, network, environment, and secret-name policies. Agent and gate manifest entries also record their effective execution policy: `host`, or the resolved hermetic settings. None of these records contain environment values.
 
-Hermetic settings are resolved when configuration loads and are retained by
-the run snapshot for resume and audit. Changing the configuration does not
-rewrite an existing snapshot; use the documented resume configuration override
-when intentionally changing a saved run's configuration.
+Hermetic settings are resolved when configuration loads, and the run snapshot keeps them for resume and audit. Changing the configuration doesn't rewrite an existing snapshot. To change a saved run's configuration on purpose, use the documented resume configuration override.

@@ -5,101 +5,69 @@ description: How aloop separates CLI composition, phase execution, policy, repor
 
 # Architecture and module boundaries
 
-aloop keeps deterministic workflow control in the driver and delegates judgment
-to configured agent CLIs. The public CLI behavior, configuration, phase
-contracts, and persisted run artefacts are documented in the other guides; this
-page describes the source-level boundaries that maintain that behavior.
+The driver controls the workflow deterministically. Configured agent CLIs supply the judgment. Other guides cover the public CLI, configuration, phase contracts, and saved run artefacts. This page covers the source-level boundaries behind them.
 
 ## Pipeline orchestration
 
-`src/pipeline.mjs` is the composition root. It parses and validates a run,
-loads configuration and saved state, creates the shared run context, and wires
-the concrete operations used to execute phases. It also retains the
-implementation-specific agent, gate, review-repair, manifest, and budget
-operations that the runner invokes.
+`src/pipeline.mjs` is the composition root. It parses and validates a run, loads configuration and saved state, builds the shared run context, and wires up the operations that execute phases. It also holds the implementation-specific agent, gate, review-repair, manifest, and budget operations.
 
-`src/runner.mjs` owns the phase workflow. Given normalized phase descriptors
-and injected operations, it handles phase selection and resume skipping,
-interactive confirmation, clean-tree and publishing guards, retries, verdict
-and standalone-gate repair rounds, checkpoints, and completion or stall
-reporting. Keeping this control flow independent of the concrete operations
-makes descriptor-driven workflow changes easier to reason about without moving
-CLI setup or persistence details.
+`src/runner.mjs` owns the phase workflow. Given normalized phase descriptors and injected operations, it handles:
+
+- phase selection and skipping on resume;
+- interactive confirmation;
+- clean-tree and publishing guards;
+- retries, and verdict and standalone-gate repair rounds;
+- checkpoints, and completion or stall reporting.
+
+Because this control flow doesn't depend on the concrete operations, you can change the workflow through descriptors without touching CLI setup or persistence.
 
 ## Deterministic policy
 
-`src/policy.mjs` contains decisions that must remain deterministic rather than
-being left to an agent prompt:
+`src/policy.mjs` holds decisions that must not be left to an agent prompt:
 
-- whether a configured phase may be skipped interactively;
-- agent-phase postconditions such as a clean tree, an advanced or unchanged
-  `HEAD`, and a repair rebuttal when required; and
-- the publication attestation that binds the current `HEAD` to a preceding
-  passing gate and an approved review.
+- whether a configured phase can be skipped interactively;
+- agent-phase postconditions: a clean tree, `HEAD` advanced or unchanged as required, and a repair rebuttal when one is required;
+- the publication attestation, which ties the current `HEAD` to a passing gate and an approved review.
 
-The user-facing rules and failure behavior are in [Agentic loop
-runner](loop.md#phases) and [Publishing](publishing.md), which are the sources
-of truth when changing a workflow contract.
+The user-facing rules and failure behavior live in the [loop guide](loop.md#phases) and [Publishing](publishing.md). Treat those as the source of truth when you change a workflow contract.
 
-## Commands, terminal interaction, and worktrees
+## Commands, terminal, and worktrees
 
-`src/command.mjs` owns child-process invocation, output capture, timeout
-termination, active-process bookkeeping, and platform-specific executable
-resolution. The supported host behavior is documented in [Platform
-support](platform.md).
+`src/command.mjs` runs child processes. It captures output, terminates on timeout, tracks active processes, and resolves executables per platform. See [Platform support](platform.md).
 
-`src/reporter.mjs` owns terminal-facing concerns: progress banners, phase and
-summary formatting, terminal confirmation input, and final reporting. It does
-not decide which phases execute. Its `banner`/`log` calls fan out to whichever
-renderer is active, which is how `src/tui.mjs` — the live-dashboard renderer
-described in [Agentic loop runner](loop.md) — slots in as a second renderer
-without `runner.mjs` or `pipeline.mjs` knowing which one is live.
-`src/quiet.mjs` is the third: the [quiet mode](loop.md#quiet-mode) renderer,
-which drops raw engine, gate, and setup output from the terminal and prints
-phase transitions, `log` lines, and a periodic heartbeat. `pipeline.mjs`
-selects at most one alternate renderer per run (quiet takes precedence over
-the TUI) and stops it before the final `report`, which always prints as plain
-text.
+`src/reporter.mjs` handles everything the terminal sees: progress banners, phase and summary formatting, confirmation input, and the final report. It doesn't decide which phases run. Its `banner` and `log` calls go to whichever renderer is active, so other renderers plug in without `runner.mjs` or `pipeline.mjs` knowing which one is live:
 
-`src/worktree.mjs` owns worktree planning, creation, and resume validation. It
-checks a saved worktree through Git before resuming rather than silently
-substituting another checkout. The persisted-worktree and recovery contract is
-documented in [Run state and recovery](run-state.md).
+- `src/tui.mjs` is the live dashboard described in the [loop guide](loop.md).
+- `src/quiet.mjs` is the [quiet mode](loop.md#quiet-mode) renderer. It drops raw engine, gate, and setup output and prints phase transitions, `log` lines, and a periodic heartbeat.
+
+`pipeline.mjs` picks at most one alternate renderer per run (quiet wins over the TUI) and stops it before the final `report`, which is always plain text.
+
+`src/worktree.mjs` plans and creates worktrees and validates them on resume. It checks a saved worktree through Git instead of quietly substituting another checkout. See [Run state and recovery](run-state.md).
 
 ## Static contracts
 
-The runtime remains ESM JavaScript. `tsconfig.json` runs TypeScript in strict,
-no-emit JSDoc-checking mode over the production modules, CLI, and tests. The
-shared contracts are declared in `src/types.d.ts`; importing them in JSDoc with
-`import('./types.js')` adds no runtime dependency or emitted output.
+The runtime is ESM JavaScript. `tsconfig.json` runs TypeScript in strict, no-emit mode, checking JSDoc across the production modules, CLI, and tests. Shared contracts live in `src/types.d.ts`. Import them in JSDoc with `import('./types.js')`. This adds no runtime dependency and no output.
 
-Use those shared contracts when a value crosses a module boundary, such as a
-phase descriptor, adapter, resolved configuration, run state, manifest entry,
-or review verdict. Keep implementation-specific local shapes local rather than
-growing the shared declaration file preemptively. Files marked `// @ts-nocheck`
-remain deliberately outside the checker while they are incrementally typed;
-do not remove that marker without making the file pass the configured strict
-check. Type-only fixtures in `test/type-contracts.test.mjs` exercise the
-contracts with valid examples and expected invalid assignments.
+Use the shared contracts for values that cross a module boundary: a phase descriptor, adapter, resolved configuration, run state, manifest entry, or review verdict. Keep local shapes local, and don't grow the shared file ahead of need. Files marked `// @ts-nocheck` are deliberately outside the checker while they're typed step by step. Don't remove the marker unless the file passes the strict check. `test/type-contracts.test.mjs` checks the contracts with valid examples and expected invalid assignments.
 
-Run `npm run typecheck` after changing the shared declarations, JSDoc imports,
-or a checked JavaScript file. Continuous integration runs the same command
-before the test suite.
+Run `npm run typecheck` after changing the shared declarations, JSDoc imports, or a checked file. CI runs it before the tests.
 
-## Related components
+## Related modules
 
-The surrounding modules provide the boundaries used by the orchestration layer:
-configuration normalization (`src/config.mjs`), hermetic runtime policy
-(`src/hermetic.mjs`), agent adapters (`src/adapters.mjs`), Git operations
-(`src/git.mjs`), prompts (`src/prompts.mjs`), durable state (`src/state.mjs`),
-and review verdicts (`src/verdict.mjs`). Consult the focused operational guides
-before changing their externally visible contracts:
+These modules support the orchestration layer:
 
-- [Agentic loop runner](loop.md) for configuration, phase descriptors, prompts,
-  and the manifest.
-- [Hermetic phase execution](hermetic.md) for runtime wrapping, mounts, network
-  policy, environment forwarding, and the snapshot contract.
-- [Run state and recovery](run-state.md) for state, locking, and resumption.
-- [Publishing](publishing.md) for PR-description and publish guarantees.
-- [Operational run commands](operations.md) and [Cost and quality
-  metrics](metrics.md) for persisted-run consumers.
+- `src/config.mjs`: configuration normalization
+- `src/hermetic.mjs`: hermetic runtime policy
+- `src/adapters.mjs`: agent adapters
+- `src/git.mjs`: Git operations
+- `src/prompts.mjs`: prompts
+- `src/state.mjs`: durable state
+- `src/verdict.mjs`: review verdicts
+
+Before you change a contract that users can see, read the matching guide:
+
+- [Agentic loop runner](loop.md): configuration, phase descriptors, prompts, manifest.
+- [Hermetic phase execution](hermetic.md): runtime wrapping, mounts, network policy, environment forwarding, snapshots.
+- [Run state and recovery](run-state.md): state, locking, resuming.
+- [Publishing](publishing.md): PR description and publish guarantees.
+- [Operational run commands](operations.md) and [Cost and quality metrics](metrics.md): tools that read saved runs.

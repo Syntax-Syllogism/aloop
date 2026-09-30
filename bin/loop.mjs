@@ -214,7 +214,7 @@ export function usage() {
     '      --config <path>     Load loop configuration from this file (also overrides saved config on resume)',
     '      --phases a,b,c      Override the configured phase list',
     '      --max-rounds <n>    Cap on review/repair rounds',
-    '      --from <phase>      Start at this phase',
+    '      --from <phase>      Start at this phase (with --resume, re-run it even if complete)',
     '      --preset <name|path> Activate a bundled preset or external preset directory',
     '      --resume            Skip phases already recorded complete',
     '      --note <text>       Give the resumed phase an authoritative instruction',

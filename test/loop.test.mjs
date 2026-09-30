@@ -2705,9 +2705,11 @@ fs.writeFileSync('final-runs', String(attempts));
   console.log = () => {};
   let firstSummary;
   let resumedSummary;
+  let forcedSummary;
   try {
     firstSummary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
     resumedSummary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
+    forcedSummary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'final', yes: true } });
   } finally {
     console.log = original;
     process.exitCode = originalExitCode;
@@ -2717,13 +2719,15 @@ fs.writeFileSync('final-runs', String(attempts));
   assert.equal(firstSummary.stalled.reason, 'budget exhausted: tokens');
   assert.equal(resumedSummary.stalled.phase, 'final');
   assert.equal(resumedSummary.stalled.reason, 'budget exhausted: tokens');
+  assert.equal(forcedSummary.stalled.phase, 'final');
+  assert.equal(forcedSummary.stalled.reason, 'budget exhausted: tokens');
   assert.equal(await readFile(join(root, 'final-runs'), 'utf8'), '1', 'unchanged resume must not rerun the final phase');
 
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   assert.deepEqual(state.data.completed, ['final'], 'terminal budget exhaustion must checkpoint the completed final phase');
   assert.equal(state.data.phases.final.budgetExhausted, true);
   const manifest = JSON.parse(await readFile(join(firstSummary.runDir, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.phases.filter((entry) => entry.phase === 'final').length, 3);
+  assert.equal(manifest.phases.filter((entry) => entry.phase === 'final').length, 4);
   assert.equal(manifest.phases.at(-1).budgetStall, true);
 
   await writeFile(join(root, 'loop.config.mjs'), `export default {
@@ -4059,6 +4063,49 @@ test('a dry-run resume starts from a fresh verdict round', async () => {
   assert.match(output, /none — review the cumulative branch diff/);
 });
 
+test('a dry-run --resume --from previews a completed phase without changing saved state', async () => {
+  const { root, workItem } = await repoFixture({ phases: ['implement', 'docs', 'gate', 'review'] });
+  const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  await state.record({
+    completed: ['implement', 'docs', 'gate', 'review'],
+    rounds: { review: 2 },
+    reviewedShas: { review: { 2: 'abc123' } },
+  });
+  const statePath = join(root, '.loop/runs/ss-demo-feature/state.json');
+  const before = await readFile(statePath, 'utf8');
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'review', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /review \(round 1\/3\)/);
+  assert.doesNotMatch(lines.join('\n'), /implement: already complete, skipping/);
+  assert.equal(await readFile(statePath, 'utf8'), before);
+});
+
+test('implement prompt shows the current platform gate commands', async () => {
+  const { root, workItem } = await repoFixture({ config: `export default {
+  gate: ['echo plain', { posix: 'echo posix', windows: 'echo win' }, { argv: ['node', '-v'] }],
+  phases: ['implement'],
+};
+` });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  const output = lines.join('\n');
+  const platformCommand = process.platform === 'win32' ? 'echo win' : 'echo posix';
+  assert.match(output, new RegExp(`echo plain\\n${platformCommand}\\nnode -v`));
+  assert.doesNotMatch(output, /\[object Object\]/);
+});
+
 test('a dry-run resume does not replay a persisted repair checkpoint', async () => {
   const { root, workItem } = await repoFixture({
     phases: ['gate', 'review', 'address'],
@@ -4517,6 +4564,74 @@ test('a noted completed phase invalidates downstream gate and review attestation
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   assert.equal(state.data.rounds.review, 1, 'the re-run review starts from its first round');
   assert.equal(state.data.reviewedShas.review[1], await git(resumed.worktree, 'rev-parse', 'HEAD'));
+});
+
+test('--resume --from reruns a completed implement phase and clears downstream state without a note', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const gateLog = join(await mkdtemp(join(tmpdir(), 'loop-events-')), 'gates.log');
+  const agentScript = [
+    'prompt=$1',
+    "case \"$prompt\" in *'Take on the role of a senior developer'*)",
+    "  verdict_path=$(printf '%s\\n' \"$prompt\" | sed -n 's/.*write this JSON to `\\([^`]*\\)`.*/\\1/p')",
+    "  printf '%s\\n' '{\"verdict\":\"APPROVED\",\"blocking\":[]}' > \"$verdict_path\"",
+    '  ;;',
+    "*'documentation-as-built pass'*) ;;",
+    "*) if test -f second.txt; then exit 1; elif test -f first.txt; then file=second.txt; else file=first.txt; fi",
+    "   printf implemented > \"$file\"; git add \"$file\" && git commit -m 'feat: implement fixture' >/dev/null ;;",
+    'esac',
+  ].join('\n');
+  const { root, workItem } = await repoFixture({ config: `export default {
+  adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'from-agent', prompt] }; } } },
+  engines: { default: 'mytool' },
+  gate: [${JSON.stringify(`printf 'gate\\n' >> ${gateLog}`)}],
+  phases: ['implement', 'docs', 'gate', 'review'],
+  maxRounds: 1,
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+` });
+
+  const original = console.log;
+  console.log = () => {};
+  let initial;
+  let resumed;
+  try {
+    initial = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+    const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+    await state.record({
+      pendingRepairs: { review: { round: 1 } },
+      phaseBaselines: { review: 'old-baseline' },
+    });
+    resumed = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'implement', yes: true } });
+  } finally {
+    console.log = original;
+  }
+
+  assert.equal(initial.stalled, null);
+  assert.equal(resumed.stalled, null);
+  assert.deepEqual(resumed.phases.map((phase) => phase.name), ['implement', 'docs', 'gate', 'review']);
+  assert.deepEqual((await readFile(gateLog, 'utf8')).trim().split('\n'), ['gate', 'gate']);
+  const manifest = JSON.parse(await readFile(join(resumed.runDir, 'manifest.json'), 'utf8'));
+  for (const phase of ['implement', 'docs', 'gate', 'review']) {
+    assert.equal(manifest.phases.filter((entry) => entry.phase === phase && entry.status === 'completed').length, 2);
+    assert.equal(manifest.phases.filter((entry) => entry.phase === phase && entry.status === 'skipped').length, 0);
+  }
+  const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
+  assert.equal(state.data.rounds.review, 1);
+  assert.equal(state.data.pendingRepairs.review, undefined);
+  assert.equal(state.data.phaseBaselines.review, undefined);
+
+  console.log = () => {};
+  try {
+    const reviewOnly = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'review', yes: true } });
+    assert.equal(reviewOnly.stalled, null);
+    assert.deepEqual(reviewOnly.phases.map((phase) => phase.name), ['review']);
+  } finally {
+    console.log = original;
+  }
+  const afterReviewOnly = JSON.parse(await readFile(join(resumed.runDir, 'manifest.json'), 'utf8'));
+  assert.equal(afterReviewOnly.phases.filter((entry) => entry.phase === 'review' && entry.status === 'completed').length, 3);
+  assert.equal(afterReviewOnly.phases.filter((entry) => entry.phase === 'implement' && entry.status === 'completed').length, 2);
+  assert.deepEqual((await readFile(gateLog, 'utf8')).trim().split('\n'), ['gate', 'gate']);
 });
 
 test('a noted review rerun clears nested repair baselines before addressing findings', async () => {

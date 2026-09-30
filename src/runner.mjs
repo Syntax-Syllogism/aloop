@@ -539,8 +539,8 @@ export async function runPhases({
   }
   for (const [phaseIndex, phase] of phasesToRun.entries()) {
     const isFinalPhase = phaseIndex === phasesToRun.length - 1;
-    const forceNotedPhase = args.resume && args.from === phase.name && ctx.note?.targetPhase === phase.name;
-    if (args.resume && state.data.phases?.[phase.name]?.budgetExhausted && !forceNotedPhase) {
+    const forcedFromPhase = args.resume && args.from === phase.name;
+    if (args.resume && state.data.phases?.[phase.name]?.budgetExhausted && !forcedFromPhase) {
       const budget = budgetStatus(ctx);
       if (budget) {
         summary.stalled = await recordBudgetStall(ctx, phase, budget);
@@ -551,7 +551,7 @@ export async function runPhases({
       summary.phases.push({ name: phase.name, ok: true });
       continue;
     }
-    if (args.resume && state.isComplete(phase.name) && !forceNotedPhase) {
+    if (args.resume && state.isComplete(phase.name) && !forcedFromPhase) {
       log(`\n── ${phase.name}: already complete, skipping`);
       await recordManifest(ctx, manifestEntry(phase, ctx, { status: 'skipped' }));
       continue;
@@ -588,7 +588,7 @@ export async function runPhases({
         continue;
       }
     }
-    if (forceNotedPhase) {
+    if (forcedFromPhase) {
       await invalidateFollowingPhaseState(state, config.resolvedPhases, phase.name);
     }
     await state.enterPhase(phase.name);
@@ -695,7 +695,7 @@ export async function runPhases({
       continue;
     }
     const headBefore = await phaseHeadBefore(phase, ctx);
-    if (!ctx.dryRun && args.resume && requiresCommitBaseline(phase) && !forceNotedPhase) {
+    if (!ctx.dryRun && args.resume && requiresCommitBaseline(phase) && !forcedFromPhase) {
       const stalledReason = await codePhasePostcondition(phase, ctx, { headBefore });
       if (!stalledReason) {
         const outputSha = await ctx.git.revParse();

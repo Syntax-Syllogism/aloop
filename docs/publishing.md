@@ -5,16 +5,12 @@ description: How aloop hands off a pull-request description and verifies driver-
 
 # Publishing
 
-The default pipeline separates PR writing from remote mutation:
+The default pipeline keeps writing the PR separate from changing the remote:
 
-1. `pr-description` is an agent phase. It inspects the committed work and
-   writes only `{{RUN_DIR}}/pr.md`.
-2. `publish` is a driver phase. It verifies the clean, approved tree, pushes
-   the configured branch, and creates or updates the pull request through the
-   configured backend.
+1. `pr-description` is an agent phase. It inspects the committed work and writes only `{{RUN_DIR}}/pr.md`.
+2. `publish` is a driver phase. It verifies the clean, approved tree, pushes the configured branch, and creates or updates the pull request through the configured backend.
 
-The description file must begin with a one-line title, a blank line, and a
-non-empty body. The shipped prompt asks for a body of fewer than 250 words:
+The description file starts with a one-line title, then a blank line, then a non-empty body. The shipped prompt asks for a body under 250 words:
 
 ```text
 Title: Add request tracing
@@ -23,37 +19,23 @@ Summarizes the implementation, validation, review outcome, and deliberate
 out-of-scope work.
 ```
 
-The description phase must not commit, push, or call a pull-request service.
-Its clean-tree and unchanged-`HEAD` postconditions make the handoff
-deterministic.
+The description phase must not commit, push, or call a pull-request service. Its postconditions, a clean tree and an unchanged `HEAD`, keep the handoff deterministic.
 
 ## Publish safeguards
 
-Before the driver mutates a remote, it requires:
+Before the driver changes a remote, it requires:
 
 - a clean worktree;
-- a current `HEAD` matching the latest approved review SHA; and
-- a passing gate receipt for that same SHA before the approval.
+- a current `HEAD` that matches the latest approved review SHA;
+- a passing gate receipt for that same SHA, dated before the approval.
 
-Publishing then runs the backend precheck, pushes with upstream tracking and
-without force, and reads the remote branch SHA. A mismatch with the approved
-SHA stalls the run before PR creation or update. The driver then looks up the
-branch's existing PR, updates it when present or creates one when absent, and
-performs a final lookup.
+Then it runs the backend precheck, pushes with upstream tracking and no force, and reads the remote branch SHA. If that SHA differs from the approved one, the run stalls before any PR is created or updated. Otherwise the driver looks up the branch's existing PR, updates it or creates one, and looks it up once more.
 
-The final PR must report the configured base branch, approved head SHA, draft
-state, URL, and numeric PR number. Any missing or mismatched value stalls the
-run. A stalled publish phase remains incomplete, so `--resume` retries it with
-the existing run artifacts and commits intact.
+The final PR must report the configured base branch, the approved head SHA, the draft state, a URL, and a numeric PR number. A missing or mismatched value stalls the run. A stalled publish phase stays incomplete, so `--resume` retries it with the existing run artifacts and commits intact.
 
 ## GitHub backend
 
-The default backend is GitHub through the authenticated `gh` CLI. Its precheck
-resolves the configured Git remote to a GitHub repository and runs `gh auth
-status`. Every PR inspection, creation, and update command is bound to that
-repository with `--repo`, so a repository with multiple remotes still uses the
-configured `remote`. `publish.draft` defaults to `true`; set it to `false` when
-the PR should be created as ready for review.
+GitHub is the default, through the signed-in `gh` CLI. The precheck resolves the configured Git remote to a GitHub repository and runs `gh auth status`. Every PR lookup, creation, and update is bound to that repository with `--repo`, so a repository with several remotes still uses the configured `remote`. `publish.draft` defaults to `true`. Set it to `false` to create PRs that are ready for review.
 
 ```js
 export default {
@@ -63,41 +45,26 @@ export default {
 };
 ```
 
-GitHub publishing needs network access and an authenticated `gh` installation.
-Use `aloop doctor` to check the local CLI prerequisites before a real run.
+You need network access and a signed-in `gh`. Run `aloop doctor` before a real run to check the local CLI prerequisites.
 
 ## GitLab backend
 
-Set `publish.backend` to `'gitlab'` to use the bundled transport backed by the
-authenticated `glab` CLI:
+Set `publish.backend` to `'gitlab'` to use the bundled transport, which relies on the signed-in `glab` CLI:
 
 ```js
 publish: { backend: 'gitlab', draft: true }
 ```
 
-The backend resolves the GitLab host and full project path from the configured
-Git remote. HTTPS, SSH, scp-style remotes, nested groups, and self-hosted
-instances with ports are supported. Its precheck runs `glab auth status` for
-the resolved host, and publishing uses `--repo https://<host>/<project>` so the
-configured `remote` selects the repository. The final merge request is
-verified against the configured target branch, approved head SHA, URL, IID,
-and draft state.
+The backend finds the GitLab host and full project path from the configured Git remote. It handles HTTPS, SSH, scp-style remotes, nested groups, and self-hosted instances with ports. The precheck runs `glab auth status` for that host. Publishing uses `--repo https://<host>/<project>`, so the configured `remote` picks the repository. The final merge request is checked against the target branch, approved head SHA, URL, IID, and draft state.
 
-GitLab drafts use both the native draft flag and the `Draft:` title convention;
-an existing `Draft:` or `WIP:` prefix is not duplicated. Setting
-`publish.draft` to `false` removes either prefix from the title and uses
-GitLab's `--ready` update option. `glab` must be installed and authenticated;
-the publish precheck fails before pushing when it is unavailable or
-unauthenticated.
+GitLab drafts use both the native draft flag and the `Draft:` title prefix. An existing `Draft:` or `WIP:` prefix isn't duplicated. With `publish.draft: false`, either prefix is removed from the title and the update uses GitLab's `--ready` option. `glab` must be installed and signed in. If it isn't, the precheck fails before anything is pushed.
 
-For REST, MCP, or another GitLab client, import `gitlabBackend` and inject a
-transport. The transport receives GitLab-native values and the backend maps
-merge requests to aloop's verified pull-request shape:
+For a REST, MCP, or other GitLab client, import `gitlabBackend` and inject a transport. The transport works in GitLab's own terms, and the backend maps merge requests to aloop's verified pull-request shape:
 
-| Method | Required context/result |
+| Method | Context in, result out |
 | --- | --- |
-| `checkAuth` | `{ host }` → resolves or throws |
-| `getMergeRequest` | `{ host, project, branch }` → `{ iid, web_url, target_branch, sha, draft }` (or legacy `work_in_progress`) or `null` |
+| `checkAuth` | `{ host }`. Resolves or throws. |
+| `getMergeRequest` | `{ host, project, branch }`. Returns `{ iid, web_url, target_branch, sha, draft }` (or legacy `work_in_progress`), or `null`. |
 | `createMergeRequest` | `{ host, project, sourceBranch, targetBranch, title, description, descriptionFilePath, draft }` |
 | `updateMergeRequest` | `{ host, project, iid, branch, title, description, descriptionFilePath, draft }` |
 
@@ -118,8 +85,7 @@ export default {
 
 ## Custom backends
 
-Set `publish.backend` to an object to use another service. The object must
-provide all four operations; the driver passes these context objects:
+To use another service, set `publish.backend` to an object with all four operations. The driver passes these contexts:
 
 ```js
 {
@@ -130,14 +96,6 @@ provide all four operations; the driver passes these context objects:
 }
 ```
 
-`view` returns the existing PR or `null` when none exists. After `create` or
-`update`, the final `view` result must contain `url`, integer `number`,
-`baseRefName`, `headRefOid`, and boolean `isDraft` values that match the
-configured base, approved SHA, and draft setting. `bodyFilePath` points to a
-temporary body-only file in the run directory; the driver removes it after the
-operation. Backends may use either `body` or that file path.
+`view` returns the existing PR, or `null` if there isn't one. After `create` or `update`, the final `view` result must contain `url`, an integer `number`, `baseRefName`, `headRefOid`, and a boolean `isDraft`. They must match the configured base, the approved SHA, and the draft setting. `bodyFilePath` points to a temporary body-only file in the run directory, which the driver removes afterward. A backend can use either `body` or that path.
 
-Publishing results are retained in `manifest.json` on the `publish` phase,
-including `approvedSha`, `remoteSha`, `prUrl`, and the verified `pullRequest`
-object. The successful URL is also shown by the run report and read-only
-operations such as `aloop status` and `aloop inspect --json`.
+The publish result is kept in `manifest.json` on the `publish` phase: `approvedSha`, `remoteSha`, `prUrl`, and the verified `pullRequest` object. The URL also appears in the run report and in `aloop status` and `aloop inspect --json`.

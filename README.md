@@ -1,44 +1,29 @@
 # aloop
 
-`@syntax-syllogism/aloop` is an engine-agnostic agentic loop runner. It drives
-a task through file-based implementation, deterministic checks, review, repair,
-documentation, and publishing phases. The driver owns control flow; configured agent
-CLIs provide judgment in fresh processes.
+`@syntax-syllogism/aloop` runs an AI coding task through a repeatable loop: implement, check, review, repair, document, and publish. The runner controls the flow. The agent CLIs you configure (Claude, Codex, and others) do the thinking, each in a fresh process.
 
 ## Install
 
 ```sh
 npm install --global @syntax-syllogism/aloop
-# or run without a global install
+# or run it without installing
 npx @syntax-syllogism/aloop --help
 ```
 
-The package is published to the public npm registry and needs no private
-registry configuration.
+The package is on the public npm registry. You don't need any registry setup.
 
 ## Platform support
 
-Linux and macOS are supported, and so is Windows, in two fully supported
-modes:
+Linux, macOS, and Windows are supported. On Windows you can use either of two modes:
 
-- **Git Bash** — launch aloop from a Git Bash (Git for Windows) terminal.
-  `sh.exe` on `PATH` runs setup/gate command *strings* exactly as on POSIX.
-- **Native PowerShell** — no POSIX shell required. Setup/gate commands run
-  under PowerShell 7+ (`pwsh`), falling back to Windows PowerShell
-  (`powershell.exe`); override with `shell:` in the config. Command strings
-  that use POSIX-only syntax (`&&` with `$VAR`, `[[ ]]`, `2>&1`, single-quote
-  semantics) are not portable to PowerShell as-is — use the `argv` or
-  per-platform command forms below for anything beyond a single portable
-  binary invocation.
+- **Git Bash.** Start aloop from a Git for Windows terminal. `sh.exe` on `PATH` runs setup and gate command strings exactly as on POSIX.
+- **Native PowerShell.** No POSIX shell needed. Commands run under PowerShell 7+ (`pwsh`), or Windows PowerShell (`powershell.exe`) if that's missing. Set `shell:` in the config to override. Command strings that use POSIX-only syntax (`&&` with `$VAR`, `[[ ]]`, `2>&1`, single-quote rules) won't run unchanged in PowerShell. For anything beyond one simple command, use the `argv` or per-platform forms described below.
 
-WSL works as Linux. Interactive confirmations use a TTY when available, and
-otherwise the Windows console (`CONIN$`) under Git Bash. Use `--yes` for
-unattended or piped runs when no console input is available. See
-[`docs/platform.md`](docs/platform.md) for the full platform reference.
+WSL works as Linux. Confirmations use a TTY when there is one, or the Windows console (`CONIN$`) under Git Bash. If neither is available, for example in a piped run, pass `--yes`. See [`docs/platform.md`](docs/platform.md) for details.
 
 ## Quick start
 
-From a git repository, create the editable configuration and prompt overrides:
+In a git repository, create an editable config and prompt overrides:
 
 ```sh
 aloop init
@@ -51,40 +36,33 @@ aloop --task "Add request tracing" --name request-tracing
 aloop --task-file plan.md
 ```
 
-Inspect the rendered plan first with `aloop --task "..." --name example
---dry-run`. A terminal run asks for confirmation before each phase. Use `-y`
-only after the configured engines and workflow have been proven for the task
-shapes you intend to automate. Required phases cannot be skipped interactively:
-declining one asks you to run it or quit. `docs` is optional by default; see
-[`docs/loop.md`](docs/loop.md#phases) for custom-phase rules and the full phase
-reference.
+To see the rendered plan first, add `--dry-run`:
+
+```sh
+aloop --task "..." --name example --dry-run
+```
+
+In a terminal, aloop asks for confirmation before each phase. Pass `-y` only after you've seen the engines and workflow work well for the kinds of tasks you want to automate. You can't skip a required phase interactively. If you decline one, aloop asks whether to run it or quit. `docs` is optional by default. See [`docs/loop.md`](docs/loop.md#phases) for the phase reference and the rules for custom phases.
 
 ## How the loop works
 
-The default pipeline is:
+The default pipeline:
 
-1. `implement` — make the requested change in an isolated git worktree.
-2. `docs` — update documentation when the implementation requires it.
-3. `gate` — run deterministic commands such as `npm test`.
-4. `review` — write a machine-readable verdict JSON file.
-5. `address` — repair blocking findings, then repeat the gate and review up to
-   the configured round limit.
-6. `pr-description` — author the title and body in the run directory.
-7. `publish` — push and verify the attested branch, then create or update a
-   draft pull request.
+1. `implement`: make the change in an isolated git worktree.
+2. `docs`: update documentation if the change needs it.
+3. `gate`: run deterministic checks such as `npm test`.
+4. `review`: write a machine-readable verdict file.
+5. `address`: fix blocking findings, then repeat the gate and review, up to the round limit.
+6. `pr-description`: write the pull request title and body in the run directory.
+7. `publish`: push and verify the branch, then create or update a draft pull request.
 
-Phases communicate through files rather than shared agent sessions. A review
-verdict has the shape `{ verdict, summary, blocking, nits }`; malformed verdicts
-fail closed. The runner never merges a branch and never treats an agent's prose
-as a deterministic test result. Each real run also records the repository SHAs,
-rendered prompt and configuration hashes, gate receipts, verdict binding, and
-phase artifacts in its run manifest. See [`docs/loop.md`](docs/loop.md) for the
-complete guide, manifest schema, and verdict contract.
+Phases pass work to each other through files, not shared agent sessions. A review verdict looks like `{ verdict, summary, blocking, nits }`, and a malformed one fails closed. The runner never merges a branch, and it never mistakes an agent's prose for a test result.
+
+Every real run also records what it needs to be audited: repository SHAs, hashes of the rendered prompts and configuration, gate receipts, verdict binding, and phase artifacts, all in the run manifest. See [`docs/loop.md`](docs/loop.md) for the full guide, the manifest schema, and the verdict contract.
 
 ## Configuration
 
-`aloop init` creates a commented `loop.config.mjs` in the repository being
-operated on. Adjust it as needed; for example, a configuration can be:
+`aloop init` creates a commented `loop.config.mjs` in the repository you're working on. Edit it as needed. For example:
 
 ```js
 export default {
@@ -101,36 +79,24 @@ export default {
 };
 ```
 
-A bare string such as `'npm test'` runs through the shell (`sh` on POSIX, or
-the native Windows shell — see above) and is not portable to a host that
-lacks that shell. To write a single `gate`/`setup`/`phase.commands` config
-that runs unchanged on POSIX and native Windows, use the structured forms:
+A plain string like `'npm test'` runs through the shell (`sh` on POSIX, the native shell on Windows), so it isn't portable to a machine without that shell. To write one `gate`, `setup`, or `phase.commands` entry that runs unchanged on POSIX and native Windows, use the structured forms:
 
 ```js
 export default {
-  // No shell at all — the portable default for a single command with no
+  // No shell at all. The portable choice for a single command with no
   // pipes, `&&`, or shell expansion.
   setup: [{ argv: ['npm', 'ci'] }],
-  // Per-platform variants for anything that needs shell syntax.
+  // Per-platform variants, for anything that needs shell syntax.
   gate: [{ posix: 'npm test 2>&1', windows: 'npm test *>&1' }],
-  shell: 'pwsh', // optional; overrides the auto-detected native shell
+  shell: 'pwsh', // optional; overrides the detected native shell
 };
 ```
 
-A per-platform entry that omits the variant needed on the current host (for
-example, only `posix` on a native Windows run) fails at config-load time with
-an error naming the offending phase and command index.
+If a per-platform entry lacks the variant for the current host (say, only `posix` on native Windows), config loading fails with an error that names the phase and command index.
 
-Supported built-in engines are `claude`, `codex`, `agy`, and `gemini`. The
-corresponding CLI must already be installed and authenticated. Engine
-descriptors may include an engine-specific `model` and `effort` (Gemini has no
-effort tier, so a configured `effort` is ignored for it). `--config` selects a configuration
-file outside the current repository; command-line phase and round options take
-precedence.
+The built-in engines are `claude`, `codex`, `agy`, and `gemini`. The matching CLI must already be installed and signed in. An engine can set its own `model` and `effort`. Gemini has no effort setting, so aloop ignores `effort` for it. Use `--config` to load a config file from outside the repository. Command-line phase and round options override the config.
 
-GitLab publishing is also bundled: set `publish: { backend: 'gitlab', draft:
-true }` to use the authenticated `glab` CLI. For a REST or MCP integration,
-import `gitlabBackend` and inject the small GitLab-native transport port:
+GitLab publishing is built in too. Set `publish: { backend: 'gitlab', draft: true }` to use the signed-in `glab` CLI. For a REST or MCP integration, import `gitlabBackend` and pass in a small GitLab transport:
 
 ```js
 import { gitlabBackend } from '@syntax-syllogism/aloop';
@@ -141,51 +107,32 @@ export default { publish: { backend: gitlabBackend({ transport: myMcpTransport }
 
 ### Bring your own engine
 
-Register an adapter under `adapters` when another CLI should run a phase. Its
-`command({ prompt, cwd, addDirs, permissions, artifactOnly, agent })` function
-returns `{ command, args }`. For a read-only phase, `cwd` is a disposable
-read-only source snapshot of the saved worktree and `addDirs` contains only
-writable artifact roots. The runner supplies a permission level and restricts
-`addDirs` accordingly; the adapter must translate `permissions` into its own
-read-only or write-capable invocation flags. It may also provide `efforts`
-validation and `createRenderer()` for streaming output. Custom adapter flags
-are vendor-specific and are not verified by aloop. See the [phase permission
-contract](docs/loop.md#phase-permissions) before enabling unattended runs.
+To run a phase with another CLI, register an adapter under `adapters`. Its `command({ prompt, cwd, addDirs, permissions, artifactOnly, agent })` function returns `{ command, args }`.
+
+For a read-only phase, `cwd` is a disposable read-only snapshot of the saved worktree, and `addDirs` holds only the writable artifact folders. The runner sets the permission level. Your adapter has to turn `permissions` into the right read-only or write-capable flags for its CLI. It can also provide `efforts` validation and `createRenderer()` for streaming output. aloop doesn't verify a custom adapter's vendor-specific flags. Read the [phase permission contract](docs/loop.md#phase-permissions) before you enable unattended runs.
 
 ## Prompt overrides and the work-item preset
 
-Copy a phase prompt to `.loop/prompts/<phase>.md` to override only that phase.
-Templates use the variables documented in `docs/loop.md` and fail if a
-placeholder is unresolved.
+To change one phase's prompt, copy it to `.loop/prompts/<phase>.md`. Templates use the variables listed in `docs/loop.md`, and a run fails if any placeholder is left unresolved.
 
-For repositories using Markdown work items, install the bundled preset:
+If your repository uses Markdown work items, use the bundled preset:
 
 ```sh
 aloop --preset work-item --task-file ./work-items/example.md
 ```
 
-You can set `preset: 'work-item'` in `loop.config.mjs` to opt in for every run.
-The runtime preset activates the packaged prompt overrides without copying
-them into `.loop/prompts/`; project prompt files still win per file. Use
-`aloop init --preset work-item` when you want an editable copy of the sample
-configuration and prompts. See [`docs/loop.md`](docs/loop.md#configuration) for
-precedence, external preset paths, and resume behavior.
+Set `preset: 'work-item'` in `loop.config.mjs` to use it on every run. The preset activates its prompts at run time without copying them into `.loop/prompts/`, and your own prompt files still win, file by file. For an editable copy of the sample config and prompts, run `aloop init --preset work-item`. See [`docs/loop.md`](docs/loop.md#configuration) for precedence, external preset paths, and resuming.
 
-## Building up to unattended runs
+## Working up to unattended runs
 
-Use this progression:
-
-1. Render prompts with `--dry-run`.
-2. Watch one representative task through every phase.
-3. Exercise the review loop with `--max-rounds 2`.
-4. Add `-y` only for task shapes whose behavior is already understood.
+1. Render the prompts with `--dry-run`.
+2. Watch one typical task go through every phase.
+3. Try the review loop with `--max-rounds 2`.
+4. Add `-y` only for task shapes whose behavior you already understand.
 
 ## Evaluation harness
 
-`aloop-eval <spec.mjs>` runs a task corpus across a model/config matrix, each
-cell in its own throwaway repository, and reports completion, escaped
-defects, convergence, and cost per cell and per config. See
-[`docs/eval.md`](docs/eval.md) for the spec file shape and reported fields.
+`aloop-eval <spec.mjs>` runs a set of tasks across a matrix of models and configs. Each cell gets its own throwaway repository. It reports completion, escaped defects, convergence, and cost for each cell and each config. See [`docs/eval.md`](docs/eval.md) for the spec file and the reported fields.
 
 ## Development
 
@@ -197,12 +144,11 @@ npm pack --dry-run
 
 ## Contributing
 
-Issues and contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and
-the [Code of Conduct](CODE_OF_CONDUCT.md).
+Issues and contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+See [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 

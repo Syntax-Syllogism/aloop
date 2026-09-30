@@ -5,125 +5,71 @@ description: How aloop persists, protects, and resumes a run.
 
 # Run state and recovery
 
-For every real run, aloop stores durable artefacts in
-`.loop/runs/<slug>/` in the source repository, rather than in the isolated
-worktree. This makes a stalled run inspectable and resumable even when its
-worktree is later moved or removed. The directory should be ignored by Git.
+Every real run saves durable artefacts in `.loop/runs/<slug>/` in the source repository, not in the isolated worktree. A stalled run stays inspectable and resumable even if its worktree is later moved or removed. Keep this directory out of Git.
 
 ## Artefacts
 
-`state.json` is the runner's checkpoint. It records the run identity, completed
-phases, review-loop progress, resolved branch and worktree, selected prompt
-preset, its original path-resolution directory, and other values needed to
-resume the same run. A saved preset is reused on `--resume`, and a conflicting
-`--preset` is rejected; see [Agentic loop runner](loop.md#configuration) for the
-selection and precedence rules.
-`currentPhase` and `phaseStartedAt` record the phase or sub-phase most recently
-entered and its UTC start time. The runner updates them before each top-level
-phase, review agent, repair agent or gate attempt begins. They remain in state
-after completion, a stall, or a crash, so the last active phase stays visible.
-Older runs without these fields use the last non-skipped manifest entry as a
-fallback. That entry records the last completed or stalled phase, so it may not
-identify the phase currently running. Its `phaseStartedAt` is `null`.
-`manifest.json` records the resolved task,
-branch, repository, and worktree context once planning has completed, followed
-by one entry for each phase invocation. Logs, verdicts, and repair responses
-are stored alongside them. The `pr-description` phase writes `pr.md` in the
-run directory; a successful `publish` phase records the verified PR URL and
-metadata in the manifest and state. The manifest metadata points to
-`snapshot.json`.
+**`state.json`** is the runner's checkpoint. It records:
 
-`snapshot.json` is the immutable start-of-run reproducibility record. It stores
-the base revision, resolved configuration, gate definitions, environment, and
-engine versions captured at startup. Its `promptHashes` field points to
-`manifest.json` with the selector `phases[*].promptHash`; this keeps the
-snapshot tied to the hashes rendered for each actual invocation, including
-repairs and later review rounds. New agent entries also retain the prompt
-template body, interpolation variables, and applicable operator note alongside
-their hash. This lets `aloop replay` re-render and verify the recorded prompt
-without invoking an engine; entries created before those inputs were recorded
-remain inspectable but their prompts are unverifiable.
+- the run identity and completed phases;
+- review-loop progress;
+- the resolved branch and worktree;
+- the chosen prompt preset and the directory its paths were resolved from;
+- anything else needed to resume the same run.
 
-While setup, a gate, or an agent command is running, `active-command.json`
-records the child PID and, on platforms with process groups, its process-group
-ID. It is removed when the command exits or fails. This transient record lets
-`aloop cancel` terminate the command tree and lets resume protection detect a
-command that is still alive even if the runner's lock owner has already
-stopped.
+A saved preset is reused on `--resume`, and a conflicting `--preset` is rejected. See the [loop guide](loop.md#configuration) for selection and precedence.
 
-`state.json` and `manifest.json` contain `schemaVersion` (currently `1`) and
-are written by replacing a completed temporary file. A crash during a write
-therefore leaves the previous complete file available; an abandoned `.tmp`
-file is not treated as the current checkpoint. `snapshot.json` uses
-`snapshotVersion` (currently `1`) and is written with the same atomic
-replacement. The snapshot is written once and is not replaced when a run
-resumes.
+`currentPhase` and `phaseStartedAt` record the phase or sub-phase most recently entered and its UTC start time. The runner updates them before each top-level phase, review agent, repair agent, or gate attempt starts. They stay in state after completion, a stall, or a crash, so the last active phase remains visible. Older runs without these fields fall back to the last non-skipped manifest entry. That entry is the last phase completed or stalled, which may not be the one running now, and its `phaseStartedAt` is `null`.
 
-Runs created before schema versioning, whose state or manifest JSON has no
-`schemaVersion`, are read as version 1. Other older versions, future versions,
-and non-integer versions are rejected rather than being interpreted
-incorrectly.
+**`manifest.json`** records the resolved task, branch, repository, and worktree once planning is done, then one entry per phase invocation. Logs, verdicts, and repair responses are stored beside it. The `pr-description` phase writes `pr.md` in the run directory. A successful `publish` phase records the verified PR URL and metadata in the manifest and state. The manifest points to `snapshot.json`.
+
+**`snapshot.json`** is the immutable record of how the run started. It stores the base revision, resolved configuration, gate definitions, environment, and engine versions. Its `promptHashes` field points to `manifest.json` with the selector `phases[*].promptHash`. That ties the snapshot to the hash of every prompt actually rendered, including repairs and later review rounds. New agent entries also keep the prompt template body, interpolation variables, and any operator note next to their hash. This lets `aloop replay` re-render and verify a recorded prompt without calling an engine. Older entries stay inspectable, but their prompts are unverifiable.
+
+**`active-command.json`** exists while setup, a gate, or an agent command is running. It holds the child PID and, where process groups exist, the process-group ID. It's removed when the command exits or fails. `aloop cancel` uses it to terminate the command tree. Resume protection uses it to detect a command that's still alive even if the runner's lock owner has already stopped.
+
+### Writes and versions
+
+`state.json` and `manifest.json` carry a `schemaVersion` (currently `1`). Each is written by replacing a completed temporary file, so a crash mid-write leaves the previous complete file in place. An abandoned `.tmp` file is never treated as the checkpoint. `snapshot.json` uses `snapshotVersion` (currently `1`) with the same atomic replacement. It's written once and not replaced on resume.
+
+State or manifest files from before schema versioning, with no `schemaVersion`, are read as version 1. Other older versions, future versions, and non-integer versions are rejected instead of being misread.
 
 ## Starting and resuming
 
-The slug derived from `--name` or `--task-file` identifies the run directory.
-A normal run refuses to reuse a directory that already contains a state or
-manifest; use a new name for a new run. Use `--resume` only to continue the
-existing run:
+The slug from `--name` or `--task-file` identifies the run directory. A normal run refuses to reuse a directory that already has a state or manifest, so use a new name for a new run. Use `--resume` only to continue an existing one:
 
 ```sh
 aloop --name my-spec --resume
 ```
 
-Each run also has a generated `runId`, which links its state and manifest. The
-guard against non-resumed slug reuse prevents one run's logs and checkpoint
-from being silently mixed with another's.
+Each run also gets a generated `runId` that links its state and manifest. The guard against reusing a slug without `--resume` keeps one run's logs and checkpoint from being mixed with another's.
 
-Budget stalls are recorded in `manifest.json` and leave the run stalled. A
-stall at a phase or repair boundary resumes before that work is invoked again;
-an unchanged limit therefore stalls again without spending more usage. When
-the final configured phase completes and its post-phase check finds an
-exhausted budget, `state.json` records that phase as complete with
-`budgetExhausted: true`. Resuming with the unchanged limit still stops, while
-raising the limit lets aloop clear the marker and finalize the run without
-rerunning the completed final action. See [Run budgets](loop.md#run-budgets)
-for configuration and enforcement details.
+### Budget stalls
 
-When a repair-enabled standalone gate fails, its pending repair round is also
-checkpointed in `state.json`. Its manifest keeps the failed and re-run gate
-receipts, repair entries, and their input/output SHAs separately; a successful
-later attempt is therefore evidence of the repaired tree rather than a
-replacement for the original failure.
+Budget stalls are recorded in `manifest.json` and leave the run stalled. A stall at a phase or repair boundary resumes before that work is invoked again, so an unchanged limit stalls again without spending more.
 
-Commit-required agent phases persist their first-attempt `HEAD` in
-`state.json` under `phaseBaselines`. The baseline is reused across resumes, so
-if a phase stalled for producing no commit and an operator later creates a
-clean commit, `--resume` can recognize that `HEAD` has advanced past the
-baseline, record the phase as completed, and skip another agent invocation.
-The completion entry records the persisted baseline as `inputSha` and the
-current `HEAD` as `outputSha`. A forced noted rerun invalidates the phase and
-its later state, then captures a new baseline.
+If the final configured phase completes and the post-phase check finds the budget exhausted, `state.json` records that phase as complete with `budgetExhausted: true`. Resuming with the same limit still stops. Raising the limit lets aloop clear the marker and finish the run without repeating the completed final action. See [Run budgets](loop.md#run-budgets).
+
+### Repair rounds
+
+When a repair-enabled standalone gate fails, its pending repair round is checkpointed in `state.json`. The manifest keeps the failed and re-run gate receipts, repair entries, and their input and output SHAs separately. A later successful attempt is therefore evidence of the repaired tree, not a replacement for the original failure.
+
+### Commit-required phases
+
+Agent phases that must commit save their first-attempt `HEAD` in `state.json` under `phaseBaselines`. The baseline is reused across resumes. Say a phase stalled because it made no commit, and you later create a clean commit yourself. `--resume` sees that `HEAD` has moved past the baseline, records the phase as completed, and skips another agent call. The completion entry records the saved baseline as `inputSha` and the current `HEAD` as `outputSha`.
+
+`--resume --from <phase>` reruns that phase even without a note. It invalidates that phase and all later ones, then captures a new baseline.
 
 ## Concurrent-run protection
 
-Real runs acquire a single-host lock in their run directory before loading or
-changing state. A second process targeting the same slug fails fast and reports
-the owner PID. Wait for that process to finish; if it has crashed, rerun the
-command and aloop will recover the stale lock after confirming that PID is no
-longer alive.
+Real runs take a single-host lock in their run directory before loading or changing state. A second process aimed at the same slug fails immediately and reports the owner's PID. Wait for that process to finish. If it crashed, rerun the command. aloop takes over the stale lock once it confirms the PID is gone.
 
-Lock publication and stale-lock takeover are race-safe. An interrupted initial
-lock publication can be recovered, but a malformed or unreadable lock fails
-closed so two runners cannot proceed on uncertain ownership. Locks are released
-when the run completes and on the normal process-exit path. This is advisory
-protection for processes on one host, not a distributed lock.
+Lock creation and stale-lock takeover are race-safe. An interrupted initial lock write can be recovered. A malformed or unreadable lock fails closed, so two runners never proceed with uncertain ownership. Locks are released when the run completes and on normal process exit. This protects processes on one host. It's not a distributed lock.
 
-`--dry-run` is read-only: it creates neither run metadata nor a lock.
+`--dry-run` is read-only. It creates no run metadata and no lock.
 
-## Operational recovery
+## Recovery
 
-Use [`Operational run commands`](operations.md) to inspect persisted evidence
-without starting a phase:
+Use the [operational run commands](operations.md) to inspect saved evidence without starting a phase:
 
 ```sh
 aloop list
@@ -132,16 +78,8 @@ aloop inspect my-spec
 aloop watch --initial
 ```
 
-A persisted `status: "running"` with no live runner or active command is
-derived as `interrupted`, which identifies a runner lost to a kill, crash, or
-reboot. Continue it with `aloop --name my-spec --resume`; use
-`aloop cancel my-spec` to record cancellation when it should not be resumed.
-`aloop watch` reports this derived status so an external monitor can react.
+A saved `status: "running"` with no live runner or active command is derived as `interrupted`. That means the runner was lost to a kill, crash, or reboot. Continue it with `aloop --name my-spec --resume`, or record a cancellation with `aloop cancel my-spec` if you don't want to resume. `aloop watch` reports this derived status so an external monitor can react.
 
-An active run can be stopped with `aloop cancel <name>`. Cancellation waits for
-the recorded command and runner to stop before recording `status: "cancelled"`
-and releasing the lock, while retaining the run directory and worktree for
-inspection. Completed run directories can be previewed and removed with
-`aloop clean`; cleanup also removes an external worktree associated with a
-selected completed run. It never selects active, stalled, cancelled, or
-unknown runs. Interrupted runs are also excluded from cleanup.
+To stop an active run, use `aloop cancel <name>`. It waits for the recorded command and runner to stop, then records `status: "cancelled"` and releases the lock. The run directory and worktree stay for inspection.
+
+To clear out finished runs, preview and remove them with `aloop clean`. It also removes the external worktree of each selected completed run. It never selects active, interrupted, stalled, cancelled, or unknown runs.
