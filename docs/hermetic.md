@@ -22,12 +22,21 @@ export default {
   },
   phases: [
     { name: 'implement', kind: 'agent', hermetic: true },
-    { name: 'gate', kind: 'gate', commands: ['npm test'], hermetic: {
-      network: ['registry-net'],
-    } },
-    { name: 'publish', kind: 'publish', hermetic: {
-      secrets: ['GH_TOKEN'],
-    } },
+    {
+      name: 'gate',
+      kind: 'gate',
+      commands: ['npm test'],
+      hermetic: {
+        network: ['registry-net'],
+      },
+    },
+    {
+      name: 'publish',
+      kind: 'publish',
+      hermetic: {
+        secrets: ['GH_TOKEN'],
+      },
+    },
   ],
 };
 ```

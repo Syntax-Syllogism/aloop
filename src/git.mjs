@@ -39,12 +39,7 @@ export class GitFacade {
   }
 
   async push(remote, branch, { setUpstream = true, ...options } = {}) {
-    return this.run([
-      'push',
-      ...(setUpstream ? ['--set-upstream'] : []),
-      remote,
-      branch,
-    ], options);
+    return this.run(['push', ...(setUpstream ? ['--set-upstream'] : []), remote, branch], options);
   }
 
   async lsRemote(remote, branch, options = {}) {
@@ -113,5 +108,4 @@ export class GitFacade {
   async removeWorktree(path) {
     await this.run(['worktree', 'remove', '--force', path]);
   }
-
 }

@@ -18,7 +18,12 @@ function fakeOutput() {
 
 function fakeClock(start = new Date(2026, 8, 27, 14, 2).getTime()) {
   let current = start;
-  return { now: () => current, advance: (ms) => { current += ms; } };
+  return {
+    now: () => current,
+    advance: (ms) => {
+      current += ms;
+    },
+  };
 }
 
 function fakeTimers() {
@@ -26,7 +31,13 @@ function fakeTimers() {
   return {
     timers,
     setInterval: (callback, ms) => {
-      const timer = { callback, ms, unref() { this.unrefed = true; } };
+      const timer = {
+        callback,
+        ms,
+        unref() {
+          this.unrefed = true;
+        },
+      };
       timers.set.push(timer);
       return timer;
     },
@@ -149,12 +160,24 @@ test('formatDuration renders minutes and hours', () => {
 });
 
 test('resolveQuiet applies CLI over config over defaults', () => {
-  assert.deepEqual(resolveQuiet({}, { quiet: false, heartbeatMinutes: 10 }), { enabled: false, heartbeatMs: 10 * MINUTE });
-  assert.deepEqual(resolveQuiet({}, { quiet: true, heartbeatMinutes: 10 }), { enabled: true, heartbeatMs: 10 * MINUTE });
+  assert.deepEqual(resolveQuiet({}, { quiet: false, heartbeatMinutes: 10 }), {
+    enabled: false,
+    heartbeatMs: 10 * MINUTE,
+  });
+  assert.deepEqual(resolveQuiet({}, { quiet: true, heartbeatMinutes: 10 }), {
+    enabled: true,
+    heartbeatMs: 10 * MINUTE,
+  });
   assert.deepEqual(resolveQuiet({ quiet: true }, {}), { enabled: true, heartbeatMs: 10 * MINUTE });
-  assert.deepEqual(resolveQuiet({ heartbeatMinutes: 3 }, { quiet: false, heartbeatMinutes: 10 }), { enabled: true, heartbeatMs: 3 * MINUTE });
+  assert.deepEqual(resolveQuiet({ heartbeatMinutes: 3 }, { quiet: false, heartbeatMinutes: 10 }), {
+    enabled: true,
+    heartbeatMs: 3 * MINUTE,
+  });
   assert.equal(resolveQuiet({ noQuiet: true }, { quiet: true, heartbeatMinutes: 10 }).enabled, false);
-  assert.deepEqual(resolveQuiet({ quiet: true }, { quiet: false, heartbeatMinutes: 5 }), { enabled: true, heartbeatMs: 5 * MINUTE });
+  assert.deepEqual(resolveQuiet({ quiet: true }, { quiet: false, heartbeatMinutes: 5 }), {
+    enabled: true,
+    heartbeatMs: 5 * MINUTE,
+  });
   assert.deepEqual(resolveQuiet({ heartbeatMinutes: 0 }, {}), { enabled: true, heartbeatMs: 0 });
 });
 
@@ -163,7 +186,10 @@ test('quiet CLI flags parse and validate', () => {
   assert.equal(parseLoopArgs(['-f', 'wi.md', '--no-quiet']).noQuiet, true);
   assert.equal(parseLoopArgs(['-f', 'wi.md', '--heartbeat', '2.5']).heartbeatMinutes, 2.5);
   assert.equal(parseLoopArgs(['-f', 'wi.md', '--heartbeat', '0']).heartbeatMinutes, 0);
-  assert.throws(() => parseLoopArgs(['-f', 'wi.md', '--heartbeat=-1']), /--heartbeat must be a non-negative number of minutes/);
+  assert.throws(
+    () => parseLoopArgs(['-f', 'wi.md', '--heartbeat=-1']),
+    /--heartbeat must be a non-negative number of minutes/,
+  );
   assert.throws(() => parseLoopArgs(['-f', 'wi.md', '--heartbeat', 'x']), /--heartbeat must be/);
   assert.throws(() => parseLoopArgs(['-f', 'wi.md', '--heartbeat', '']), /--heartbeat must be/);
   assert.throws(() => parseLoopArgs(['-f', 'wi.md', '--quiet', '--no-quiet']), /mutually exclusive/);
@@ -177,13 +203,19 @@ test('loadConfig defaults and validates quiet settings', async () => {
   assert.equal(config.quiet, false);
   assert.equal(config.heartbeatMinutes, 10);
   await assert.rejects(loadConfig(cwd, { gate: ['true'], quiet: 'yes' }), /`quiet` must be a boolean/);
-  await assert.rejects(loadConfig(cwd, { gate: ['true'], heartbeatMinutes: -1 }), /`heartbeatMinutes` must be a nonnegative number/);
+  await assert.rejects(
+    loadConfig(cwd, { gate: ['true'], heartbeatMinutes: -1 }),
+    /`heartbeatMinutes` must be a nonnegative number/,
+  );
   await assert.rejects(loadConfig(cwd, { gate: ['true'], heartbeatMinutes: '5' }), /`heartbeatMinutes`/);
 });
 
 test('display-only quiet settings do not change the config hash', () => {
   const base = { gate: ['npm test'], maxRounds: 3 };
-  assert.equal(hashConfig({ ...base, quiet: false, heartbeatMinutes: 10 }), hashConfig({ ...base, quiet: true, heartbeatMinutes: 1 }));
+  assert.equal(
+    hashConfig({ ...base, quiet: false, heartbeatMinutes: 10 }),
+    hashConfig({ ...base, quiet: true, heartbeatMinutes: 1 }),
+  );
   assert.equal(hashConfig({ ...base, quiet: true }), hashConfig(base));
   assert.notEqual(hashConfig({ ...base, maxRounds: 2 }), hashConfig(base));
 });

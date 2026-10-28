@@ -16,7 +16,9 @@ export class PublishError extends Error {
 export function parsePullRequestDescription(contents) {
   const match = /^Title:\s*(.+?)\r?\n\r?\n([\s\S]*?)\s*$/i.exec(contents);
   if (!match) {
-    throw new PublishError('PR description must start with "Title: <one-line title>", followed by a blank line and body.');
+    throw new PublishError(
+      'PR description must start with "Title: <one-line title>", followed by a blank line and body.',
+    );
   }
   const title = match[1].trim();
   const body = match[2].trim();
@@ -32,7 +34,10 @@ export function githubBackend(options = {}) {
   async function resolveRepository(remote) {
     if (!repositories.has(remote)) {
       const remoteUrl = await git.remoteUrl(remote);
-      const match = /^(?:https?:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(remoteUrl);
+      const match =
+        /^(?:https?:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(
+          remoteUrl,
+        );
       if (!match) {
         throw new PublishError(`Configured remote ${remote} does not point to a GitHub repository.`);
       }
@@ -94,7 +99,9 @@ function resolveBackend(backend, cwd, git, env) {
   if (backend === 'gitlab') return gitlabBackend({ cwd, git, env });
   if (typeof backend === 'object' && backend !== null) {
     if (env !== undefined) {
-      throw new PublishError('Hermetic publishing does not support in-process custom backends; use the built-in GitHub backend or disable hermetic publishing.');
+      throw new PublishError(
+        'Hermetic publishing does not support in-process custom backends; use the built-in GitHub backend or disable hermetic publishing.',
+      );
     }
     return backend;
   }
@@ -106,13 +113,19 @@ function assertVerifiedPullRequest(pullRequest, { base, branch, localSha, draft 
     throw new PublishError(`No pull request exists for branch ${branch} after publishing.`);
   }
   if (pullRequest.baseRefName !== base) {
-    throw new PublishError(`Pull request base ${pullRequest.baseRefName ?? '(none)'} does not match configured base ${base}.`);
+    throw new PublishError(
+      `Pull request base ${pullRequest.baseRefName ?? '(none)'} does not match configured base ${base}.`,
+    );
   }
   if (pullRequest.headRefOid?.toLowerCase() !== localSha.toLowerCase()) {
-    throw new PublishError(`Pull request head SHA ${pullRequest.headRefOid ?? '(none)'} does not match approved SHA ${localSha}.`);
+    throw new PublishError(
+      `Pull request head SHA ${pullRequest.headRefOid ?? '(none)'} does not match approved SHA ${localSha}.`,
+    );
   }
   if (pullRequest.isDraft !== draft) {
-    throw new PublishError(`Pull request draft state ${String(pullRequest.isDraft)} does not match configured draft state ${String(draft)}.`);
+    throw new PublishError(
+      `Pull request draft state ${String(pullRequest.isDraft)} does not match configured draft state ${String(draft)}.`,
+    );
   }
   if (typeof pullRequest.url !== 'string' || !pullRequest.url) {
     throw new PublishError('Pull request verification returned no URL.');
@@ -130,7 +143,17 @@ function assertVerifiedPullRequest(pullRequest, { base, branch, localSha, draft 
  * view, create, and update operations without changing this use case.
  */
 export async function publish(options = {}) {
-  const { git, remote, branch, base, prBodyPath, draft = true, backend = 'github', approvedSha = null, env } = /** @type {any} */ (options);
+  const {
+    git,
+    remote,
+    branch,
+    base,
+    prBodyPath,
+    draft = true,
+    backend = 'github',
+    approvedSha = null,
+    env,
+  } = /** @type {any} */ (options);
   if (!git || typeof git.push !== 'function' || typeof git.lsRemote !== 'function') {
     throw new PublishError('Publish requires a GitFacade with push and lsRemote operations.');
   }
@@ -144,7 +167,7 @@ export async function publish(options = {}) {
   }
   await selectedBackend.precheck({ remote, branch, base });
 
-  const localSha = approvedSha ?? await git.revParse();
+  const localSha = approvedSha ?? (await git.revParse());
   const description = parsePullRequestDescription(await readFile(prBodyPath, 'utf8'));
   const bodyFilePath = join(dirname(prBodyPath), '.pr-body.md');
   await writeFile(bodyFilePath, `${description.body}\n`, 'utf8');
@@ -152,14 +175,32 @@ export async function publish(options = {}) {
     await git.push(remote, branch, { setUpstream: true, ...(env ? { env } : {}) });
     const remoteSha = await git.lsRemote(remote, branch, env ? { env } : {});
     if (remoteSha.toLowerCase() !== localSha.toLowerCase()) {
-      throw new PublishError(`Remote branch ${remote}/${branch} SHA ${remoteSha} does not match approved SHA ${localSha}.`);
+      throw new PublishError(
+        `Remote branch ${remote}/${branch} SHA ${remoteSha} does not match approved SHA ${localSha}.`,
+      );
     }
 
     const existing = await selectedBackend.view({ remote, branch, base });
     if (existing) {
-      await selectedBackend.update({ remote, branch, base, title: description.title, body: description.body, bodyFilePath, draft });
+      await selectedBackend.update({
+        remote,
+        branch,
+        base,
+        title: description.title,
+        body: description.body,
+        bodyFilePath,
+        draft,
+      });
     } else {
-      await selectedBackend.create({ remote, branch, base, title: description.title, body: description.body, bodyFilePath, draft });
+      await selectedBackend.create({
+        remote,
+        branch,
+        base,
+        title: description.title,
+        body: description.body,
+        bodyFilePath,
+        draft,
+      });
     }
     const pullRequest = await selectedBackend.view({ remote, branch, base });
     assertVerifiedPullRequest(pullRequest, { base, branch, localSha, draft });

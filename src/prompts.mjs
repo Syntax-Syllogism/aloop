@@ -17,7 +17,7 @@ async function availableBundledPresets() {
   const entries = await readdir(packagePresets, { withFileTypes: true });
   const available = [];
   for (const entry of entries) {
-    if (entry.isDirectory() && await isDirectory(join(packagePresets, entry.name, 'prompts'))) {
+    if (entry.isDirectory() && (await isDirectory(join(packagePresets, entry.name, 'prompts')))) {
       available.push(entry.name);
     }
   }
@@ -53,7 +53,7 @@ export async function resolvePresetPromptDir(preset, { cwd = process.cwd() } = {
 /** @param {PromptOptions} [options] */
 export async function loadTemplate(name, options = {}) {
   const { promptDirs = [], projectPromptDir } = options;
-  const overrideDirs = promptDirs.length ? promptDirs : (projectPromptDir ? [projectPromptDir] : []);
+  const overrideDirs = promptDirs.length ? promptDirs : projectPromptDir ? [projectPromptDir] : [];
   const candidates = [...overrideDirs, packagePrompts].map((dir) => join(dir, `${name}.md`));
   for (const candidate of candidates) {
     try {

@@ -29,6 +29,8 @@ Before the driver changes a remote, it requires:
 - a current `HEAD` that matches the latest approved review SHA;
 - a passing gate receipt for that same SHA, dated before the approval.
 
+A recorded `repeated-blockers` override from the [repeated-blocker judge](judge.md#stall-and-override) can stand in for the approval. The gate receipt is still required, and the run logs that it is publishing with unresolved review findings.
+
 Then it runs the backend precheck, pushes with upstream tracking and no force, and reads the remote branch SHA. If that SHA differs from the approved one, the run stalls before any PR is created or updated. Otherwise the driver looks up the branch's existing PR, updates it or creates one, and looks it up once more.
 
 The final PR must report the configured base branch, the approved head SHA, the draft state, a URL, and a numeric PR number. A missing or mismatched value stalls the run. A stalled publish phase stays incomplete, so `--resume` retries it with the existing run artifacts and commits intact.
@@ -61,12 +63,12 @@ GitLab drafts use both the native draft flag and the `Draft:` title prefix. An e
 
 For a REST, MCP, or other GitLab client, import `gitlabBackend` and inject a transport. The transport works in GitLab's own terms, and the backend maps merge requests to aloop's verified pull-request shape:
 
-| Method | Context in, result out |
-| --- | --- |
-| `checkAuth` | `{ host }`. Resolves or throws. |
-| `getMergeRequest` | `{ host, project, branch }`. Returns `{ iid, web_url, target_branch, sha, draft }` (or legacy `work_in_progress`), or `null`. |
-| `createMergeRequest` | `{ host, project, sourceBranch, targetBranch, title, description, descriptionFilePath, draft }` |
-| `updateMergeRequest` | `{ host, project, iid, branch, title, description, descriptionFilePath, draft }` |
+| Method               | Context in, result out                                                                                                        |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `checkAuth`          | `{ host }`. Resolves or throws.                                                                                               |
+| `getMergeRequest`    | `{ host, project, branch }`. Returns `{ iid, web_url, target_branch, sha, draft }` (or legacy `work_in_progress`), or `null`. |
+| `createMergeRequest` | `{ host, project, sourceBranch, targetBranch, title, description, descriptionFilePath, draft }`                               |
+| `updateMergeRequest` | `{ host, project, iid, branch, title, description, descriptionFilePath, draft }`                                              |
 
 ```js
 import { gitlabBackend } from '@syntax-syllogism/aloop';

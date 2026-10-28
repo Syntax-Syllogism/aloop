@@ -38,6 +38,8 @@ By default, the runner asks before each phase. At the prompt, Enter or `y` runs 
       --config <path>     Load loop configuration from this file
       --phases a,b,c      Override the configured phase list
       --max-rounds <n>    Cap on review/repair rounds
+      --no-judge          Disable a configured repeated-blocker judge for this run
+      --on-repeat <action> Judge action: stall or continue
       --from <phase>      Start at this phase (with --resume, re-run it even if complete)
       --preset <name|path> Activate a bundled preset or external preset directory
       --resume            Skip phases already recorded complete
@@ -159,6 +161,8 @@ Notes apply to one invocation and aren't saved in `state.json`, so a later ordin
 
 ## Configuration
 
+Engine entries accept `agent` to select a named CLI persona. See [Named agents](agents.md) for support, inheritance, model precedence, and the requirement to commit repo definitions on the base branch. Custom adapters can [declare agent support](agents.md#custom-adapters).
+
 `loop.config.mjs` at the repository root:
 
 ```js
@@ -170,6 +174,7 @@ export default {
   engines: {
     default: { name: 'claude', effort: 'high' },
     review: { name: 'codex', effort: 'high' },
+    docs: { model: 'claude-haiku-5-5' },
   },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   reviewRoles: [], // optional: security, api-compat, test-quality
@@ -213,15 +218,30 @@ Optional runtime isolation is configured separately from phase permissions. See 
 
 ### Engines
 
-An `engines` entry can be an engine-name string, or a descriptor with `name` plus optional `model` and `effort`. A phase with no entry inherits the entire `default` descriptor. A phase descriptor replaces it. Model names go to the CLI as-is. Effort is validated before a phase starts:
+An `engines` entry can be an engine-name string, or a descriptor with optional `name`, `model`, `effort`, and `agent`. `default` must name an engine. Every agent phase can have an entry: built-ins include `implement`, `docs`, `review`, `address`, and `pr-description`; enabled review roles add `review-security`, `review-api-compat`, and `review-test-quality`.
 
-| Engine | Model option | Effort option | Supported effort |
-| --- | --- | --- | --- |
-| `claude` | `--model` | `--effort` | `low`, `medium`, `high`, `xhigh`, `max` |
-| `codex` | `--model` | `-c model_reasoning_effort=…` | `low`, `medium`, `high`, `xhigh`, `max` |
-| `agy` | `--model` | `--effort` | `low`, `medium`, `high` |
-| `gemini` | `--model` | none | none (the Gemini CLI has no effort flag, so a configured `effort` is ignored) |
-| configured adapter name | adapter-defined | adapter-defined | the adapter's `efforts`, or any value if omitted |
+Phase entries inherit from their base after command-line `--engine`, `--model`, and `--effort` changes have been applied to `default`:
+
+| Phase entry                            | Resolved settings                                       |
+| -------------------------------------- | ------------------------------------------------------- |
+| absent                                 | base unchanged                                          |
+| `{ model }`, `{ effort }`, or both     | base with those fields replaced                         |
+| `{ name }` equal to the base engine    | base with supplied fields replaced                      |
+| a different `name`, including a string | supplied entry only; model and effort are not inherited |
+
+The base is `default` for ordinary phases. A specialized reviewer inherits from its resolved `review` entry. This means a same-name phase entry now keeps the default model and effort, while a different engine deliberately starts without vendor-specific settings. When a native or delegated `agent` is resolved, inherited model and effort are omitted; only per-phase values are passed. Inline agents retain the resolved model and effort. Model names go to the CLI as-is. Effort is validated after inheritance, before a phase starts.
+
+If `--engine` moves a phase's base to a different engine, a phase entry without a `name` loses its own `model` and `effort`. Those values were written for the old engine, and `--engine` drops them from `default` for the same reason. The run header logs each dropped setting, for example `engines.docs: dropped model=claude-haiku-5-5 (configured for claude; this run uses codex)`. The phase then runs on the new engine with whatever `--model` and `--effort` set. To keep a phase on its configured vendor, give its entry an explicit `name`.
+
+Unknown `engines` keys fail config loading and list the active valid keys. Keys for known agent phases omitted from the current run only warn, so a full config works with `--phases`; `gate` and `publish` always fail because they are not agent phases. The run header (including `--dry-run`) and `aloop inspect` show the resolved engine, model, and effort for every agent phase.
+
+| Engine                  | Model option    | Effort option                 | Supported effort                                                              |
+| ----------------------- | --------------- | ----------------------------- | ----------------------------------------------------------------------------- |
+| `claude`                | `--model`       | `--effort`                    | `low`, `medium`, `high`, `xhigh`, `max`                                       |
+| `codex`                 | `--model`       | `-c model_reasoning_effort=…` | `low`, `medium`, `high`, `xhigh`, `max`                                       |
+| `agy`                   | `--model`       | `--effort`                    | `low`, `medium`, `high`                                                       |
+| `gemini`                | `--model`       | none                          | none (the Gemini CLI has no effort flag, so a configured `effort` is ignored) |
+| configured adapter name | adapter-defined | adapter-defined               | the adapter's `efforts`, or any value if omitted                              |
 
 Running `review` on a different engine than `implement` is the main reason to use several CLIs. Different model families fail differently, so the reviewer's blind spots don't overlap with the implementer's.
 
@@ -231,6 +251,8 @@ An adapter renderer can expose `usage()`, returning numeric `tokens` and `cost`.
 
 ### Bring your own engine
 
+Custom adapters can [declare named-agent support](agents.md#custom-adapters).
+
 An adapter is a small ES module object whose `command` function returns one process invocation. For example, an opencode-style setup:
 
 ```js
@@ -238,9 +260,8 @@ export default {
   adapters: {
     opencode: {
       command({ prompt, cwd, addDirs, permissions, artifactOnly, agent = {} }) {
-        const writeAccess = permissions.includes('write-worktree')
-          && !permissions.includes('read-only')
-          && !artifactOnly;
+        const writeAccess =
+          permissions.includes('write-worktree') && !permissions.includes('read-only') && !artifactOnly;
         // `--mode` is illustrative; use opencode's equivalent flags.
         const args = ['run', prompt, '--dir', cwd, '--mode', writeAccess ? 'write' : 'plan'];
         if (agent.model) args.push('--model', agent.model);
@@ -251,9 +272,8 @@ export default {
     },
     pi: {
       command({ prompt, cwd, addDirs, permissions, artifactOnly, agent = {} }) {
-        const writeAccess = permissions.includes('write-worktree')
-          && !permissions.includes('read-only')
-          && !artifactOnly;
+        const writeAccess =
+          permissions.includes('write-worktree') && !permissions.includes('read-only') && !artifactOnly;
         // `--mode` is illustrative; use pi's equivalent flags.
         const args = ['--print', prompt, '--cwd', cwd, '--mode', writeAccess ? 'write' : 'plan'];
         if (agent.model) args.push('--model', agent.model);
@@ -305,10 +325,7 @@ Each entry in `gate`, `setup`, or a `gate`-kind phase's `commands` takes one of 
 ```js
 export default {
   setup: [{ argv: ['npm', 'ci'] }],
-  gate: [
-    { posix: 'npm test 2>&1', windows: 'npm test *>&1' },
-    { argv: ['node', 'scripts/check-schema.mjs'] },
-  ],
+  gate: [{ posix: 'npm test 2>&1', windows: 'npm test *>&1' }, { argv: ['node', 'scripts/check-schema.mjs'] }],
 };
 ```
 
@@ -336,11 +353,11 @@ Budget stalls can be resumed. An unchanged limit stalls again before any more wo
 
 Every normalized phase has a `permissions` array with values from `read-only`, `write-worktree`, and `publish`. Unknown values are rejected. A custom phase that omits the field or gives an empty array defaults to `read-only`. A custom phase with `kind: 'publish'` defaults to `publish`.
 
-| Permission | Built-in phases | Agent access and behavior |
-| --- | --- | --- |
-| `read-only` | `gate`, `review`, `pr-description` | Agent phases run from a disposable read-only source snapshot of the saved worktree. They can write only the run artifacts, plus the task-file artifact directory for the verdict/review phase. Shell gates don't invoke an agent adapter. |
-| `write-worktree` | `implement`, `docs`, `address` | Agent phases may modify and commit the worktree. The adapter receives the run directory and any task-file directory the phase needs. |
-| `publish` | `publish` | Publishing is owned by the driver and doesn't invoke an agent. |
+| Permission       | Built-in phases                    | Agent access and behavior                                                                                                                                                                                                                 |
+| ---------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read-only`      | `gate`, `review`, `pr-description` | Agent phases run from a disposable read-only source snapshot of the saved worktree. They can write only the run artifacts, plus the task-file artifact directory for the verdict/review phase. Shell gates don't invoke an agent adapter. |
+| `write-worktree` | `implement`, `docs`, `address`     | Agent phases may modify and commit the worktree. The adapter receives the run directory and any task-file directory the phase needs.                                                                                                      |
+| `publish`        | `publish`                          | Publishing is owned by the driver and doesn't invoke an agent.                                                                                                                                                                            |
 
 If an array holds more than one value, the most restrictive wins: `read-only`, then `write-worktree`, then `publish`. An absent or unrecognized request resolves to `read-only` for the adapter. That way an incomplete custom descriptor can't gain write access.
 
@@ -354,15 +371,15 @@ Hermetic execution is a separate opt-in boundary around agent and gate commands.
 
 ## Phases
 
-| Phase | Kind | Role | Permission | Interactive policy |
-| --- | --- | --- | --- | --- |
-| `implement` | agent | Writes code to spec and commits it | `write-worktree` | Required |
-| `docs` | agent | Documentation-as-built pass. Commits docs changes. | `write-worktree` | Optional; may be skipped |
-| `gate` | shell | Runs the `gate` commands. Exit code decides. | `read-only` | Required |
-| `review` | agent | Emits a verdict and writes prose to `RUN_DIR`. The work-item preset may append it to the task file. | `read-only` | Required |
-| `address` | agent | Fixes and commits verdict findings, or records a written rebuttal | `write-worktree` | Runs within the required review loop |
-| `pr-description` | agent | Writes the title and body to `{{RUN_DIR}}/pr.md` without changing the worktree | `read-only` | Required |
-| `publish` | driver | Pushes the attested branch, then creates or updates and verifies the PR through the configured backend | `publish` | Required |
+| Phase            | Kind   | Role                                                                                                   | Permission       | Interactive policy                   |
+| ---------------- | ------ | ------------------------------------------------------------------------------------------------------ | ---------------- | ------------------------------------ |
+| `implement`      | agent  | Writes code to spec and commits it                                                                     | `write-worktree` | Required                             |
+| `docs`           | agent  | Documentation-as-built pass. Commits docs changes.                                                     | `write-worktree` | Optional; may be skipped             |
+| `gate`           | shell  | Runs the `gate` commands. Exit code decides.                                                           | `read-only`      | Required                             |
+| `review`         | agent  | Emits a verdict and writes prose to `RUN_DIR`. The work-item preset may append it to the task file.    | `read-only`      | Required                             |
+| `address`        | agent  | Fixes and commits verdict findings, or records a written rebuttal                                      | `write-worktree` | Runs within the required review loop |
+| `pr-description` | agent  | Writes the title and body to `{{RUN_DIR}}/pr.md` without changing the worktree                         | `read-only`      | Required                             |
+| `publish`        | driver | Pushes the attested branch, then creates or updates and verifies the PR through the configured backend | `publish`        | Required                             |
 
 ### How the phases fit together
 
@@ -374,7 +391,7 @@ Review uses the configured base branch for the cumulative change. From round two
 
 **Clean-tree check.** Before the description and publish phases run, the runner stalls the pipeline if `git status` isn't empty, and reports the offending paths.
 
-**Publish requirements.** Before publishing, the runner requires a clean `HEAD` that matches the SHA of the latest approved review. That approval must be backed by a passing gate that ran over the same SHA before the review. A mismatch or an ungated approval stalls the run. This closes a hole in partial runs that start at `review` (for example `--from review`): review alone can record an approval, but with no gate over the tree, publishing refuses it. Unresolved review findings also block a standalone resume through `publish`, because publishing always needs a completed, gate-backed approval for the current SHA.
+**Publish requirements.** Before publishing, the runner requires a clean `HEAD` that matches the SHA of the latest approved review. That approval must be backed by a passing gate that ran over the same SHA before the review. A mismatch or an ungated approval stalls the run. A recorded `repeated-blockers` override is the sole exception: it still requires that same passing gate recorded before the override, and the `pr-description` phase is asked to list the unresolved findings in the PR body. See the [judge guide](judge.md#stall-and-override).
 
 **Review is observational.** It must not change the worktree or advance `HEAD`. If a review invocation changes a file, the runner stalls that review. If it also creates a commit, the runner invalidates the completed gate over the review's input SHA. Resuming reruns the gate before another review can approve the changed tree.
 
@@ -491,6 +508,8 @@ Parsing fails closed. A missing, malformed, or unrecognized verdict stalls the r
 
 ### Specialized reviewers
 
+Specialized reviewers do not inherit the review agent; set `engines['review-security'].agent` explicitly.
+
 Set `reviewRoles` in `loop.config.mjs` to any subset of `security`, `api-compat`, and `test-quality`, for example `reviewRoles: ['security', 'test-quality']`. The default empty list runs only the generalist reviewer. Duplicate or unknown roles are rejected. A non-empty selection needs a verdict phase named `review` in the resolved phase list.
 
 - Roles run after the generalist, in configuration order.
@@ -501,11 +520,16 @@ Set `reviewRoles` in `loop.config.mjs` to any subset of `security`, `api-compat`
 - The role prompts are `review-security.md`, `review-api.md`, and `review-tests.md`. Project prompt overrides use those filenames.
 - Specialized reviewers inherit the `review` engine unless an engine is configured for their phase name, such as `review-security`.
 
+### Repeated-blocker judge
+
+An optional judge can stop a review/address loop when every blocker in a new round repeats one from the previous round. It's off by default. Its configuration, transports, defaults, recipes, and overrides are in the [judge guide](judge.md).
+
 ## Stopping conditions
 
 The run stops and reports when any of these happens:
 
 - the round cap is reached;
+- the repeated-blocker judge finds every blocker repeated (`onRepeat: 'stall'`), or the judge fails;
 - a standalone gate fails;
 - a setup command fails;
 - a code phase breaks its committed-output postcondition;
@@ -550,11 +574,13 @@ Each run gets a `git worktree` off `baseBranch`. Concurrent runs can't stomp on 
 
 Logs, verdicts, `state.json`, `manifest.json`, and `snapshot.json` live in `.loop/runs/<slug>/` in the main repository. That's outside the worktree, so they survive its removal. Add `.loop/runs/` to `.gitignore`. See [Run state and recovery](run-state.md) for the on-disk artefacts, locking, schema compatibility, and crash recovery.
 
-`--resume` reads the state cursor, skips phases already recorded complete, and reloads the manifest so evidence from earlier phases stays with the run. If a verdict loop was left incomplete after a saved review round, resume first replays its unfinished repair phases, including any failed or unrun recheck gate. Then it starts the next review with that review's SHA as `SINCE_SHA`. The pending repair's verdict comes from `state.json`, not from the round's verdict file. When resume reaches a new review invocation, the runner invalidates that round's old verdict file before calling the reviewer. If the saved round has already reached the cap, it stops without another agent invocation.
+`--resume` reads the state cursor, skips phases already recorded complete, and reloads the manifest so evidence from earlier phases stays with the run. If a verdict loop was left incomplete after a saved review round, resume first replays its unfinished repair phases, including any failed or unrun recheck gate. The exception is a repeated-blocker stall resumed with `continue` in effect, which resolves from the cached judgement without replaying repairs (see [judge guide](judge.md#stall-and-override)). Then it starts the next review with that review's SHA as `SINCE_SHA`. The pending repair's verdict comes from `state.json`, not from the round's verdict file. When resume reaches a new review invocation, the runner invalidates that round's old verdict file before calling the reviewer. If the saved round has already reached the cap, it stops without another agent invocation.
 
 Before resuming, the runner checks that the saved worktree still exists and is registered for the saved branch. A worktree moved with `git worktree move` is adopted at its registered location. If it was removed or is no longer registered, the runner fails before planning or running a phase. Restore or re-register it with `git worktree`. It won't carry on in a different checkout.
 
 ### Run manifest
+
+Named-agent entries include `engine.agent`, `agentStatus`, and (when inlined) `agentSource`. See [Named agents](agents.md#warnings).
 
 Every phase action in a real run records an ordered entry in `.loop/runs/<slug>/manifest.json`. The file is independent of `state.json`. `state.json` is the resume cursor, and the manifest is the evidence record of what each phase saw and produced. The top-level shape:
 
@@ -571,9 +597,7 @@ Every phase action in a real run records an ordered entry in `.loop/runs/<slug>/
       "promptHash": null,
       "configHash": "<64-character SHA-256>",
       "artifacts": ["gate.log"],
-      "gateReceipts": [
-        { "command": "npm test", "exitCode": 0, "durationMs": 842 }
-      ],
+      "gateReceipts": [{ "command": "npm test", "exitCode": 0, "durationMs": 842 }],
       "engine": null,
       "status": "completed",
       "startedAt": "<ISO timestamp>",

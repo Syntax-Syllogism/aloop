@@ -38,7 +38,11 @@ function formatClock(ms) {
 
 // A `\r`-redrawn progress bar should read as its latest frame, not every frame.
 function visibleText(line) {
-  const pieces = line.replace(ANSI_PATTERN, '').split('\r').map((piece) => piece.trim()).filter(Boolean);
+  const pieces = line
+    .replace(ANSI_PATTERN, '')
+    .split('\r')
+    .map((piece) => piece.trim())
+    .filter(Boolean);
   return pieces.at(-1) ?? '';
 }
 
@@ -80,7 +84,9 @@ export function createQuietRenderer(options) {
   const tick = () => {
     const at = now();
     const last = lastLine || visibleText(pendingLine);
-    write(`[${formatClock(at)}] ${phaseName ?? 'setup'} · ${formatDuration(at - phaseStartedAt)} in phase · ${formatDuration(at - startedAt)} total${last ? ` · last: ${truncate(last, LAST_LINE_LIMIT)}` : ''}`);
+    write(
+      `[${formatClock(at)}] ${phaseName ?? 'setup'} · ${formatDuration(at - phaseStartedAt)} in phase · ${formatDuration(at - startedAt)} total${last ? ` · last: ${truncate(last, LAST_LINE_LIMIT)}` : ''}`,
+    );
   };
 
   const restartTimer = () => {

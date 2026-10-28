@@ -6,13 +6,15 @@ export function signalProcessGroup(pid, signal, options = {}) {
   const { platform = process.platform, spawnImpl = spawn, onFailure } = /** @type {any} */ (options);
   if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
   if (platform === 'win32') {
-    const handleFailure = onFailure ?? (() => {
-      try {
-        process.kill(pid, signal);
-      } catch (error) {
-        if (error.code !== 'ESRCH') throw error;
-      }
-    });
+    const handleFailure =
+      onFailure ??
+      (() => {
+        try {
+          process.kill(pid, signal);
+        } catch (error) {
+          if (error.code !== 'ESRCH') throw error;
+        }
+      });
     let killer;
     try {
       killer = spawnImpl('taskkill', ['/PID', String(pid), '/T', '/F'], {
@@ -130,7 +132,11 @@ export function resolveShell(options = {}) {
       : { bin: 'powershell.exe', flag: '-Command' };
   }
   if (configuredShell) {
-    const base = configuredShell.split(/[\\/]/).pop().replace(/\.exe$/i, '').toLowerCase();
+    const base = configuredShell
+      .split(/[\\/]/)
+      .pop()
+      .replace(/\.exe$/i, '')
+      .toLowerCase();
     if (base === 'cmd') return { bin: configuredShell, flag: ['/d', '/s', '/c'] };
     if (base === 'pwsh' || base === 'powershell') return { bin: configuredShell, flag: '-Command' };
     return { bin: configuredShell, flag: '-c' };
@@ -154,7 +160,13 @@ function windowsSpawnSpec(command, args, env, resolveExecutable) {
   if (extension === '.ps1') {
     return {
       command: environmentValue(env, 'SystemRoot')
-        ? windowsPath.join(environmentValue(env, 'SystemRoot'), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        ? windowsPath.join(
+            environmentValue(env, 'SystemRoot'),
+            'System32',
+            'WindowsPowerShell',
+            'v1.0',
+            'powershell.exe',
+          )
         : 'powershell.exe',
       args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', resolved, ...args],
     };
@@ -192,7 +204,8 @@ export async function runCommand(command, args = [], options = {}) {
     resolveExecutable = resolveWindowsExecutable,
   } = /** @type {any} */ (options);
   return new Promise((resolve, reject) => {
-    const spawnSpec = platform === 'win32' ? windowsSpawnSpec(command, args, env, resolveExecutable) : { command, args };
+    const spawnSpec =
+      platform === 'win32' ? windowsSpawnSpec(command, args, env, resolveExecutable) : { command, args };
     const child = spawnImpl(spawnSpec.command, spawnSpec.args, {
       cwd,
       env,
@@ -200,10 +213,13 @@ export async function runCommand(command, args = [], options = {}) {
       ...(platform === 'win32' ? { windowsVerbatimArguments: false } : {}),
     });
     if (activeProcessPath) {
-      writeFileSync(activeProcessPath, `${JSON.stringify({
-        pid: child.pid,
-        ...(platform !== 'win32' ? { processGroupId: child.pid } : {}),
-      })}\n`);
+      writeFileSync(
+        activeProcessPath,
+        `${JSON.stringify({
+          pid: child.pid,
+          ...(platform !== 'win32' ? { processGroupId: child.pid } : {}),
+        })}\n`,
+      );
     }
     let stdout = '';
     let stderr = '';
@@ -225,11 +241,14 @@ export async function runCommand(command, args = [], options = {}) {
               reject(timeoutError(error));
             }
           };
-          if (!signalProcessGroup(child.pid, 'SIGKILL', {
-            platform,
-            spawnImpl,
-            onFailure: killDirectChild,
-          })) killDirectChild();
+          if (
+            !signalProcessGroup(child.pid, 'SIGKILL', {
+              platform,
+              spawnImpl,
+              onFailure: killDirectChild,
+            })
+          )
+            killDirectChild();
         }, timeoutMs)
       : null;
 

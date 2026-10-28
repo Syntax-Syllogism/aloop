@@ -45,7 +45,7 @@ export function writeOutput(text) {
 }
 
 export function describeAgent(agent) {
-  return `${agent.name}${agent.model ? ` model=${agent.model}` : ''}${agent.effort ? ` effort=${agent.effort}` : ''}`;
+  return `${agent.name}${agent.agent ? ` agent: ${agent.agent}` : ''}${agent.model ? ` model=${agent.model}` : ''}${agent.effort ? ` effort=${agent.effort}` : ''}`;
 }
 
 export function formatPhase(phase) {
@@ -54,7 +54,11 @@ export function formatPhase(phase) {
 }
 
 export function openTerminalInput(options = {}) {
-  const { platform = process.platform, input = process.stdin, createInput = createReadStream } = /** @type {any} */ (options);
+  const {
+    platform = process.platform,
+    input = process.stdin,
+    createInput = createReadStream,
+  } = /** @type {any} */ (options);
   if (platform === 'win32' && input.isTTY) return Promise.resolve(input);
   const terminalPath = platform === 'win32' ? '\\\\.\\CONIN$' : '/dev/tty';
   return new Promise((resolveInput, rejectInput) => {

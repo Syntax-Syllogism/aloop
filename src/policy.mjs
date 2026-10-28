@@ -11,14 +11,10 @@ export function phaseIsSkippable(phase) {
   return phase.optional && !phase.verdict && phase.kind !== 'gate';
 }
 
-export async function codePhasePostcondition(phase, ctx, {
-  hasFindings = true,
-  headBefore = null,
-  round = null,
-} = {}) {
+export async function codePhasePostcondition(phase, ctx, { hasFindings = true, headBefore = null, round = null } = {}) {
   if (ctx.dryRun) return null;
   const logPath = ctx.state.logPath(phase.name);
-  if (hasPostcondition(phase, 'clean-tree') && await ctx.git.status()) {
+  if (hasPostcondition(phase, 'clean-tree') && (await ctx.git.status())) {
     return `${phase.name} left uncommitted changes; the reviewer inspects base...HEAD and will not see them. Commit the work. Check ${logPath}.`;
   }
   if (hasPostcondition(phase, 'pr-description-valid')) {
@@ -32,10 +28,14 @@ export async function codePhasePostcondition(phase, ctx, {
   const requiresHeadAdvance = hasPostcondition(phase, 'head-advanced');
   const permitsRebuttal = hasPostcondition(phase, 'head-advanced-or-rebuttal');
   const requiresHeadUnchanged = hasPostcondition(phase, 'head-unchanged');
-  const headChanged = (requiresHeadAdvance || permitsRebuttal || requiresHeadUnchanged)
-    && headBefore !== null && headBefore !== (await ctx.git.revParse());
-  if (requiresHeadAdvance && !headChanged) return `${phase.name} produced no commit. Commit the work. Check ${logPath}.`;
-  if (requiresHeadUnchanged && headChanged) return `${phase.name} changed HEAD from ${headBefore} to ${await ctx.git.revParse()}; it may only write the PR description. Check ${logPath}.`;
+  const headChanged =
+    (requiresHeadAdvance || permitsRebuttal || requiresHeadUnchanged) &&
+    headBefore !== null &&
+    headBefore !== (await ctx.git.revParse());
+  if (requiresHeadAdvance && !headChanged)
+    return `${phase.name} produced no commit. Commit the work. Check ${logPath}.`;
+  if (requiresHeadUnchanged && headChanged)
+    return `${phase.name} changed HEAD from ${headBefore} to ${await ctx.git.revParse()}; it may only write the PR description. Check ${logPath}.`;
   if (!permitsRebuttal || headChanged || !hasFindings) return null;
   const rebuttalPath = round === null ? null : join(ctx.state.dir, `response-round-${round}.md`);
   try {
@@ -47,18 +47,41 @@ export async function codePhasePostcondition(phase, ctx, {
 }
 
 function latestApprovedReview(state) {
-  const index = state.manifest.entries.findLastIndex((entry) => entry.role === 'verdict' && entry.status !== 'skipped');
+  const index = state.manifest.entries.findLastIndex(
+    (entry) => (entry.role === 'verdict' || entry.role === 'review-override') && entry.status !== 'skipped',
+  );
   const entry = index === -1 ? null : state.manifest.entries[index];
-  if (entry?.status !== 'completed' || entry.verdict?.verdict !== APPROVED
-    || typeof entry.verdict.sha !== 'string' || (entry.reviewGroup && !entry.aggregate)) return null;
-  return { index, sha: entry.verdict.sha };
+  if (entry?.role === 'review-override') {
+    if (entry.status !== 'completed' || entry.reason !== 'repeated-blockers' || typeof entry.outputSha !== 'string') return null;
+    return { index, sha: entry.outputSha, overridden: true };
+  }
+  if (
+    entry?.status !== 'completed' ||
+    entry.verdict?.verdict !== APPROVED ||
+    typeof entry.verdict.sha !== 'string' ||
+    (entry.reviewGroup && !entry.aggregate)
+  )
+    return null;
+  return { index, sha: entry.verdict.sha, overridden: false };
 }
 
 export function publishingAttestation(state, currentSha) {
   const approved = latestApprovedReview(state);
-  if (!approved) return { approvedSha: null, currentSha, reason: `current HEAD ${currentSha} has no completed approval from a review phase` };
-  if (approved.sha !== currentSha) return { approvedSha: approved.sha, currentSha, reason: `current HEAD ${currentSha} does not match the approved review SHA ${approved.sha}` };
-  const gatePassed = state.manifest.entries.slice(0, approved.index).some((entry) => entry.role === 'gate' && entry.status === 'completed' && entry.outputSha === approved.sha);
+  if (!approved)
+    return {
+      approvedSha: null,
+      currentSha,
+      reason: `current HEAD ${currentSha} has no completed approval from a review phase`,
+    };
+  if (approved.sha !== currentSha)
+    return {
+      approvedSha: approved.sha,
+      currentSha,
+      reason: `current HEAD ${currentSha} does not match the approved review SHA ${approved.sha}`,
+    };
+  const gatePassed = state.manifest.entries
+    .slice(0, approved.index)
+    .some((entry) => entry.role === 'gate' && entry.status === 'completed' && entry.outputSha === approved.sha);
   if (!gatePassed) {
     return {
       approvedSha: approved.sha,
@@ -66,5 +89,5 @@ export function publishingAttestation(state, currentSha) {
       reason: `current HEAD matches approved review SHA ${approved.sha}, but no passing gate receipt for that SHA was recorded before the review`,
     };
   }
-  return null;
+  return approved.overridden ? { approvedSha: approved.sha, currentSha, overridden: true } : null;
 }

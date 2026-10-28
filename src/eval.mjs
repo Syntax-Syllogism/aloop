@@ -203,7 +203,15 @@ export function formatEvalTable(results) {
 
 /** Render per-config aggregate summaries as a tab-separated table. */
 export function formatEvalSummaryTable(summaries) {
-  const header = ['CONFIG', 'CELLS', 'COMPLETION_RATE', 'ESCAPED_DEFECT_RATE', 'AVG_ROUNDS', 'TOTAL_COST', 'TOTAL_DURATION_MS'];
+  const header = [
+    'CONFIG',
+    'CELLS',
+    'COMPLETION_RATE',
+    'ESCAPED_DEFECT_RATE',
+    'AVG_ROUNDS',
+    'TOTAL_COST',
+    'TOTAL_DURATION_MS',
+  ];
   const rows = summaries.map((summary) => [
     summary.config,
     String(summary.cells),

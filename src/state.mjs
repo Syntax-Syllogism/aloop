@@ -24,7 +24,8 @@ function isProcessAlive(pid) {
 }
 
 function isProcessGroupAlive(groupId) {
-  if (process.platform === 'win32' || !Number.isInteger(groupId) || groupId <= 0 || groupId === process.pid) return false;
+  if (process.platform === 'win32' || !Number.isInteger(groupId) || groupId <= 0 || groupId === process.pid)
+    return false;
   try {
     process.kill(-groupId, 0);
     return true;
@@ -102,9 +103,7 @@ async function readLockOwner(lockPath) {
 function validateSchema(data, source) {
   const version = Object.hasOwn(data, 'schemaVersion') ? data.schemaVersion : 0;
   if (!Number.isInteger(version)) {
-    throw new Error(
-      `Unsupported ${source} schemaVersion ${version}; expected an integer version.`,
-    );
+    throw new Error(`Unsupported ${source} schemaVersion ${version}; expected an integer version.`);
   }
   if (version > STATE_SCHEMA_VERSION) {
     throw new Error(
@@ -255,8 +254,9 @@ export class RunState {
         // crashes with "EPERM: operation not permitted, rename". Treat those as
         // contention too, but only when the lock path is actually present, so a
         // genuine permission failure still surfaces instead of spinning here.
-        const contended = ['EEXIST', 'ENOTEMPTY'].includes(error.code)
-          || (['EPERM', 'EACCES'].includes(error.code) && await pathExists(path));
+        const contended =
+          ['EEXIST', 'ENOTEMPTY'].includes(error.code) ||
+          (['EPERM', 'EACCES'].includes(error.code) && (await pathExists(path)));
         if (!contended) throw error;
       }
 
@@ -365,7 +365,7 @@ export class RunState {
   }
 
   async saveSnapshot(snapshot) {
-    if (this.readOnly || await this.hasSnapshot()) return;
+    if (this.readOnly || (await this.hasSnapshot())) return;
     await atomicWrite(this.snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
   }
 

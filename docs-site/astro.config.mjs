@@ -1,10 +1,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
-import {
-  remarkRelativeMdLinks,
-  starlightPreset,
-} from '@syntax-syllogism/docs-theme';
+import { remarkRelativeMdLinks, starlightPreset } from '@syntax-syllogism/docs-theme';
 
 const BASE = '/aloop/docs';
 

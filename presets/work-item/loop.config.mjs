@@ -5,6 +5,7 @@ export default {
   engines: {
     default: { name: 'claude', effort: 'high' },
     review: { name: 'codex', effort: 'high' },
+    docs: { model: 'claude-haiku-5-5' },
   },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   gate: ['npm test'],

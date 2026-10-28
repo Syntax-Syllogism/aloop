@@ -49,7 +49,7 @@ Each task is one self-contained fixture:
 - `files`: the starting repo contents, written relative to the fixture root before the first commit.
 - `task`: the task text, written to the run's task file.
 - `gate`: the visible gate commands the loop enforces during the run. Same shape as `gate` in `loop.config.mjs`.
-- `heldOutCheck`: hidden checks run against the approved worktree *after* the run finishes. They never appear in the gate or in any prompt, so they measure defects that got past both the gate and the review, not just gate coverage.
+- `heldOutCheck`: hidden checks run against the approved worktree _after_ the run finishes. They never appear in the gate or in any prompt, so they measure defects that got past both the gate and the review, not just gate coverage.
 - `phases`: optional phase list. Defaults to `['implement', 'gate', 'review']`.
 
 ### Config fields

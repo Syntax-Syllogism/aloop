@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile, spawn } from 'node:child_process';
@@ -7,7 +7,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseLoopArgs, runOperationalCommand, watchCommand } from '../bin/loop.mjs';
 import { hashConfig, hashText } from '../src/manifest.mjs';
-import { cancelRun, cleanRuns, doctor, getRun, getRunStatus, inspectRun, listRuns, replayRun, watchRuns } from '../src/operations.mjs';
+import {
+  cancelRun,
+  cleanRuns,
+  doctor,
+  getRun,
+  getRunStatus,
+  inspectRun,
+  listRuns,
+  replayRun,
+  watchRuns,
+} from '../src/operations.mjs';
 import { RunState } from '../src/state.mjs';
 
 const exec = promisify(execFile);
@@ -45,7 +55,10 @@ async function fixture() {
   await writeFile(join(root, 'README.md'), '# fixture\n');
   await git(root, 'add', '.');
   await git(root, 'commit', '-m', 'chore: init');
-  await writeFile(join(root, 'loop.config.mjs'), "export default { worktrees: false, phases: ['gate'], gate: ['true'] };\n");
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    "export default { worktrees: false, phases: ['gate'], gate: ['true'] };\n",
+  );
   return root;
 }
 
@@ -65,14 +78,30 @@ async function completedRun(root, name, { worktree = root, branch = `feat/${name
     gateReceipts: [{ command: 'true', ok: true }],
     artifacts: ['gate.log'],
   });
-  await state.record({ status: 'completed', prUrl: `https://github.com/example/project/pull/${name === 'old' ? 1 : 2}` });
+  await state.record({
+    status: 'completed',
+    prUrl: `https://github.com/example/project/pull/${name === 'old' ? 1 : 2}`,
+  });
   await state.release();
   return state;
 }
 
 test('operational read commands summarize state and manifest evidence', async () => {
   const root = await fixture();
-  await completedRun(root, 'demo');
+  const state = await completedRun(root, 'demo');
+  state.manifest.append({
+    phase: 'review',
+    role: 'judge',
+    round: 2,
+    status: 'completed',
+    decision: { repeated: true, matches: [{ current: 0, previous: 0 }], unmatched: [] },
+    matchSummary: 'src/current.mjs:2 — still missing auth ↔ src/previous.mjs:1 — missing auth',
+  });
+  await state.save();
+  await state.record({
+    currentPhase: 'gate',
+    agentSettings: { implement: { name: 'claude', model: 'sonnet', effort: 'high' } },
+  });
 
   const [listed] = await listRuns({ cwd: root });
   assert.equal(listed.name, 'demo');
@@ -85,6 +114,70 @@ test('operational read commands summarize state and manifest evidence', async ()
   assert.equal(inspected.phases[0].inputSha, 'before');
   assert.deepEqual(inspected.phases[0].gateReceipts, [{ command: 'true', ok: true }]);
   assert.deepEqual(inspected.phases[0].artifacts, ['gate.log']);
+  assert.deepEqual(inspected.agentSettings, { implement: { name: 'claude', model: 'sonnet', effort: 'high' } });
+  assert.equal(inspected.judge.repeated, true);
+  assert.match(inspected.judge.matchSummary, /still missing auth/);
+
+  const output = [];
+  await runOperationalCommand(parseLoopArgs(['inspect', 'demo', '--json']), {
+    cwd: root,
+    output: { log: (line) => output.push(line) },
+  });
+  assert.deepEqual(JSON.parse(output.join('\n')).agentSettings, {
+    implement: { name: 'claude', model: 'sonnet', effort: 'high' },
+  });
+  const statusOutput = [];
+  await runOperationalCommand(parseLoopArgs(['status', 'demo']), {
+    cwd: root,
+    output: { log: (line) => statusOutput.push(line) },
+  });
+  assert.ok(statusOutput.some((line) => line.includes('judge    : round 2 repeated')));
+  assert.ok(statusOutput.some((line) => line.includes('still missing auth')));
+  // A judge that only decided "not repeated" prints no all-zeros stalls line.
+  assert.ok(!statusOutput.some((line) => line.startsWith('stalls')));
+});
+
+test('metrics output shows judge stall reasons and review overrides', async () => {
+  const root = await fixture();
+  const stalled = await completedRun(root, 'stalled-judge');
+  stalled.manifest.append({
+    phase: 'review',
+    role: 'judge',
+    round: 2,
+    status: 'stalled',
+    decision: { repeated: true, matches: [{ current: 0, previous: 0 }], unmatched: [] },
+  });
+  stalled.manifest.append({
+    phase: 'review',
+    role: 'judge',
+    round: 3,
+    status: 'stalled',
+    failure: { reason: 'timeout' },
+  });
+  await stalled.save();
+  const overridden = await completedRun(root, 'overridden');
+  overridden.manifest.append({
+    phase: 'review',
+    role: 'review-override',
+    round: 2,
+    status: 'completed',
+    reason: 'repeated-blockers',
+  });
+  await overridden.save();
+  await completedRun(root, 'no-judge');
+
+  const output = [];
+  await runOperationalCommand(parseLoopArgs(['metrics']), { cwd: root, output: { log: (line) => output.push(line) } });
+  assert.ok(
+    output.includes('stalls      : 1 repeated-blocker stall(s), 1 failed-closed stall(s), 1 review override(s)'),
+  );
+
+  const statusOutput = [];
+  await runOperationalCommand(parseLoopArgs(['status', 'no-judge']), {
+    cwd: root,
+    output: { log: (line) => statusOutput.push(line) },
+  });
+  assert.ok(!statusOutput.some((line) => line.startsWith('stalls')));
 });
 
 test('status, list, and watch prefer the entered phase over the finished manifest phase', async () => {
@@ -103,21 +196,30 @@ test('status, list, and watch prefer the entered phase over the finished manifes
   assert.equal(status.phaseStartedAt, startedAt);
   const lines = [];
   await runOperationalCommand(parseLoopArgs(['status', 'in-flight']), {
-    cwd: root, output: { log: (line) => lines.push(line) },
+    cwd: root,
+    output: { log: (line) => lines.push(line) },
   });
   assert.ok(lines.includes(`phase    : review`));
   assert.ok(lines.includes(`started  : ${startedAt}`));
   const events = [];
   const controller = new AbortController();
-  for await (const event of watchRuns({ repos: [root], initial: true, signal: controller.signal,
+  for await (const event of watchRuns({
+    repos: [root],
+    initial: true,
+    signal: controller.signal,
     sleep: async () => controller.abort(),
-  })) events.push(event);
+  }))
+    events.push(event);
   assert.equal(events[0].currentPhase, 'review');
   assert.equal(events[0].phaseStartedAt, startedAt);
   await state.release();
 });
 
-async function replayableRun(root, name, { promptHash = hashText('Implement demo.'), baseSha = null, worktree = root } = {}) {
+async function replayableRun(
+  root,
+  name,
+  { promptHash = hashText('Implement demo.'), baseSha = null, worktree = root } = {},
+) {
   const state = await RunState.open(join(root, '.loop/runs'), name, { name, worktree });
   const resolvedConfig = { promptDir: '.loop/prompts' };
   state.manifest.append({
@@ -147,7 +249,7 @@ async function replayableRun(root, name, { promptHash = hashText('Implement demo
     gateReceipts: [{ command: 'npm test', exitCode: 0 }],
   });
   await state.saveSnapshot({
-    baseSha: baseSha ?? await git(root, 'rev-parse', 'HEAD'),
+    baseSha: baseSha ?? (await git(root, 'rev-parse', 'HEAD')),
     configHash: hashConfig(resolvedConfig),
     resolvedConfig,
     worktree,
@@ -169,10 +271,10 @@ test('replay verifies recorded prompt inputs and reconstructs the phase timeline
   assert.deepEqual(result.divergences, []);
 
   const output = [];
-  const cliResult = await runOperationalCommand(
-    parseLoopArgs(['replay', 'replayable', '--json']),
-    { cwd: root, output: { log: (line) => output.push(line) } },
-  );
+  const cliResult = await runOperationalCommand(parseLoopArgs(['replay', 'replayable', '--json']), {
+    cwd: root,
+    output: { log: (line) => output.push(line) },
+  });
   assert.equal(cliResult.timeline[0].prompt.status, 'verified');
   assert.equal(JSON.parse(output[0]).name, 'replayable');
 });
@@ -187,7 +289,10 @@ test('replay reports prompt and Git-state divergence without failing', async () 
 
   const result = await replayRun('tampered', { cwd: root });
   assert.equal(result.timeline[0].prompt.status, 'mismatch');
-  assert.deepEqual(result.divergences.map((item) => item.type), ['base-sha', 'worktree', 'prompt-hash']);
+  assert.deepEqual(
+    result.divergences.map((item) => item.type),
+    ['base-sha', 'worktree', 'prompt-hash'],
+  );
 });
 
 test('PR summaries ignore URLs in task and manifest text', async () => {
@@ -201,6 +306,35 @@ test('PR summaries ignore URLs in task and manifest text', async () => {
   assert.equal(listed.prUrl, null);
 });
 
+test('watch tolerates a listed lock owner that cannot be read', { skip: process.platform === 'win32' }, async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'released-owner', {}, { lock: false });
+  await state.record({ status: 'running' });
+  await mkdir(join(state.dir, 'lock'));
+  // A dangling link deterministically reproduces ENOENT after readdir listed
+  // the owner, as happens when release moves the lock between those reads.
+  await symlink(join(state.dir, 'removed-owner'), join(state.dir, 'lock/owner-99999999-cafe'));
+  const errors = [];
+  const events = [];
+  const controller = new AbortController();
+  const result = await watchCommand(parseLoopArgs(['watch', '--initial', '--once', '--only', 'status']), {
+    cwd: root,
+    output: {
+      write: (line, callback) => {
+        events.push(JSON.parse(line));
+        controller.abort();
+        callback?.();
+      },
+      error: (line) => errors.push(line),
+    },
+    signal: controller.signal,
+  });
+  assert.equal(result, 0);
+  assert.deepEqual(errors, []);
+  assert.equal(events[0].type, 'snapshot');
+  assert.equal(events[0].status, 'interrupted');
+});
+
 test('lock recovery refuses a dead runner with an active command', async () => {
   const root = await fixture();
   const state = await RunState.open(join(root, '.loop/runs'), 'active', { name: 'active' }, { lock: false });
@@ -209,7 +343,10 @@ test('lock recovery refuses a dead runner with an active command', async () => {
   const owner = { pid: 99999999, token: 'cafe', runId: state.data.runId };
   await writeFile(join(state.dir, `lock/owner-${owner.pid}-${owner.token}`), `${JSON.stringify(owner)}\n`);
   const command = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
-  await writeFile(join(state.dir, 'active-command.json'), `${JSON.stringify({ pid: 99999999, processGroupId: command.pid })}\n`);
+  await writeFile(
+    join(state.dir, 'active-command.json'),
+    `${JSON.stringify({ pid: 99999999, processGroupId: command.pid })}\n`,
+  );
 
   try {
     await assert.rejects(
@@ -237,7 +374,12 @@ test('cancel records cancellation after a runner finishes its final state write'
   const root = await fixture();
   const state = await RunState.open(join(root, '.loop/runs'), 'racing', { name: 'racing' }, { lock: false });
   await state.record({ status: 'running' });
-  const runner = spawn(process.execPath, ['--input-type=module', '-e', `
+  const runner = spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
     import { readFileSync, writeFileSync } from 'node:fs';
     process.on('SIGTERM', () => setTimeout(() => {
       const data = JSON.parse(readFileSync(process.env.STATE_PATH, 'utf8'));
@@ -248,7 +390,10 @@ test('cancel records cancellation after a runner finishes its final state write'
       process.exit(0);
     }, 100));
     setInterval(() => {}, 1000);
-  `], { env: { ...process.env, STATE_PATH: state.path }, stdio: 'ignore' });
+  `,
+    ],
+    { env: { ...process.env, STATE_PATH: state.path }, stdio: 'ignore' },
+  );
   await new Promise((resolve) => setTimeout(resolve, 50));
   const owner = { pid: runner.pid, token: 'a11ce', runId: state.data.runId };
   await mkdir(join(state.dir, 'lock'), { recursive: true });
@@ -268,7 +413,12 @@ test('cancel stops a command recorded while the runner is shutting down', async 
   const root = await fixture();
   const state = await RunState.open(join(root, '.loop/runs'), 'handoff', { name: 'handoff' }, { lock: false });
   await state.record({ status: 'running' });
-  const runner = spawn(process.execPath, ['--input-type=module', '-e', `
+  const runner = spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
     import { spawn } from 'node:child_process';
     import { writeFileSync } from 'node:fs';
     import { join } from 'node:path';
@@ -278,7 +428,10 @@ test('cancel stops a command recorded while the runner is shutting down', async 
       process.exit(0);
     });
     setInterval(() => {}, 1000);
-  `], { env: { ...process.env, RUN_DIR: state.dir }, stdio: 'ignore' });
+  `,
+    ],
+    { env: { ...process.env, RUN_DIR: state.dir }, stdio: 'ignore' },
+  );
   const owner = { pid: runner.pid, token: 'a11ce', runId: state.data.runId };
   await mkdir(join(state.dir, 'lock'), { recursive: true });
   await writeFile(join(state.dir, `lock/owner-${owner.pid}-${owner.token}`), `${JSON.stringify(owner)}\n`);
@@ -297,10 +450,7 @@ test('cancel rejects a completed run without changing its status', async () => {
   const root = await fixture();
   const state = await completedRun(root, 'finished');
 
-  await assert.rejects(
-    cancelRun('finished', { cwd: root }),
-    /not active/,
-  );
+  await assert.rejects(cancelRun('finished', { cwd: root }), /not active/);
   const saved = JSON.parse(await readFile(state.path, 'utf8'));
   assert.equal(saved.status, 'completed');
 });
@@ -315,7 +465,10 @@ test('cancel terminates a shell command process group and its child', async () =
     stdio: 'ignore',
   });
   const childPid = Number((await waitForFile(childPath)).trim());
-  await writeFile(join(state.dir, 'active-command.json'), `${JSON.stringify({ pid: command.pid, processGroupId: command.pid })}\n`);
+  await writeFile(
+    join(state.dir, 'active-command.json'),
+    `${JSON.stringify({ pid: command.pid, processGroupId: command.pid })}\n`,
+  );
 
   const result = await cancelRun('tree', { cwd: root });
   assert.equal(result.status, 'cancelled');
@@ -332,7 +485,10 @@ test('clean previews and then removes only old completed runs', async () => {
 
   const preview = await cleanRuns({ cwd: root, olderThanDays: 30 });
   assert.equal(preview.dryRun, true);
-  assert.deepEqual(preview.candidates.map((run) => run.name), ['old']);
+  assert.deepEqual(
+    preview.candidates.map((run) => run.name),
+    ['old'],
+  );
 
   const cleaned = await cleanRuns({ cwd: root, olderThanDays: 30, yes: true });
   assert.deepEqual(cleaned.removed, ['old']);
@@ -389,11 +545,14 @@ test('operational commands honor a custom runsDir and surface a broken config im
 
 test('doctor keeps configuration errors separate from unavailable tooling', async () => {
   const root = await fixture();
-  await writeFile(join(root, 'loop.config.mjs'), `export default {
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    `export default {
   phases: [{ name: 'check', kind: 'agent', prompt: 'docs' }],
   engines: { default: { name: 'missing-engine' } },
   adapters: { 'missing-engine': { command: () => ({ command: 'missing-engine', args: [] }) } },
-};\n`);
+};\n`,
+  );
 
   const result = await doctor({ cwd: root });
   assert.equal(result.checks.find((check) => check.name === 'config').ok, true);
@@ -402,7 +561,22 @@ test('doctor keeps configuration errors separate from unavailable tooling', asyn
 });
 
 test('watch parsing accepts multiple names and repos and validates watch-only options', () => {
-  const args = parseLoopArgs(['watch', 'alpha', 'beta', '--repo', '.', '--repo', '../other', '--interval', '2', '--timeout', '1.5m', '--only', 'status', '--initial']);
+  const args = parseLoopArgs([
+    'watch',
+    'alpha',
+    'beta',
+    '--repo',
+    '.',
+    '--repo',
+    '../other',
+    '--interval',
+    '2',
+    '--timeout',
+    '1.5m',
+    '--only',
+    'status',
+    '--initial',
+  ]);
   assert.deepEqual(args.runNames, ['alpha', 'beta']);
   assert.deepEqual(args.repo, ['.', '../other']);
   assert.equal(args.intervalMs, 2000);
@@ -423,26 +597,143 @@ test('watch snapshots existing runs and coalesces simultaneous status and phase 
   let sleeps = 0;
   const events = [];
   for await (const event of watchRuns({
-    repos: [root], initial: true, signal: controller.signal, intervalMs: 1,
+    repos: [root],
+    initial: true,
+    signal: controller.signal,
+    intervalMs: 1,
     sleep: async () => {
       sleeps += 1;
       if (sleeps === 1) {
         await state.release();
         state.manifest.append({ phase: 'gate', kind: 'gate', status: 'completed' });
-        await state.record({ status: 'stalled', currentPhase: 'gate', phaseStartedAt: '2026-09-28T10:01:00.000Z', stalled: { phase: 'gate', reason: 'round cap reached', findings: ['private detail'] } });
+        await state.record({
+          status: 'stalled',
+          currentPhase: 'gate',
+          phaseStartedAt: '2026-09-28T10:01:00.000Z',
+          stalled: { phase: 'gate', reason: 'round cap reached', findings: ['private detail'] },
+        });
       } else controller.abort();
     },
-  })) events.push(event);
+  }))
+    events.push(event);
 
   assert.equal(events[0].type, 'snapshot');
-  assert.deepEqual(events.slice(1).map(({ type, from, to }) => ({ type, from, to })), [
-    { type: 'status', from: 'running', to: 'stalled' },
-  ]);
+  assert.deepEqual(
+    events.slice(1).map(({ type, from, to }) => ({ type, from, to })),
+    [{ type: 'status', from: 'running', to: 'stalled' }],
+  );
   assert.equal(events[1].currentPhase, 'gate');
   assert.equal(events[1].phaseStartedAt, '2026-09-28T10:01:00.000Z');
   assert.deepEqual(events[1].stalled, { phase: 'gate', reason: 'round cap reached' });
   assert.equal(JSON.stringify(events[1]).includes('private detail'), false);
   assert.equal(events[1].repo, root);
+});
+
+test('watch emits one decision event per new judge decision and review override', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'judged', { name: 'judged' });
+  await state.record({ status: 'running', currentPhase: 'review' });
+  const controller = new AbortController();
+  const events = [];
+  let sleeps = 0;
+  for await (const event of watchRuns({
+    repos: [root],
+    signal: controller.signal,
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        state.manifest.append({
+          phase: 'review',
+          role: 'judge',
+          round: 2,
+          status: 'completed',
+          action: 'continue',
+          decision: { repeated: true, matches: [{ current: 0, previous: 0, probability: 0.82 }], unmatched: [] },
+        });
+        state.manifest.append({
+          phase: 'review',
+          role: 'review-override',
+          round: 2,
+          status: 'completed',
+          reason: 'repeated-blockers',
+          findings: [{ issue: 'still missing' }],
+        });
+        await state.save();
+      } else controller.abort();
+    },
+  }))
+    events.push(event);
+  await state.release();
+
+  assert.deepEqual(
+    events.map(({ type, name, decision }) => ({ type, name, decision })),
+    [
+      {
+        type: 'decision',
+        name: 'judged',
+        decision: {
+          phase: 'review',
+          round: 2,
+          outcome: 'repeated',
+          message: 'judge (round 2): repeated (1/1 blockers matched, min p 0.82) → continue',
+        },
+      },
+      {
+        type: 'decision',
+        name: 'judged',
+        decision: {
+          phase: 'review',
+          round: 2,
+          outcome: 'review-override',
+          message: 'review-override (round 2): continuing with 1 unresolved finding (repeated-blockers)',
+        },
+      },
+    ],
+  );
+});
+
+test('watch --only status suppresses judge decision events', async () => {
+  const root = await fixture();
+  const state = await RunState.open(join(root, '.loop/runs'), 'quiet-judge', { name: 'quiet-judge' });
+  await state.record({ status: 'running', currentPhase: 'review' });
+  const output = [];
+  const errors = [];
+  let snapshotWritten;
+  const snapshot = new Promise((resolve) => {
+    snapshotWritten = resolve;
+  });
+  const args = parseLoopArgs(['watch', '--only', 'status', '--initial', '--once']);
+  const watching = watchCommand(/** @type {any} */ ({ ...args, intervalMs: 20 }), {
+    cwd: root,
+    output: {
+      write: (line, callback) => {
+        output.push(line);
+        snapshotWritten();
+        callback?.();
+      },
+      error: (line) => errors.push(line),
+    },
+  });
+  await snapshot;
+  state.manifest.append({
+    phase: 'review',
+    role: 'judge',
+    round: 2,
+    status: 'stalled',
+    failure: { reason: 'timeout' },
+  });
+  await state.save();
+  // Let several polls see the decision before the status changes.
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await state.record({ status: 'stalled', stalled: { phase: 'review', reason: 'judge failed: timeout' } });
+  await state.release();
+
+  assert.equal(await watching, 0);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(
+    output.map((line) => JSON.parse(line).type),
+    ['snapshot', 'status'],
+  );
 });
 
 test('watch emits phase-only changes when status stays the same', async () => {
@@ -453,18 +744,21 @@ test('watch emits phase-only changes when status stays the same', async () => {
   const events = [];
   let sleeps = 0;
   for await (const event of watchRuns({
-    repos: [root], signal: controller.signal,
+    repos: [root],
+    signal: controller.signal,
     sleep: async () => {
       sleeps += 1;
       if (sleeps === 1) await state.record({ status: 'running', currentPhase: 'gate' });
       else controller.abort();
     },
-  })) events.push(event);
+  }))
+    events.push(event);
   await state.release();
 
-  assert.deepEqual(events.map(({ type, from, to }) => ({ type, from, to })), [
-    { type: 'phase', from: 'implement', to: 'gate' },
-  ]);
+  assert.deepEqual(
+    events.map(({ type, from, to }) => ({ type, from, to })),
+    [{ type: 'phase', from: 'implement', to: 'gate' }],
+  );
 });
 
 test('watch does not emit a phase event for a new start time with the same phase', async () => {
@@ -474,12 +768,15 @@ test('watch does not emit a phase event for a new start time with the same phase
   const controller = new AbortController();
   const events = [];
   let sleeps = 0;
-  for await (const event of watchRuns({ repos: [root], signal: controller.signal,
+  for await (const event of watchRuns({
+    repos: [root],
+    signal: controller.signal,
     sleep: async () => {
       if (++sleeps === 1) await state.enterPhase('gate');
       else controller.abort();
     },
-  })) events.push(event);
+  }))
+    events.push(event);
   assert.deepEqual(events, []);
   await state.release();
 });
@@ -490,24 +787,36 @@ test('watch --only status ignores phase events and --once waits past initial sna
   await state.record({ status: 'running', currentPhase: 'implement' });
   const output = [];
   let snapshotWritten;
-  const snapshot = new Promise((resolve) => { snapshotWritten = resolve; });
+  const snapshot = new Promise((resolve) => {
+    snapshotWritten = resolve;
+  });
   let settled = false;
-  const watching = watchCommand(parseLoopArgs([
-    'watch', '--only', 'status', '--initial', '--once', '--interval', '1',
-  ]), {
-    cwd: root,
-    output: {
-      write: (line, callback) => { output.push(line); snapshotWritten(); callback?.(); },
-      error: (line) => output.push(line),
+  const watching = watchCommand(
+    parseLoopArgs(['watch', '--only', 'status', '--initial', '--once', '--interval', '1']),
+    {
+      cwd: root,
+      output: {
+        write: (line, callback) => {
+          output.push(line);
+          snapshotWritten();
+          callback?.();
+        },
+        error: (line) => output.push(line),
+      },
     },
-  }).finally(() => { settled = true; });
+  ).finally(() => {
+    settled = true;
+  });
 
   await snapshot;
   state.manifest.append({ phase: 'gate', kind: 'gate', status: 'completed' });
   await state.record({ status: 'running', currentPhase: 'gate' });
   // Hold the phase-only change across at least one 1s poll before completing.
   await new Promise((resolve) => setTimeout(resolve, 2200));
-  assert.deepEqual(output.map((line) => JSON.parse(line).type), ['snapshot']);
+  assert.deepEqual(
+    output.map((line) => JSON.parse(line).type),
+    ['snapshot'],
+  );
   assert.equal(settled, false);
 
   await state.record({ status: 'completed', currentPhase: 'gate' });
@@ -515,7 +824,10 @@ test('watch --only status ignores phase events and --once waits past initial sna
   const result = await watching;
 
   assert.equal(result, 0);
-  assert.deepEqual(output.map((line) => JSON.parse(line).type), ['snapshot', 'status']);
+  assert.deepEqual(
+    output.map((line) => JSON.parse(line).type),
+    ['snapshot', 'status'],
+  );
   assert.equal(JSON.parse(output[1]).to, 'completed');
 });
 
@@ -530,7 +842,9 @@ test('watch recovers after a transient unreadable run manifest', async () => {
   const warnings = [];
   let sleeps = 0;
   for await (const event of watchRuns({
-    repos: [root], initial: true, signal: controller.signal,
+    repos: [root],
+    initial: true,
+    signal: controller.signal,
     warn: (message) => warnings.push(message),
     sleep: async () => {
       sleeps += 1;
@@ -538,10 +852,14 @@ test('watch recovers after a transient unreadable run manifest', async () => {
       else if (sleeps === 2) await writeFile(manifestPath, manifest);
       else controller.abort();
     },
-  })) events.push(event);
+  }))
+    events.push(event);
   await state.release();
 
-  assert.deepEqual(events.map(({ type }) => type), ['snapshot']);
+  assert.deepEqual(
+    events.map(({ type }) => type),
+    ['snapshot'],
+  );
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /could not read runs/);
 });
@@ -552,15 +870,21 @@ test('watch keeps a persisted running run active while its command child lives',
   await state.record({ status: 'running', currentPhase: 'implement' });
   await state.release();
   const child = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
-  await writeFile(join(state.dir, 'active-command.json'), `${JSON.stringify({ pid: child.pid, processGroupId: child.pid })}\n`);
+  await writeFile(
+    join(state.dir, 'active-command.json'),
+    `${JSON.stringify({ pid: child.pid, processGroupId: child.pid })}\n`,
+  );
   const controller = new AbortController();
   const events = [];
 
   try {
     for await (const event of watchRuns({
-      repos: [root], initial: true, signal: controller.signal,
+      repos: [root],
+      initial: true,
+      signal: controller.signal,
       sleep: async () => controller.abort(),
-    })) events.push(event);
+    }))
+      events.push(event);
   } finally {
     process.kill(-child.pid, 'SIGKILL');
   }
@@ -573,13 +897,19 @@ test('watch omits stale stalled details after a stalled run resumes', async () =
   const root = await fixture();
   const runsDir = join(root, '.loop/runs');
   const state = await RunState.open(runsDir, 'resumed', { name: 'resumed' });
-  await state.record({ status: 'stalled', currentPhase: 'review', stalled: { phase: 'review', reason: 'round cap reached' } });
+  await state.record({
+    status: 'stalled',
+    currentPhase: 'review',
+    stalled: { phase: 'review', reason: 'round cap reached' },
+  });
   await state.release();
   const controller = new AbortController();
   const events = [];
   let sleeps = 0;
   for await (const event of watchRuns({
-    repos: [root], initial: true, signal: controller.signal,
+    repos: [root],
+    initial: true,
+    signal: controller.signal,
     sleep: async () => {
       sleeps += 1;
       if (sleeps === 1) {
@@ -589,7 +919,8 @@ test('watch omits stale stalled details after a stalled run resumes', async () =
         controller.abort();
       }
     },
-  })) events.push(event);
+  }))
+    events.push(event);
 
   assert.equal(events[0].status, 'stalled');
   assert.deepEqual(events[0].stalled, { phase: 'review', reason: 'round cap reached' });
@@ -608,9 +939,12 @@ test('watch detects a persisted running state with no live lock as interrupted',
   const controller = new AbortController();
   const events = [];
   for await (const event of watchRuns({
-    repos: [root], initial: true, signal: controller.signal,
+    repos: [root],
+    initial: true,
+    signal: controller.signal,
     sleep: async () => controller.abort(),
-  })) events.push(event);
+  }))
+    events.push(event);
   assert.equal(events[0].type, 'snapshot');
   assert.equal(events[0].status, 'interrupted');
   assert.equal((await cancelRun('interrupted', { cwd: root })).status, 'cancelled');
@@ -621,7 +955,13 @@ test('watch timeout emits one NDJSON timeout event and returns exit code 2', asy
   const output = [];
   const result = await watchCommand(parseLoopArgs(['watch', '--timeout', '0.01s']), {
     cwd: root,
-    output: { write: (line, callback) => { output.push(line); callback?.(); }, error: (line) => output.push(line) },
+    output: {
+      write: (line, callback) => {
+        output.push(line);
+        callback?.();
+      },
+      error: (line) => output.push(line),
+    },
   });
   assert.equal(result, 2);
   assert.equal(JSON.parse(output[0]).type, 'timeout');
@@ -634,7 +974,10 @@ test('watch reports appeared and removed runs independently across repositories'
   let sleeps = 0;
   const events = [];
   for await (const event of watchRuns({
-    repos: [first, second], names: ['same-name'], signal: controller.signal, intervalMs: 1,
+    repos: [first, second],
+    names: ['same-name'],
+    signal: controller.signal,
+    intervalMs: 1,
     sleep: async () => {
       sleeps += 1;
       if (sleeps === 1) {
@@ -647,13 +990,17 @@ test('watch reports appeared and removed runs independently across repositories'
         await rm(join(first, '.loop/runs/same-name'), { recursive: true });
       } else controller.abort();
     },
-  })) events.push(event);
+  }))
+    events.push(event);
 
-  assert.deepEqual(events.map(({ type, repo, name }) => ({ type, repo, name })), [
-    { type: 'appeared', repo: first, name: 'same-name' },
-    { type: 'appeared', repo: second, name: 'same-name' },
-    { type: 'removed', repo: first, name: 'same-name' },
-  ]);
+  assert.deepEqual(
+    events.map(({ type, repo, name }) => ({ type, repo, name })),
+    [
+      { type: 'appeared', repo: first, name: 'same-name' },
+      { type: 'appeared', repo: second, name: 'same-name' },
+      { type: 'removed', repo: first, name: 'same-name' },
+    ],
+  );
 });
 
 test('watch --once exits after the first appeared event', async () => {
@@ -667,7 +1014,13 @@ test('watch --once exits after the first appeared event', async () => {
   const creation = new Promise((resolve) => setTimeout(() => createRun().then(resolve), 300));
   const result = await watchCommand(parseLoopArgs(['watch', '--once', '--interval', '1']), {
     cwd: root,
-    output: { write: (line, callback) => { output.push(line); callback?.(); }, error: (line) => output.push(line) },
+    output: {
+      write: (line, callback) => {
+        output.push(line);
+        callback?.();
+      },
+      error: (line) => output.push(line),
+    },
   });
   await creation;
   assert.equal(result, 0);

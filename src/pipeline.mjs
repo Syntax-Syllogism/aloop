@@ -1,12 +1,21 @@
 /** @typedef {import('./types.js').Config} Config */
 /** @typedef {import('./types.js').Operations} Operations */
 /** @typedef {import('./types.js').Summary} Summary */
+/** @typedef {import('./types.js').Engine} Engine */
 
 import { appendFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import packageJson from '../package.json' with { type: 'json' };
-import { adapterFor, agentForPhase, permissionLevel, PERMISSIONS, passthroughRenderer, validateAgent } from './adapters.mjs';
+import {
+  adapterFor,
+  permissionLevel,
+  PERMISSIONS,
+  passthroughRenderer,
+  resolvePhaseAgent,
+  validateAgent,
+} from './adapters.mjs';
+import { agentDiagnostic, diagnoseAgents, inlineAgentPrompt, resolveAgentDefinition } from './agents.mjs';
 import { resolveShell, runCommand } from './command.mjs';
 import { loadConfig, normalizeCommandEntry } from './config.mjs';
 import { GitFacade } from './git.mjs';
@@ -15,7 +24,17 @@ import { canonicalizeConfig, hashConfig, hashText } from './manifest.mjs';
 import { computeRunMetrics } from './metrics.mjs';
 import { publish } from './publish.mjs';
 import { renderPrompt, resolvePresetPromptDir, withOperatorNote } from './prompts.mjs';
-import { banner, describeAgent, ensureConfirmationAvailable, log, openTerminalInput, report, resetRenderer, setRenderer, writeOutput } from './reporter.mjs';
+import {
+  banner,
+  describeAgent,
+  ensureConfirmationAvailable,
+  log,
+  openTerminalInput,
+  report,
+  resetRenderer,
+  setRenderer,
+  writeOutput,
+} from './reporter.mjs';
 import { RunState, slugFor } from './state.mjs';
 import { runPhases } from './runner.mjs';
 import { createQuietRenderer, resolveQuiet } from './quiet.mjs';
@@ -61,12 +80,60 @@ function overrideSavedEngines(agentSettings, { engine, model, effort }, customAd
       if (agent.name === target.name && agent.model === target.model && agent.effort === target.effort) {
         return [phaseName, agent];
       }
-      const overridden = { ...target };
+      const overridden = { ...target, ...(agent.name === target.name && agent.agent ? { agent: agent.agent } : {}) };
       overrides[phaseName] = { from: agent, to: overridden };
       return [phaseName, overridden];
     }),
   );
   return { agentSettings: overriddenSettings, overrides };
+}
+
+/**
+ * A name-less phase entry inherits its engine from its base (default, or the
+ * review engine for specialized reviewers). When --engine moves that base to a
+ * different engine, the entry's model/effort were written for the old engine
+ * and are dropped for the same reason --engine drops them from default.
+ * @param {Config} config @param {Engine} previousDefault
+ */
+function dropStalePhaseEngineSettings(config, previousDefault) {
+  const baseName = (engines, phase) => {
+    const group = phase.reviewGroup ? engines[phase.reviewGroup] : null;
+    return (typeof group === 'string' ? group : group?.name) ?? engines.default.name;
+  };
+  const previousEngines = { ...config.engines, default: previousDefault };
+  const phases = config.resolvedPhases.flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])]);
+  for (const phase of phases) {
+    const entry = config.engines[phase.name];
+    if (!entry || typeof entry === 'string' || entry.name || !(entry.model || entry.effort || entry.agent)) continue;
+    const from = baseName(previousEngines, phase);
+    const to = baseName(config.engines, phase);
+    if (from === to) continue;
+    const dropped = [
+      entry.model && `model=${entry.model}`,
+      entry.effort && `effort=${entry.effort}`,
+      entry.agent && `agent=${entry.agent}`,
+    ].filter(Boolean);
+    config.engines[phase.name] = {};
+    log(`engines.${phase.name}: dropped ${dropped.join(' ')} (configured for ${from}; this run uses ${to})`);
+  }
+}
+
+function logAgentSettings(agentSettings) {
+  const settings = Object.entries(agentSettings);
+  if (!settings.length) return;
+  const width = Math.max(...settings.map(([phaseName]) => phaseName.length));
+  settings.forEach(([phaseName, agent], index) => {
+    log(`${index === 0 ? 'engines   :' : '           '} ${phaseName.padEnd(width)}  ${describeAgent(agent)}`);
+  });
+}
+
+function logJudge(judge) {
+  if (!judge) {
+    log('judge     : disabled');
+    return;
+  }
+  const transport = judge.baseUrl ? 'http' : typeof judge.judge === 'function' ? 'function' : 'command';
+  log(`judge     : ${judge.name ?? '(unnamed)'} kind=${judge.kind} transport=${transport} on-repeat=${judge.onRepeat}`);
 }
 
 function configOverrideRecord(config, path) {
@@ -115,7 +182,6 @@ async function createSourceSnapshot(ctx) {
     throw error;
   }
 }
-
 
 async function tee(path, text) {
   await appendFile(path, text);
@@ -174,6 +240,7 @@ function engineRecord(agent) {
     name: agent.name,
     ...(agent.model ? { model: agent.model } : {}),
     ...(agent.effort ? { effort: agent.effort } : {}),
+    ...(agent.agent ? { agent: agent.agent } : {}),
   };
 }
 
@@ -248,11 +315,14 @@ function logBudgetStall(budget) {
 
 async function recordBudgetStall(ctx, phase, budget) {
   logBudgetStall(budget);
-  await recordManifest(ctx, manifestEntry(phase, ctx, {
-    status: 'stalled',
-    budgetStall: true,
-    failure: { reason: budget.reason, usage: budget.usage, limit: budget.limit },
-  }));
+  await recordManifest(
+    ctx,
+    manifestEntry(phase, ctx, {
+      status: 'stalled',
+      budgetStall: true,
+      failure: { reason: budget.reason, usage: budget.usage, limit: budget.limit },
+    }),
+  );
   return { phase: phase.name, reason: budget.reason, output: budget.output };
 }
 
@@ -268,9 +338,7 @@ async function recordManifest(ctx, entry) {
 
 async function markStalledManifest(ctx, phase, result, startIndex) {
   const stalledPhase = result.stalledPhase ?? phase.name;
-  const entry = ctx.state.manifest.entries
-    .slice(startIndex)
-    .findLast((candidate) => candidate.phase === stalledPhase);
+  const entry = ctx.state.manifest.entries.slice(startIndex).findLast((candidate) => candidate.phase === stalledPhase);
   if (entry) {
     entry.status = 'stalled';
     await ctx.state.save();
@@ -281,7 +349,9 @@ async function markStalledManifest(ctx, phase, result, startIndex) {
 
 async function runGate(phase, ctx) {
   const commands = phase.commands ?? ctx.config.gate;
-  const normalizedCommands = commands.map((entry, index) => normalizeCommandEntry(entry, { label: `phases.${phase.name}.gate`, index }));
+  const normalizedCommands = commands.map((entry, index) =>
+    normalizeCommandEntry(entry, { label: `phases.${phase.name}.gate`, index }),
+  );
   const logFile = ctx.state.logPath(phase.name);
   await tee(logFile, '');
   const started = performance.now();
@@ -290,11 +360,7 @@ async function runGate(phase, ctx) {
     command: ctx.config.shell ?? 'sh',
     args: ['-c', normalizedCommands.map((entry) => entry.display).join(' && ')],
     cwd: ctx.worktree,
-    mounts: [
-      { path: ctx.worktree, mode: 'ro' },
-      { path: ctx.state.dir, mode: 'rw' },
-      ...gitMetadataMount(ctx, 'ro'),
-    ],
+    mounts: [{ path: ctx.worktree, mode: 'ro' }, { path: ctx.state.dir, mode: 'rw' }, ...gitMetadataMount(ctx, 'ro')],
   });
   for (const normalized of normalizedCommands) {
     const { display } = normalized;
@@ -374,21 +440,21 @@ async function runPublish(phase, ctx, { remote, branch, base, approvedSha }) {
     inputSha,
     outputSha,
     approvedSha,
-    artifacts: [
-      ...(await fileExists(descriptionPath) ? ['pr.md'] : []),
-    ],
+    artifacts: [...((await fileExists(descriptionPath)) ? ['pr.md'] : [])],
     startedAt,
     completedAt: new Date().toISOString(),
     durationMs: Math.round(performance.now() - started),
-    ...(result ? {
-      remoteSha: result.remoteSha,
-      prUrl: result.pullRequest.url,
-      pullRequest: result.pullRequest,
-      status: 'completed',
-    } : {
-      status: 'stalled',
-      failure: { reason: failure?.message ?? 'publishing failed' },
-    }),
+    ...(result
+      ? {
+          remoteSha: result.remoteSha,
+          prUrl: result.pullRequest.url,
+          pullRequest: result.pullRequest,
+          status: 'completed',
+        }
+      : {
+          status: 'stalled',
+          failure: { reason: failure?.message ?? 'publishing failed' },
+        }),
   });
   return { ok: Boolean(result), result, manifest, failure };
 }
@@ -493,10 +559,7 @@ async function runAgent(phase, ctx, variables) {
   const startedAt = new Date().toISOString();
   const started = performance.now();
   const inputSha = ctx.dryRun ? null : await ctx.git.revParse();
-  const agent = ctx.agentSettings[phase.name]
-    ?? (phase.reviewGroup
-      ? ctx.agentSettings[phase.reviewGroup] ?? agentForPhase(ctx.config, phase.reviewGroup)
-      : agentForPhase(ctx.config, phase.name));
+  const agent = ctx.agentSettings[phase.name] ?? resolvePhaseAgent(ctx.config, phase);
   const engineOverride = ctx.engineOverrides[phase.name];
   const adapter = adapterFor(agent.name, ctx.config.adapters);
   const worktreeWrite = permissionLevel(phase.permissions) === PERMISSIONS.WRITE_WORKTREE;
@@ -505,135 +568,210 @@ async function runAgent(phase, ctx, variables) {
   const agentRepo = sourceSnapshot?.path ?? ctx.worktree;
 
   try {
-  const promptVariables = {
-    ...variables,
-    ...(sourceSnapshot ? { REPO: agentRepo } : {}),
-  };
-  const rendered = await renderPrompt(phase.prompt, promptVariables, {
-    promptDirs: ctx.promptDirs,
-  });
-  const receivesOperatorNote = ctx.note
-    && (ctx.note.targetPhase === phase.name || ctx.note.repairPhase === phase.name);
-  const operatorNote = receivesOperatorNote ? ctx.note.text : null;
-  const prompt = withOperatorNote(rendered.prompt, operatorNote);
-  const { path } = rendered;
-  const promptHash = hashText(prompt);
-  log(`  engine: ${agent.name}${agent.model ? `   model: ${agent.model}` : ''}${agent.effort ? `   effort: ${agent.effort}` : ''}   prompt: ${path}`);
-  if (engineOverride) log(`  resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)}`);
-
-  // Read-only agents inspect the disposable source snapshot. Their writable
-  // added directories still point only at the run artifacts (and task file for
-  // review), so changing cwd cannot reach the real worktree.
-  const agentCwd = sourceSnapshot?.path ?? (artifactOnly ? ctx.state.dir : ctx.worktree);
-  // Only the verdict phase's prompt is instructed to edit the task file (its
-  // Code Review section), so only it is granted the external task-file repo as
-  // writable. Every other artifact-only phase — pr-description included — gets
-  // just its own run directory; it has no business touching the task file repo.
-  const artifactOnlyDirs = phase.role === 'verdict' ? ctx.artifactDirs : [ctx.state.dir];
-  const { command, args, input } = adapter.command({
-    prompt,
-    cwd: agentCwd,
-    addDirs: worktreeWrite ? ctx.addDirs : [...artifactOnlyDirs, ...(sourceSnapshot ? [sourceSnapshot.path] : [])],
-    timeoutMs: ctx.config.timeoutMs,
-    agent,
-    permissions: phase.permissions,
-    artifactOnly,
-  });
-  const execution = phaseInvocation(phase, ctx, {
-    command,
-    args,
-    cwd: agentCwd,
-    mounts: [
-      { path: ctx.worktree, mode: worktreeWrite ? 'rw' : 'ro' },
-      ...(worktreeWrite
-        ? ctx.addDirs.filter((path) => path !== ctx.worktree).map((path) => ({ path, mode: 'rw' }))
-        : artifactOnlyDirs.map((path) => ({ path, mode: 'rw' }))),
-      ...(sourceSnapshot ? [{ path: sourceSnapshot.path, mode: 'ro' }] : []),
-      ...gitMetadataMount(ctx, worktreeWrite ? 'rw' : 'ro'),
-    ],
-  });
-  if (ctx.dryRun) {
-    log(`  would run: ${[execution.command, ...execution.args].map((value) => JSON.stringify(String(value))).join(' ')}`);
-    log(`\n${prompt}\n`);
-    return { agent, command, args, execution, dryRun: true };
-  }
-  const logFile = ctx.state.logPath(phase.name);
-  const overrideNote = engineOverride ? ` (resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)})` : '';
-  await tee(logFile, `\n=== ${new Date().toISOString()} ${describeAgent(agent)} ${phase.name}${overrideNote} ===\n`);
-  // Only stdout carries the engine's structured stream; stderr is already
-  // human text and passes through, so a vendor warning is never swallowed.
-  const renderer = adapter.createRenderer?.() ?? passthroughRenderer();
-  let bytesEmitted = 0;
-  const pendingLogWrites = [];
-  const emit = (text) => {
-    if (!text) return;
-    bytesEmitted += Buffer.byteLength(text);
-    writeOutput(text);
-    pendingLogWrites.push(tee(logFile, text));
-  };
-  let commandError;
-  try {
-    await runCommand(execution.command, execution.args, {
-      cwd: execution.policy.mode === 'host' ? agentCwd : undefined,
-      env: execution.env,
-      timeoutMs: ctx.config.timeoutMs,
-      activeProcessPath: ctx.activeProcessPath,
-      // Adapters that carry the prompt on stdin (gemini, to dodge the cmd.exe
-      // command-line limit on Windows) return it as `input`; a hermetic wrapper
-      // forwards stdin to the sandboxed process unchanged.
-      input,
-      onOutput: (text, stream) => emit(stream === 'stderr' ? text : renderer.write(text)),
+    const promptVariables = {
+      ...variables,
+      ...(sourceSnapshot ? { REPO: agentRepo } : {}),
+    };
+    const rendered = await renderPrompt(phase.prompt, promptVariables, {
+      promptDirs: ctx.promptDirs,
     });
-  } catch (error) {
-    commandError = error;
-  } finally {
-    // A killed or failed run still has a partial line worth reading.
-    emit(renderer.end());
-    await Promise.all(pendingLogWrites);
-  }
-  const usage = renderer.usage?.() ?? adapter.usage?.() ?? null;
+    const receivesOperatorNote =
+      ctx.note && (ctx.note.targetPhase === phase.name || ctx.note.repairPhase === phase.name);
+    const operatorNote = receivesOperatorNote ? ctx.note.text : null;
+    const taskPrompt = withOperatorNote(rendered.prompt, operatorNote);
+    let prompt = taskPrompt;
+    let agentStatus;
+    let agentSource;
+    const runtimeWarnings = [];
+    const commandAgent = { ...agent };
+    if (agent.agent) {
+      const support = adapter.agentSupport;
+      if (support === 'inline') {
+        const found = await resolveAgentDefinition(agent.agent, {
+          engine: agent.name,
+          support,
+          worktree: ctx.worktree,
+        });
+        if (found) {
+          prompt = inlineAgentPrompt(taskPrompt, agent.agent, found.body);
+          agentSource = { path: found.path, hash: found.hash };
+          agentStatus = 'inline';
+          const previous = ctx.state.manifest.entries.findLast(
+            (entry) => entry.engine?.agent === agent.agent && entry.agentSource,
+          );
+          if (previous && previous.agentSource.hash !== found.hash) {
+            log(`  agent "${agent.agent}" definition changed since round ${previous.round ?? 1}`);
+          }
+        } else {
+          agentStatus = 'unresolved';
+          runtimeWarnings.push(agentDiagnostic('agent-not-found', phase.name, agent.name, agent.agent));
+        }
+      } else if (support === 'delegate') {
+        prompt = adapter.delegatePrompt?.(taskPrompt, agent.agent) ?? taskPrompt;
+        agentStatus = 'unconfirmed';
+      } else if (support === 'native') {
+        const missing =
+          !Object.hasOwn(ctx.config.adapters ?? {}, agent.name) &&
+          ctx.agentDiagnostics.some((item) => item.phase === phase.name && item.code === 'agent-not-found');
+        agentStatus = missing ? 'unresolved' : 'native';
+        if (missing) delete commandAgent.agent;
+      } else {
+        agentStatus = 'unsupported';
+        runtimeWarnings.push(agentDiagnostic('agent-unsupported-engine', phase.name, agent.name, agent.agent));
+      }
+      if (support !== 'native') delete commandAgent.agent;
+    }
+    const agentPrefix = prompt.endsWith(taskPrompt) ? prompt.slice(0, prompt.length - taskPrompt.length) : undefined;
+    const { path } = rendered;
+    const promptHash = hashText(prompt);
+    log(
+      `  engine: ${agent.name}${agent.model ? `   model: ${agent.model}` : ''}${agent.effort ? `   effort: ${agent.effort}` : ''}${agent.agent ? `   agent: ${agent.agent}` : ''}   prompt: ${path}`,
+    );
+    if (engineOverride)
+      log(`  resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)}`);
 
-  const manifest = manifestEntry(phase, ctx, {
-    inputSha,
-    outputSha: await ctx.git.revParse(),
-    promptHash,
-    promptInput: {
-      template: phase.prompt,
-      templateBody: rendered.body,
-      variables: promptVariables,
-      operatorNote,
-    },
-    artifacts: [`${phase.name}.log`],
-    engine: engineRecord(agent),
-    startedAt,
-    completedAt: new Date().toISOString(),
-    durationMs: Math.round(performance.now() - started),
-    ...(usage?.tokens !== undefined ? { tokens: usage.tokens } : {}),
-    ...(usage?.cost !== undefined ? { cost: usage.cost } : {}),
-    ...(commandError ? {
-      status: 'stalled',
-      failure: {
-        command,
-        code: commandError.code ?? null,
-        timedOut: Boolean(commandError.timedOut),
+    // Read-only agents inspect the disposable source snapshot. Their writable
+    // added directories still point only at the run artifacts (and task file for
+    // review), so changing cwd cannot reach the real worktree.
+    const agentCwd = sourceSnapshot?.path ?? (artifactOnly ? ctx.state.dir : ctx.worktree);
+    // Only the verdict phase's prompt is instructed to edit the task file (its
+    // Code Review section), so only it is granted the external task-file repo as
+    // writable. Every other artifact-only phase — pr-description included — gets
+    // just its own run directory; it has no business touching the task file repo.
+    const artifactOnlyDirs = phase.role === 'verdict' ? ctx.artifactDirs : [ctx.state.dir];
+    const { command, args, input } = adapter.command({
+      prompt,
+      cwd: agentCwd,
+      addDirs: worktreeWrite ? ctx.addDirs : [...artifactOnlyDirs, ...(sourceSnapshot ? [sourceSnapshot.path] : [])],
+      timeoutMs: ctx.config.timeoutMs,
+      agent: commandAgent,
+      permissions: phase.permissions,
+      artifactOnly,
+    });
+    const execution = phaseInvocation(phase, ctx, {
+      command,
+      args,
+      cwd: agentCwd,
+      mounts: [
+        { path: ctx.worktree, mode: worktreeWrite ? 'rw' : 'ro' },
+        ...(worktreeWrite
+          ? ctx.addDirs.filter((path) => path !== ctx.worktree).map((path) => ({ path, mode: 'rw' }))
+          : artifactOnlyDirs.map((path) => ({ path, mode: 'rw' }))),
+        ...(sourceSnapshot ? [{ path: sourceSnapshot.path, mode: 'ro' }] : []),
+        ...gitMetadataMount(ctx, worktreeWrite ? 'rw' : 'ro'),
+      ],
+    });
+    if (ctx.dryRun) {
+      log(
+        `  would run: ${[execution.command, ...execution.args].map((value) => JSON.stringify(String(value))).join(' ')}`,
+      );
+      log(`\n${prompt}\n`);
+      return { agent, command, args, execution, dryRun: true };
+    }
+    const logFile = ctx.state.logPath(phase.name);
+    const overrideNote = engineOverride
+      ? ` (resumed override: ${describeAgent(engineOverride.from)} → ${describeAgent(engineOverride.to)})`
+      : '';
+    await tee(logFile, `\n=== ${new Date().toISOString()} ${describeAgent(agent)} ${phase.name}${overrideNote} ===\n`);
+    // Only stdout carries the engine's structured stream; stderr is already
+    // human text and passes through, so a vendor warning is never swallowed.
+    const warn = async (diagnostic) => {
+      const text = `⚠ agent ${phase.name}: ${diagnostic.message}\n  → ${diagnostic.hint} (${diagnostic.docs})`;
+      if (!ctx.agentDiagnostics.some((item) => item.phase === phase.name && item.code === diagnostic.code)) log(text);
+      await tee(logFile, `${text}\n`);
+    };
+    for (const diagnostic of ctx.agentDiagnostics.filter(
+      (item) => item.phase === phase.name && item.level === 'warn',
+    )) {
+      await tee(logFile, `⚠ agent ${phase.name}: ${diagnostic.message}\n  → ${diagnostic.hint} (${diagnostic.docs})\n`);
+    }
+    for (const diagnostic of runtimeWarnings) {
+      if (!ctx.agentDiagnostics.some((item) => item.phase === phase.name && item.code === diagnostic.code))
+        await warn(diagnostic);
+    }
+    const renderer = adapter.createRenderer?.() ?? passthroughRenderer();
+    let bytesEmitted = 0;
+    const pendingLogWrites = [];
+    const emit = (text) => {
+      if (!text) return;
+      bytesEmitted += Buffer.byteLength(text);
+      writeOutput(text);
+      pendingLogWrites.push(tee(logFile, text));
+    };
+    let commandError;
+    try {
+      await runCommand(execution.command, execution.args, {
+        cwd: execution.policy.mode === 'host' ? agentCwd : undefined,
+        env: execution.env,
+        timeoutMs: ctx.config.timeoutMs,
+        activeProcessPath: ctx.activeProcessPath,
+        // Adapters that carry the prompt on stdin (gemini, to dodge the cmd.exe
+        // command-line limit on Windows) return it as `input`; a hermetic wrapper
+        // forwards stdin to the sandboxed process unchanged.
+        input,
+        onOutput: (text, stream) => emit(stream === 'stderr' ? text : renderer.write(text)),
+      });
+    } catch (error) {
+      commandError = error;
+    } finally {
+      // A killed or failed run still has a partial line worth reading.
+      emit(renderer.end());
+      await Promise.all(pendingLogWrites);
+    }
+    if (agent.agent && adapter.agentSupport === 'delegate') {
+      agentStatus = renderer.agentInvoked?.(agent.agent) === true ? 'confirmed' : 'unconfirmed';
+      if (agentStatus === 'unconfirmed')
+        await warn(agentDiagnostic('agent-unconfirmed', phase.name, agent.name, agent.agent));
+    }
+    const usage = renderer.usage?.() ?? adapter.usage?.() ?? null;
+
+    const manifest = manifestEntry(phase, ctx, {
+      inputSha,
+      outputSha: await ctx.git.revParse(),
+      promptHash,
+      promptInput: {
+        template: phase.prompt,
+        templateBody: rendered.body,
+        variables: promptVariables,
+        operatorNote,
+        ...(agentPrefix ? { agentPrefix } : {}),
+        ...(agentPrefix === undefined ? { wrappedPrompt: prompt } : {}),
       },
-    } : {}),
-    execution: execution.policy,
-    ...(!commandError && phase.name === 'pr-description' && await fileExists(join(ctx.state.dir, 'pr.md'))
-      ? { artifacts: [`${phase.name}.log`, 'pr.md'] }
-      : {}),
-  });
-  if (commandError) {
-    await recordManifest(ctx, manifest);
-    throw commandError;
-  }
+      artifacts: [`${phase.name}.log`],
+      engine: engineRecord(agent),
+      ...(agentStatus ? { agentStatus } : {}),
+      ...(agentSource ? { agentSource } : {}),
+      startedAt,
+      completedAt: new Date().toISOString(),
+      durationMs: Math.round(performance.now() - started),
+      ...(usage?.tokens !== undefined ? { tokens: usage.tokens } : {}),
+      ...(usage?.cost !== undefined ? { cost: usage.cost } : {}),
+      ...(commandError
+        ? {
+            status: 'stalled',
+            failure: {
+              command,
+              code: commandError.code ?? null,
+              timedOut: Boolean(commandError.timedOut),
+            },
+          }
+        : {}),
+      execution: execution.policy,
+      ...(!commandError && phase.name === 'pr-description' && (await fileExists(join(ctx.state.dir, 'pr.md')))
+        ? { artifacts: [`${phase.name}.log`, 'pr.md'] }
+        : {}),
+    });
+    if (commandError) {
+      await recordManifest(ctx, manifest);
+      throw commandError;
+    }
 
-  return {
-    agent,
-    bytesEmitted,
-    execution: execution.policy,
-    manifest,
-  };
+    return {
+      agent,
+      bytesEmitted,
+      execution: execution.policy,
+      manifest,
+    };
   } finally {
     await sourceSnapshot?.cleanup();
   }
@@ -647,23 +785,30 @@ export async function runLoop(options = {}) {
   const operatorNote = await resolveOperatorNote(args, cwd);
 
   if (args.config && args.overrideEngine) {
-    throw new Error('--config and --override-engine cannot be used together; configure engines in the supplied config file.');
+    throw new Error(
+      '--config and --override-engine cannot be used together; configure engines in the supplied config file.',
+    );
   }
   /** @type {Config} */
-  const config = await loadConfig(repoRoot, {
-    ...(args.maxRounds ? { maxRounds: args.maxRounds } : {}),
-    ...(args.phases ? { phases: args.phases } : {}),
-    ...(args.noWorktree ? { worktrees: false } : {}),
-  }, args.config ? resolve(cwd, args.config) : undefined);
+  const config = await loadConfig(
+    repoRoot,
+    {
+      ...(args.maxRounds ? { maxRounds: args.maxRounds } : {}),
+      ...(args.noJudge ? { judge: null } : args.onRepeat ? { judge: { onRepeat: args.onRepeat } } : {}),
+      ...(args.phases ? { phases: args.phases } : {}),
+      ...(args.noWorktree ? { worktrees: false } : {}),
+    },
+    args.config ? resolve(cwd, args.config) : undefined,
+  );
   if (args.engine && !args.overrideEngine) {
     // A model/effort string is vendor-specific — `gpt-5.6-terra` means nothing
     // to gemini — so switching to a different engine must not inherit the
     // previous engine's model/effort. Carry them over only when the engine is
     // unchanged; --model/--effort below can still set them explicitly.
-    const base = args.engine === config.engines.default.name
-      ? config.engines.default
-      : { name: args.engine };
+    const previousDefault = config.engines.default;
+    const base = args.engine === previousDefault.name ? previousDefault : { name: args.engine };
     config.engines.default = validateAgent({ ...base, name: args.engine }, config.adapters);
+    dropStalePhaseEngineSettings(config, previousDefault);
   }
   if ((args.model || args.effort) && !args.overrideEngine) {
     config.engines.default = validateAgent(
@@ -685,12 +830,14 @@ export async function runLoop(options = {}) {
   let task = args.task ?? null;
   let rawTaskFile = args.taskFile ?? null;
   let taskFile = rawTaskFile
-    ? (rawTaskFile === '-' ? '-' : (isAbsolute(rawTaskFile) ? rawTaskFile : resolve(cwd, rawTaskFile)))
+    ? rawTaskFile === '-'
+      ? '-'
+      : isAbsolute(rawTaskFile)
+        ? rawTaskFile
+        : resolve(cwd, rawTaskFile)
     : null;
 
-  const name = args.name
-    ? slugFor(args.name)
-    : (taskFile && taskFile !== '-' ? slugFor(taskFile) : null);
+  const name = args.name ? slugFor(args.name) : taskFile && taskFile !== '-' ? slugFor(taskFile) : null;
 
   if (!name) {
     throw new Error('A run needs an identity: pass --name <slug>, or --task-file <path> to derive one.');
@@ -709,326 +856,329 @@ export async function runLoop(options = {}) {
   // Whichever alternate renderer (quiet or TUI) is live; stopped exactly once.
   let activeRenderer = null;
   try {
-  const persistedName = args.resume ? state.data.name : null;
-  if (persistedName && args.name && slugFor(args.name) !== persistedName) {
-    throw new Error(
-      `Saved run used identity "${persistedName}"; cannot resume with --name "${args.name}".`,
-    );
-  }
-  const persistedTaskFile = args.resume ? state.data.taskFile : null;
-  const taskPathInRunDir = rawTaskFile === '-' ? join(state.dir, 'task.md') : null;
-  const intendedTaskFile = taskPathInRunDir ?? taskFile;
-  if (persistedTaskFile && intendedTaskFile && intendedTaskFile !== persistedTaskFile) {
-    throw new Error(
-      `Saved run used task file "${persistedTaskFile}"; cannot resume with --task-file "${intendedTaskFile}".`,
-    );
-  }
-  const persistedTask = args.resume ? state.data.task ?? null : null;
-  if (args.resume && args.task != null && args.task !== persistedTask) {
-    throw new Error(
-      `Saved run used task "${persistedTask ?? ''}"; cannot resume with --task "${args.task}".`,
-    );
-  }
-
-  if (args.resume) {
-    if (!taskFile && persistedTaskFile) taskFile = persistedTaskFile;
-    if (task == null && persistedTask != null) task = persistedTask;
-  }
-
-  const requestedPreset = args.preset ?? config.preset ?? null;
-  const configuredPreset = typeof requestedPreset === 'string' && requestedPreset.trim()
-    ? requestedPreset
-    : null;
-  const hasSavedPreset = args.resume && Object.hasOwn(state.data, 'preset');
-  const savedPreset = hasSavedPreset && typeof state.data.preset === 'string' && state.data.preset.trim()
-    ? state.data.preset
-    : hasSavedPreset ? null : undefined;
-  if (hasSavedPreset && args.preset !== undefined && configuredPreset !== savedPreset) {
-    throw new Error(
-      `Saved run used preset "${savedPreset ?? ''}"; cannot resume with --preset "${args.preset}". Start a new run instead.`,
-    );
-  }
-  const preset = hasSavedPreset ? savedPreset : configuredPreset;
-  const presetResolutionCwd = args.resume && typeof state.data.presetCwd === 'string'
-    ? state.data.presetCwd
-    : cwd;
-  const presetPromptDir = await resolvePresetPromptDir(preset, { cwd: presetResolutionCwd });
-
-  const persistedBranch = args.resume ? state.data.branch : null;
-  if (persistedBranch && args.branch && args.branch !== persistedBranch) {
-    throw new Error(
-      `Saved run used branch "${persistedBranch}"; cannot resume with --branch "${args.branch}". Start a new run instead of resuming with a different branch.`,
-    );
-  }
-  const branch = persistedBranch ?? configuredBranch;
-  const persistedBaseBranch = args.resume ? state.data.baseBranch : null;
-  if (persistedBaseBranch && args.baseBranch && args.baseBranch !== persistedBaseBranch) {
-    throw new Error(
-      `Saved run used base branch "${persistedBaseBranch}"; cannot resume with --base-branch "${args.baseBranch}". Start a new run instead of resuming with a different base.`,
-    );
-  }
-  const baseBranch = persistedBaseBranch ?? args.baseBranch ?? config.baseBranch;
-  if (args.baseBranch && !(await rootGit.localBranchExists(baseBranch))) {
-    throw new Error(`--base-branch "${baseBranch}" does not exist locally. Fetch or check it out first.`);
-  }
-
-  if (!args.yes && !args.dryRun) {
-    await ensureConfirmationAvailable(confirmInput, terminalOpener);
-  }
-
-  if (rawTaskFile === '-') {
-    const canReuseMaterializedTask = args.resume
-      && state.data.taskFile === taskPathInRunDir
-      && await fileExists(taskPathInRunDir);
-    if (canReuseMaterializedTask) {
-      taskFile = taskPathInRunDir;
-    } else {
-      const content = await readStdin();
-      if (!content || !content.trim()) {
-        throw new Error('no data on stdin for --task-file -');
-      }
-      taskFile = taskPathInRunDir;
-      if (!args.dryRun) {
-        await writeFile(taskFile, content, 'utf8');
-      }
-      await state.record({ taskFile });
+    const persistedName = args.resume ? state.data.name : null;
+    if (persistedName && args.name && slugFor(args.name) !== persistedName) {
+      throw new Error(`Saved run used identity "${persistedName}"; cannot resume with --name "${args.name}".`);
     }
-  }
-  await state.record({ status: 'running', preset, presetCwd: preset ? presetResolutionCwd : null });
-  runStarted = true;
-  const configuredAgentSettings = Object.fromEntries(
-    config.resolvedPhases
-      .flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])])
-      .filter((phase) => phase.kind === 'agent')
-      .map((phase) => [phase.name,
-        config.engines[phase.name] ?? (phase.reviewGroup ? agentForPhase(config, phase.reviewGroup) : agentForPhase(config, phase.name))]),
-  );
-  const savedAgentSettings = args.resume && !args.config ? state.data.agentSettings : null;
-  if (savedAgentSettings) {
-    for (const phaseName of Object.keys(configuredAgentSettings)) {
-      if (!savedAgentSettings[phaseName]) {
-        throw new Error(`Saved run settings do not include agent phase "${phaseName}"; start a new run instead of resuming with a different phase list.`);
-      }
-      validateAgent(savedAgentSettings[phaseName], config.adapters);
+    const persistedTaskFile = args.resume ? state.data.taskFile : null;
+    const taskPathInRunDir = rawTaskFile === '-' ? join(state.dir, 'task.md') : null;
+    const intendedTaskFile = taskPathInRunDir ?? taskFile;
+    if (persistedTaskFile && intendedTaskFile && intendedTaskFile !== persistedTaskFile) {
+      throw new Error(
+        `Saved run used task file "${persistedTaskFile}"; cannot resume with --task-file "${intendedTaskFile}".`,
+      );
     }
-  }
-  let agentSettings = savedAgentSettings ?? configuredAgentSettings;
-  let engineOverrides = {};
-  if (args.overrideEngine) {
-    if (!savedAgentSettings) {
-      throw new Error('--override-engine requires saved agent settings from an earlier run.');
+    const persistedTask = args.resume ? (state.data.task ?? null) : null;
+    if (args.resume && args.task != null && args.task !== persistedTask) {
+      throw new Error(`Saved run used task "${persistedTask ?? ''}"; cannot resume with --task "${args.task}".`);
     }
-    ({ agentSettings, overrides: engineOverrides } = overrideSavedEngines(
-      savedAgentSettings,
-      { engine: args.engine, model: args.model, effort: args.effort },
-      config.adapters,
-    ));
-    if (Object.keys(engineOverrides).length > 0) {
-      const engineOverride = {
-        at: new Date().toISOString(),
-        engine: args.engine,
-        phases: engineOverrides,
-      };
-      await state.record({
-        agentSettings,
-        engineOverrides: [...(state.data.engineOverrides ?? []), engineOverride],
-      });
-      log('  resumed engine override:');
-      for (const [phaseName, override] of Object.entries(engineOverrides)) {
-        log(`    ${phaseName}: ${describeAgent(override.from)} → ${describeAgent(override.to)}`);
+
+    if (args.resume) {
+      if (!taskFile && persistedTaskFile) taskFile = persistedTaskFile;
+      if (task == null && persistedTask != null) task = persistedTask;
+    }
+
+    const requestedPreset = args.preset ?? config.preset ?? null;
+    const configuredPreset = typeof requestedPreset === 'string' && requestedPreset.trim() ? requestedPreset : null;
+    const hasSavedPreset = args.resume && Object.hasOwn(state.data, 'preset');
+    const savedPreset =
+      hasSavedPreset && typeof state.data.preset === 'string' && state.data.preset.trim()
+        ? state.data.preset
+        : hasSavedPreset
+          ? null
+          : undefined;
+    if (hasSavedPreset && args.preset !== undefined && configuredPreset !== savedPreset) {
+      throw new Error(
+        `Saved run used preset "${savedPreset ?? ''}"; cannot resume with --preset "${args.preset}". Start a new run instead.`,
+      );
+    }
+    const preset = hasSavedPreset ? savedPreset : configuredPreset;
+    const presetResolutionCwd = args.resume && typeof state.data.presetCwd === 'string' ? state.data.presetCwd : cwd;
+    const presetPromptDir = await resolvePresetPromptDir(preset, { cwd: presetResolutionCwd });
+
+    const persistedBranch = args.resume ? state.data.branch : null;
+    if (persistedBranch && args.branch && args.branch !== persistedBranch) {
+      throw new Error(
+        `Saved run used branch "${persistedBranch}"; cannot resume with --branch "${args.branch}". Start a new run instead of resuming with a different branch.`,
+      );
+    }
+    const branch = persistedBranch ?? configuredBranch;
+    const persistedBaseBranch = args.resume ? state.data.baseBranch : null;
+    if (persistedBaseBranch && args.baseBranch && args.baseBranch !== persistedBaseBranch) {
+      throw new Error(
+        `Saved run used base branch "${persistedBaseBranch}"; cannot resume with --base-branch "${args.baseBranch}". Start a new run instead of resuming with a different base.`,
+      );
+    }
+    const baseBranch = persistedBaseBranch ?? args.baseBranch ?? config.baseBranch;
+    if (args.baseBranch && !(await rootGit.localBranchExists(baseBranch))) {
+      throw new Error(`--base-branch "${baseBranch}" does not exist locally. Fetch or check it out first.`);
+    }
+
+    if (!args.yes && !args.dryRun) {
+      await ensureConfirmationAvailable(confirmInput, terminalOpener);
+    }
+
+    if (rawTaskFile === '-') {
+      const canReuseMaterializedTask =
+        args.resume && state.data.taskFile === taskPathInRunDir && (await fileExists(taskPathInRunDir));
+      if (canReuseMaterializedTask) {
+        taskFile = taskPathInRunDir;
+      } else {
+        const content = await readStdin();
+        if (!content || !content.trim()) {
+          throw new Error('no data on stdin for --task-file -');
+        }
+        taskFile = taskPathInRunDir;
+        if (!args.dryRun) {
+          await writeFile(taskFile, content, 'utf8');
+        }
+        await state.record({ taskFile });
       }
     }
-  } else if (!savedAgentSettings) {
-    const configOverrides = args.resume && args.config
-      ? [...(state.data.configOverrides ?? []), configOverrideRecord(config, resolve(cwd, args.config))]
-      : state.data.configOverrides;
-    await state.record({ agentSettings, ...(configOverrides ? { configOverrides } : {}) });
-  }
+    await state.record({ status: 'running', preset, presetCwd: preset ? presetResolutionCwd : null });
+    runStarted = true;
+    const configuredAgentSettings = Object.fromEntries(
+      config.resolvedPhases
+        .flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])])
+        .filter((phase) => phase.kind === 'agent')
+        .map((phase) => [phase.name, resolvePhaseAgent(config, phase)]),
+    );
+    const savedAgentSettings = args.resume && !args.config ? state.data.agentSettings : null;
+    if (savedAgentSettings) {
+      for (const phaseName of Object.keys(configuredAgentSettings)) {
+        if (!savedAgentSettings[phaseName]) {
+          throw new Error(
+            `Saved run settings do not include agent phase "${phaseName}"; start a new run instead of resuming with a different phase list.`,
+          );
+        }
+        validateAgent(savedAgentSettings[phaseName], config.adapters);
+      }
+    }
+    let agentSettings = savedAgentSettings ?? configuredAgentSettings;
+    let engineOverrides = {};
+    if (args.overrideEngine) {
+      if (!savedAgentSettings) {
+        throw new Error('--override-engine requires saved agent settings from an earlier run.');
+      }
+      ({ agentSettings, overrides: engineOverrides } = overrideSavedEngines(
+        savedAgentSettings,
+        { engine: args.engine, model: args.model, effort: args.effort },
+        config.adapters,
+      ));
+      if (Object.keys(engineOverrides).length > 0) {
+        const engineOverride = {
+          at: new Date().toISOString(),
+          engine: args.engine,
+          phases: engineOverrides,
+        };
+        await state.record({
+          agentSettings,
+          engineOverrides: [...(state.data.engineOverrides ?? []), engineOverride],
+        });
+        log('  resumed engine override:');
+        for (const [phaseName, override] of Object.entries(engineOverrides)) {
+          log(`    ${phaseName}: ${describeAgent(override.from)} → ${describeAgent(override.to)}`);
+        }
+      }
+    } else if (!savedAgentSettings) {
+      const configOverrides =
+        args.resume && args.config
+          ? [...(state.data.configOverrides ?? []), configOverrideRecord(config, resolve(cwd, args.config))]
+          : state.data.configOverrides;
+      await state.record({ agentSettings, ...(configOverrides ? { configOverrides } : {}) });
+    }
 
-  const savedWorktree = args.resume
-    ? await resumedWorktree(rootGit, repoRoot, branch, state.data.worktree)
-    : null;
-  const { worktree, created, worktreeCreated } = savedWorktree
-    ? { worktree: savedWorktree, created: false, worktreeCreated: false }
-    : args.dryRun
-      ? { ...(await planWorktree(rootGit, config, slug, branch, repoRoot)), created: false, worktreeCreated: false }
-      : await setupWorktree(rootGit, config, slug, branch, repoRoot, baseBranch);
-  const worktreeGit = new GitFacade(worktree);
-  const hermeticPhaseExists = config.resolvedPhases
-    .flatMap((phase) => [phase, ...(phase.repair ?? [])])
-    .some((phase) => phase.hermetic);
-  const gitCommonDir = args.dryRun || !hermeticPhaseExists
-    ? null
-    : resolve(worktree, await worktreeGit.commonDir());
-  await state.record({ worktree, branch, baseBranch });
-  await state.saveManifest({
-    runId: state.data.runId,
-    name: state.data.name,
-    task: task ?? null,
-    taskFile,
-    branch,
-    baseBranch,
-    repoRoot,
-    worktree,
-    snapshot: 'snapshot.json',
-  });
-  if (args.baseBranch && !created) {
-    log(`  note: branch "${branch}" already has a worktree or exists; --base-branch has no effect on this run.`);
-  }
-
-  // The agent's writable set: its checkout, the run directory it must write the
-  // verdict into, and the task-file directory when the file is outside the
-  // agent's checkout. Same-repository task files retain their source path, so
-  // their containing directory must be granted explicitly in worktree mode.
-  const taskFileGit = taskFile ? new GitFacade(dirname(taskFile)) : null;
-  const taskFileRepo = taskFileGit ? await taskFileGit.toplevel().catch(() => null) : null;
-  const taskFileAccessDir = taskFileRepo === repoRoot ? dirname(taskFile) : taskFileRepo;
-
-  const artifactDirs = [state.dir];
-  if (taskFileAccessDir && !artifactDirs.includes(taskFileAccessDir)) artifactDirs.push(taskFileAccessDir);
-
-  const remote = config.remote ?? (await rootGit.defaultRemote()) ?? 'origin';
-  if (config.remote && !(await rootGit.remoteExists(config.remote))) {
-    throw new Error(`Configured remote "${config.remote}" does not exist in ${repoRoot}.`);
-  }
-  const ctx = {
-    config,
-    worktree,
-    gitCommonDir,
-    addDirs: [worktree, ...artifactDirs],
-    artifactDirs,
-    state,
-    git: worktreeGit,
-    agentSettings,
-    engineOverrides,
-    budgetWarnings: new Set(),
-    configHash: hashConfig(config),
-    note: operatorNote,
-    resume: Boolean(args.resume),
-    dryRun: args.dryRun,
-    remote,
-    baseBranch,
-    promptDirs: [join(repoRoot, config.promptDir), ...(presetPromptDir ? [presetPromptDir] : [])],
-    activeProcessPath: join(state.dir, 'active-command.json'),
-  };
-
-  // Quiet goes in before setup: `npm ci` and friends are the noisiest output
-  // of a fresh run. Dry runs keep plain output — their rendered prompts are
-  // the point.
-  const quiet = resolveQuiet(args, config);
-  if (!args.dryRun && quiet.enabled) {
-    activeRenderer = createQuietRenderer({ heartbeatMs: quiet.heartbeatMs });
-    setRenderer(activeRenderer);
-  }
-
-  if (worktreeCreated && !args.dryRun && config.setup.length) {
-    log(`setup     : ${config.setup.join(' && ')}`);
-    await runSetup(config.setup, ctx);
-  }
-
-  const variables = {
-    TASK: task ?? '',
-    TASK_FILE: taskFile ?? '',
-    TASK_NAME: name,
-    TASK_DIR: taskFile ? dirname(taskFile) : cwd,
-    TASK_CONTEXT: buildTaskContext({ task, taskFile }),
-    BRANCH: branch,
-    BASE_BRANCH: baseBranch,
-    REPO: worktree,
-    RUN_DIR: state.dir,
-    REMOTE: remote,
-    GATE_COMMANDS: config.gate
-      .map((entry, index) => normalizeCommandEntry(entry, { label: 'gate', index }).display)
-      .join('\n') || '(none configured)',
-  };
-
-  if (!args.dryRun && !(await state.hasSnapshot())) {
-    await state.saveSnapshot(await captureRunSnapshot({
-      state,
-      rootGit,
-      baseBranch,
+    const savedWorktree = args.resume ? await resumedWorktree(rootGit, repoRoot, branch, state.data.worktree) : null;
+    const { worktree, created, worktreeCreated } = savedWorktree
+      ? { worktree: savedWorktree, created: false, worktreeCreated: false }
+      : args.dryRun
+        ? { ...(await planWorktree(rootGit, config, slug, branch, repoRoot)), created: false, worktreeCreated: false }
+        : await setupWorktree(rootGit, config, slug, branch, repoRoot, baseBranch);
+    const worktreeGit = new GitFacade(worktree);
+    const hermeticPhaseExists = config.resolvedPhases
+      .flatMap((phase) => [phase, ...(phase.repair ?? [])])
+      .some((phase) => phase.hermetic);
+    const gitCommonDir = args.dryRun || !hermeticPhaseExists ? null : resolve(worktree, await worktreeGit.commonDir());
+    await state.record({ worktree, branch, baseBranch });
+    await state.saveManifest({
+      runId: state.data.runId,
+      name: state.data.name,
+      task: task ?? null,
+      taskFile,
       branch,
-      config,
-      agentSettings,
-      cwd,
+      baseBranch,
+      repoRoot,
       worktree,
-    }));
-  }
+      snapshot: 'snapshot.json',
+    });
+    if (args.baseBranch && !created) {
+      log(`  note: branch "${branch}" already has a worktree or exists; --base-branch has no effect on this run.`);
+    }
 
-  log(`task      : ${name}`);
-  if (taskFile) log(`task file : ${taskFile}`);
-  log(`branch    : ${branch}${created ? ' (created)' : ''}`);
-  log(`base      : ${baseBranch}`);
-  if (presetPromptDir) log(`preset    : ${preset} (${presetPromptDir})`);
-  log(`worktree  : ${worktree}`);
-  log(`run dir   : ${state.dir}`);
-  log(`phases    : ${config.resolvedPhases.map((phase) => phase.name).join(' → ')}`);
-  if (!args.dryRun && quiet.enabled) {
-    const heartbeat = quiet.heartbeatMs > 0 ? `heartbeat every ${quiet.heartbeatMs / 60000}m` : 'heartbeat off';
-    log(`output    : quiet (${heartbeat}; full logs in ${state.dir})`);
-  }
+    // The agent's writable set: its checkout, the run directory it must write the
+    // verdict into, and the task-file directory when the file is outside the
+    // agent's checkout. Same-repository task files retain their source path, so
+    // their containing directory must be granted explicitly in worktree mode.
+    const taskFileGit = taskFile ? new GitFacade(dirname(taskFile)) : null;
+    const taskFileRepo = taskFileGit ? await taskFileGit.toplevel().catch(() => null) : null;
+    const taskFileAccessDir = taskFileRepo === repoRoot ? dirname(taskFile) : taskFileRepo;
 
-  /** @type {Summary} */
-  const summary = {
-    phases: [],
-    stalled: null,
-    branch,
-    baseBranch,
-    remote,
-    worktree,
-    runDir: state.dir,
-    task: name,
-    taskFile,
-    prUrl: state.data.prUrl ?? state.manifestMetadata.prUrl ?? null,
-    pullRequest: state.data.pullRequest ?? state.manifestMetadata.pullRequest ?? null,
-  };
+    const artifactDirs = [state.dir];
+    if (taskFileAccessDir && !artifactDirs.includes(taskFileAccessDir)) artifactDirs.push(taskFileAccessDir);
 
-  if (!args.dryRun && !quiet.enabled && tuiEnabled({ isTTY: process.stdout.isTTY, noTui: args.noTui })) {
-    activeRenderer = createTuiRenderer({ config, state, summary });
-    setRenderer(activeRenderer);
-  }
+    const remote = config.remote ?? (await rootGit.defaultRemote()) ?? 'origin';
+    if (config.remote && !(await rootGit.remoteExists(config.remote))) {
+      throw new Error(`Configured remote "${config.remote}" does not exist in ${repoRoot}.`);
+    }
+    const ctx = {
+      config,
+      worktree,
+      gitCommonDir,
+      addDirs: [worktree, ...artifactDirs],
+      artifactDirs,
+      state,
+      git: worktreeGit,
+      agentSettings,
+      engineOverrides,
+      agentDiagnostics: [],
+      budgetWarnings: new Set(),
+      configHash: hashConfig(config),
+      note: operatorNote,
+      resume: Boolean(args.resume),
+      dryRun: args.dryRun,
+      remote,
+      baseBranch,
+      promptDirs: [join(repoRoot, config.promptDir), ...(presetPromptDir ? [presetPromptDir] : [])],
+      activeProcessPath: join(state.dir, 'active-command.json'),
+    };
 
-  const operations = /** @satisfies {Operations} */ ({
-    budgetStatus,
-    markBudgetExhaustedComplete,
-    manifestEntry,
-    markStalledManifest,
-    recordBudgetStall,
-    recordManifest,
-    runAgent,
-    runGate,
-    runPublish,
-    withRetries,
-  });
+    // Quiet goes in before setup: `npm ci` and friends are the noisiest output
+    // of a fresh run. Dry runs keep plain output — their rendered prompts are
+    // the point.
+    const quiet = resolveQuiet(args, config);
+    if (!args.dryRun && quiet.enabled) {
+      activeRenderer = createQuietRenderer({ heartbeatMs: quiet.heartbeatMs });
+      setRenderer(activeRenderer);
+    }
 
-  await runPhases({
-    args,
-    config,
-    state,
-    ctx,
-    variables,
-    summary,
-    remote,
-    branch,
-    baseBranch,
-    confirmInput,
-    terminalOpener,
-    operations,
-  });
+    if (worktreeCreated && !args.dryRun && config.setup.length) {
+      log(`setup     : ${config.setup.join(' && ')}`);
+      await runSetup(config.setup, ctx);
+    }
 
-  // Keep the last entered phase and its start time for completed or stalled runs.
-  await state.record({
-    status: summary.stalled ? 'stalled' : 'completed',
-    ...(summary.stalled ? { stalled: summary.stalled } : {}),
-  });
-  if (activeRenderer) {
-    activeRenderer.stop();
-    resetRenderer();
-    activeRenderer = null;
-  }
-  report(summary, formatFindings);
-  return summary;
+    const variables = {
+      TASK: task ?? '',
+      TASK_FILE: taskFile ?? '',
+      TASK_NAME: name,
+      TASK_DIR: taskFile ? dirname(taskFile) : cwd,
+      TASK_CONTEXT: buildTaskContext({ task, taskFile }),
+      BRANCH: branch,
+      BASE_BRANCH: baseBranch,
+      REPO: worktree,
+      RUN_DIR: state.dir,
+      REMOTE: remote,
+      GATE_COMMANDS:
+        config.gate.map((entry, index) => normalizeCommandEntry(entry, { label: 'gate', index }).display).join('\n') ||
+        '(none configured)',
+      UNRESOLVED_FINDINGS: formatFindings(state.data.unresolvedFindings ?? []),
+    };
 
+    if (!args.dryRun && !(await state.hasSnapshot())) {
+      await state.saveSnapshot(
+        await captureRunSnapshot({
+          state,
+          rootGit,
+          baseBranch,
+          branch,
+          config,
+          agentSettings,
+          cwd,
+          worktree,
+        }),
+      );
+    }
+
+    log(`task      : ${name}`);
+    if (taskFile) log(`task file : ${taskFile}`);
+    log(`branch    : ${branch}${created ? ' (created)' : ''}`);
+    log(`base      : ${baseBranch}`);
+    if (presetPromptDir) log(`preset    : ${preset} (${presetPromptDir})`);
+    log(`worktree  : ${worktree}`);
+    log(`run dir   : ${state.dir}`);
+    log(`phases    : ${config.resolvedPhases.map((phase) => phase.name).join(' → ')}`);
+    logAgentSettings(agentSettings);
+    ctx.agentDiagnostics = await diagnoseAgents(config, { repoRoot, baseBranch, agentSettings });
+    for (const diagnostic of ctx.agentDiagnostics.filter((item) => item.level === 'warn')) {
+      const text = `⚠ agent ${diagnostic.phase}: ${diagnostic.message}\n  → ${diagnostic.hint} (${diagnostic.docs})`;
+      log(text);
+      if (!args.dryRun) await tee(join(state.dir, 'agents.log'), `${text}\n`);
+    }
+    if (args.dryRun) logJudge(config.judge);
+    if (!args.dryRun && quiet.enabled) {
+      const heartbeat = quiet.heartbeatMs > 0 ? `heartbeat every ${quiet.heartbeatMs / 60000}m` : 'heartbeat off';
+      log(`output    : quiet (${heartbeat}; full logs in ${state.dir})`);
+    }
+
+    /** @type {Summary} */
+    const summary = {
+      phases: [],
+      stalled: null,
+      branch,
+      baseBranch,
+      remote,
+      worktree,
+      runDir: state.dir,
+      task: name,
+      taskFile,
+      prUrl: state.data.prUrl ?? state.manifestMetadata.prUrl ?? null,
+      pullRequest: state.data.pullRequest ?? state.manifestMetadata.pullRequest ?? null,
+    };
+
+    if (!args.dryRun && !quiet.enabled && tuiEnabled({ isTTY: process.stdout.isTTY, noTui: args.noTui })) {
+      activeRenderer = createTuiRenderer({ config, state, summary });
+      setRenderer(activeRenderer);
+    }
+
+    const operations = /** @satisfies {Operations} */ ({
+      budgetStatus,
+      markBudgetExhaustedComplete,
+      manifestEntry,
+      markStalledManifest,
+      recordBudgetStall,
+      recordManifest,
+      runAgent,
+      runGate,
+      runPublish,
+      withRetries,
+    });
+
+    await runPhases({
+      args,
+      config,
+      state,
+      ctx,
+      variables,
+      summary,
+      remote,
+      branch,
+      baseBranch,
+      confirmInput,
+      terminalOpener,
+      operations,
+    });
+
+    // Keep the last entered phase and its start time for completed or stalled runs.
+    await state.record({
+      status: summary.stalled ? 'stalled' : 'completed',
+      ...(summary.stalled ? { stalled: summary.stalled } : {}),
+    });
+    if (activeRenderer) {
+      activeRenderer.stop();
+      resetRenderer();
+      activeRenderer = null;
+    }
+    report(summary, formatFindings);
+    return summary;
   } catch (error) {
     // A crash also retains the phase that was running for later inspection.
     if (runStarted && !args.dryRun) await state.record({ status: 'stalled' }).catch(() => {});

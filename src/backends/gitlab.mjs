@@ -3,7 +3,8 @@ import { GitFacade } from '../git.mjs';
 import { PublishError } from '../publish.mjs';
 
 const DRAFT_RE = /^(draft:\s*|wip:\s*)/i;
-const NO_MERGE_REQUEST_RE = /\b(?:no merge requests? found|merge requests? not found|merge requests? (?:do|does) not exist)\b/i;
+const NO_MERGE_REQUEST_RE =
+  /\b(?:no merge requests? found|merge requests? not found|merge requests? (?:do|does) not exist)\b/i;
 
 /**
  * @typedef {object} GitLabMr
@@ -70,13 +71,11 @@ export function parseGitLabRemoteUrl(remoteUrl) {
   return { host, project };
 }
 
-export const withDraftPrefix = (title) => DRAFT_RE.test(title) ? title : `Draft: ${title}`;
+export const withDraftPrefix = (title) => (DRAFT_RE.test(title) ? title : `Draft: ${title}`);
 export const withoutDraftPrefix = (title) => title.replace(DRAFT_RE, '');
 
 function errorText(error) {
-  return [error?.output, error?.stderr, error?.cause?.output, error?.message]
-    .filter(Boolean)
-    .join('\n');
+  return [error?.output, error?.stderr, error?.cause?.output, error?.message].filter(Boolean).join('\n');
 }
 
 /**
@@ -97,9 +96,8 @@ export function glabTransport(options = {}) {
   }
 
   const repository = (host, project) => `https://${host}/${project}`;
-  const descriptionArgs = (description, descriptionFilePath) => descriptionFilePath
-    ? ['--description-file', descriptionFilePath]
-    : ['--description', description];
+  const descriptionArgs = (description, descriptionFilePath) =>
+    descriptionFilePath ? ['--description-file', descriptionFilePath] : ['--description', description];
 
   return {
     async checkAuth({ host }) {
@@ -119,17 +117,33 @@ export function glabTransport(options = {}) {
         if (NO_MERGE_REQUEST_RE.test(output)) {
           return null;
         }
-        throw new PublishError(`Unable to inspect GitLab merge request for ${branch}: ${error.message}`, { cause: error });
+        throw new PublishError(`Unable to inspect GitLab merge request for ${branch}: ${error.message}`, {
+          cause: error,
+        });
       }
     },
 
-    async createMergeRequest({ host, project, sourceBranch, targetBranch, title, description, descriptionFilePath, draft }) {
+    async createMergeRequest({
+      host,
+      project,
+      sourceBranch,
+      targetBranch,
+      title,
+      description,
+      descriptionFilePath,
+      draft,
+    }) {
       const args = [
-        'mr', 'create',
-        '--repo', repository(host, project),
-        '--source-branch', sourceBranch,
-        '--target-branch', targetBranch,
-        '--title', title,
+        'mr',
+        'create',
+        '--repo',
+        repository(host, project),
+        '--source-branch',
+        sourceBranch,
+        '--target-branch',
+        targetBranch,
+        '--title',
+        title,
         ...descriptionArgs(description, descriptionFilePath),
         ...(draft ? ['--draft'] : []),
         '--yes',
@@ -139,9 +153,13 @@ export function glabTransport(options = {}) {
 
     async updateMergeRequest({ host, project, iid, title, description, descriptionFilePath, draft }) {
       const args = [
-        'mr', 'update', String(iid),
-        '--repo', repository(host, project),
-        '--title', title,
+        'mr',
+        'update',
+        String(iid),
+        '--repo',
+        repository(host, project),
+        '--title',
+        title,
         ...descriptionArgs(description, descriptionFilePath),
         draft ? '--draft' : '--ready',
         '--yes',

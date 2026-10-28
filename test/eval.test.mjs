@@ -1,12 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  formatEvalSummaryTable,
-  formatEvalTable,
-  runEval,
-  runEvalCell,
-  summarizeEval,
-} from '../src/eval.mjs';
+import { formatEvalSummaryTable, formatEvalTable, runEval, runEvalCell, summarizeEval } from '../src/eval.mjs';
 
 // A fake "approve everything" engine: it recognizes the review phase by the
 // verdict-file marker every review prompt contains, and otherwise applies
@@ -109,10 +103,12 @@ test('runEvalCell detects an escaped defect via the held-out check', async () =>
 });
 
 test('runEval sweeps a corpus x matrix and summarizeEval aggregates per config', async () => {
-  const results = await silently(() => runEval({
-    corpus: [correctTask, escapedDefectTask],
-    matrix: [fakeEngineConfig],
-  }));
+  const results = await silently(() =>
+    runEval({
+      corpus: [correctTask, escapedDefectTask],
+      matrix: [fakeEngineConfig],
+    }),
+  );
   assert.equal(results.length, 2);
   assert.deepEqual(results.map((cell) => cell.task).sort(), ['greet-correct', 'greet-escaped-defect']);
 
@@ -130,6 +126,9 @@ test('runEval sweeps a corpus x matrix and summarizeEval aggregates per config',
   assert.match(table, /greet-escaped-defect\tfake-engine\ttrue\ttrue/);
 
   const summaryTable = formatEvalSummaryTable(summaries);
-  assert.match(summaryTable, /CONFIG\tCELLS\tCOMPLETION_RATE\tESCAPED_DEFECT_RATE\tAVG_ROUNDS\tTOTAL_COST\tTOTAL_DURATION_MS/);
+  assert.match(
+    summaryTable,
+    /CONFIG\tCELLS\tCOMPLETION_RATE\tESCAPED_DEFECT_RATE\tAVG_ROUNDS\tTOTAL_COST\tTOTAL_DURATION_MS/,
+  );
   assert.match(summaryTable, /fake-engine\t2\t1\t0\.5/);
 });

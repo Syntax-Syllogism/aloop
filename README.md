@@ -58,6 +58,8 @@ The default pipeline:
 
 Phases pass work to each other through files, not shared agent sessions. A review verdict looks like `{ verdict, summary, blocking, nits }`, and a malformed one fails closed. The runner never merges a branch, and it never mistakes an agent's prose for a test result.
 
+Optionally, a repeated-blocker judge can stop a review/address deadlock as soon as every blocker in a new round repeats one from the prior round. See [the judge guide](docs/judge.md).
+
 Every real run also records what it needs to be audited: repository SHAs, hashes of the rendered prompts and configuration, gate receipts, verdict binding, and phase artifacts, all in the run manifest. See [`docs/loop.md`](docs/loop.md) for the full guide, the manifest schema, and the verdict contract.
 
 ## Configuration
@@ -70,6 +72,7 @@ export default {
   engines: {
     default: { name: 'claude', effort: 'high' },
     review: { name: 'codex', effort: 'high' },
+    docs: { model: 'claude-haiku-5-5' }, // inherits the default engine and effort
   },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   gate: ['npm test'],
@@ -93,6 +96,8 @@ export default {
 ```
 
 If a per-platform entry lacks the variant for the current host (say, only `posix` on native Windows), config loading fails with an error that names the phase and command index.
+
+Select existing CLI personas with `engines.<phase>.agent`; see [Named agents](docs/agents.md) for requirements and support.
 
 The built-in engines are `claude`, `codex`, `agy`, and `gemini`. The matching CLI must already be installed and signed in. An engine can set its own `model` and `effort`. Gemini has no effort setting, so aloop ignores `effort` for it. Use `--config` to load a config file from outside the repository. Command-line phase and round options override the config.
 

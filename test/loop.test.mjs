@@ -9,18 +9,52 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import { parseLoopArgs, runOperationalCommand as runCliOperationalCommand } from '../bin/loop.mjs';
-import { defaults, normalizeCommandEntry, normalizeCommandList, normalizePhases, loadConfig, loadRunsDir } from '../src/config.mjs';
-import { adapterFor, agentForPhase, createJsonlRenderer, engineForPhase, renderAgyEvent, renderClaudeEvent, renderGeminiEvent } from '../src/adapters.mjs';
-import { interpolate, loadTemplate, packagePresets, packagePrompts, renderPrompt, resolvePresetPromptDir } from '../src/prompts.mjs';
+import {
+  defaults,
+  normalizeCommandEntry,
+  normalizeCommandList,
+  normalizePhases,
+  loadConfig,
+  loadRunsDir,
+} from '../src/config.mjs';
+import {
+  adapterFor,
+  agentForPhase,
+  createJsonlRenderer,
+  engineForPhase,
+  resolvePhaseAgent,
+  renderAgyEvent,
+  renderClaudeEvent,
+  renderGeminiEvent,
+} from '../src/adapters.mjs';
+import {
+  interpolate,
+  loadTemplate,
+  packagePresets,
+  packagePrompts,
+  renderPrompt,
+  resolvePresetPromptDir,
+} from '../src/prompts.mjs';
 import { parseVerdict, formatFindings } from '../src/verdict.mjs';
 import { hashConfig, hashText } from '../src/manifest.mjs';
 import { computeAggregateMetrics, computeRunMetrics } from '../src/metrics.mjs';
-import { getAggregateMetrics, getRunStatus, init as initScaffold, listRunStatuses, runOperationalCommand } from '../src/operations.mjs';
+import {
+  getAggregateMetrics,
+  getRunStatus,
+  init as initScaffold,
+  listRunStatuses,
+  runOperationalCommand,
+} from '../src/operations.mjs';
 import { slugFor, RunState } from '../src/state.mjs';
 import { GitFacade } from '../src/git.mjs';
 import { githubBackend, parsePullRequestDescription, publish } from '../src/publish.mjs';
 import { runLoop, buildTaskContext } from '../src/pipeline.mjs';
-import { hermeticEnvironment, hermeticInvocation, normalizeHermeticConfig, resolvePhaseHermetic } from '../src/hermetic.mjs';
+import {
+  hermeticEnvironment,
+  hermeticInvocation,
+  normalizeHermeticConfig,
+  resolvePhaseHermetic,
+} from '../src/hermetic.mjs';
 import { phaseIsSkippable, publishingAttestation } from '../src/policy.mjs';
 import { APPROVED } from '../src/verdict.mjs';
 import { formatPhase } from '../src/reporter.mjs';
@@ -37,12 +71,19 @@ test('policy allows skipping only optional non-gate, non-verdict phases', () => 
 
 test('publishing policy requires a passing gate before the approved review', () => {
   const sha = 'a'.repeat(40);
-  const state = { manifest: { entries: [
-    { role: 'gate', status: 'completed', outputSha: sha },
-    { role: 'verdict', status: 'completed', verdict: { verdict: APPROVED, sha } },
-  ] } };
+  const state = {
+    manifest: {
+      entries: [
+        { role: 'gate', status: 'completed', outputSha: sha },
+        { role: 'verdict', status: 'completed', verdict: { verdict: APPROVED, sha } },
+      ],
+    },
+  };
   assert.equal(publishingAttestation(state, sha), null);
-  assert.match(publishingAttestation({ manifest: { entries: state.manifest.entries.slice(1) } }, sha).reason, /no passing gate receipt/);
+  assert.match(
+    publishingAttestation({ manifest: { entries: state.manifest.entries.slice(1) } }, sha).reason,
+    /no passing gate receipt/,
+  );
 });
 
 test('publishing waits for the aggregate verdict of a reviewer group', () => {
@@ -50,11 +91,23 @@ test('publishing waits for the aggregate verdict of a reviewer group', () => {
   /** @type {Array<Record<string, any>>} */
   const entries = [
     { role: 'gate', status: 'completed', outputSha: sha },
-    { role: 'verdict', phase: 'review', status: 'completed', reviewGroup: 'review', verdict: { verdict: APPROVED, sha } },
+    {
+      role: 'verdict',
+      phase: 'review',
+      status: 'completed',
+      reviewGroup: 'review',
+      verdict: { verdict: APPROVED, sha },
+    },
   ];
   assert.match(publishingAttestation({ manifest: { entries } }, sha).reason, /no completed approval/);
-  entries.push({ role: 'verdict', phase: 'review', status: 'completed', reviewGroup: 'review', aggregate: true,
-    verdict: { verdict: APPROVED, sha } });
+  entries.push({
+    role: 'verdict',
+    phase: 'review',
+    status: 'completed',
+    reviewGroup: 'review',
+    aggregate: true,
+    verdict: { verdict: APPROVED, sha },
+  });
   assert.equal(publishingAttestation({ manifest: { entries } }, sha), null);
 });
 
@@ -77,7 +130,9 @@ async function repoFixture({ config = null, phases = null } = {}) {
   await git(root, 'commit', '-m', 'chore: init');
 
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const body = config ?? `export default {
+  const body =
+    config ??
+    `export default {
   gate: ['git --version'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
   ${phases ? `phases: ${JSON.stringify(phases)},` : ''}
@@ -114,8 +169,13 @@ test('publish pushes an attested SHA and verifies a created pull request', async
   const result = await publish({
     git: {
       cwd: runDir,
-      async push(...args) { calls.push(['push', ...args]); },
-      async lsRemote(...args) { calls.push(['lsRemote', ...args]); return approvedSha; },
+      async push(...args) {
+        calls.push(['push', ...args]);
+      },
+      async lsRemote(...args) {
+        calls.push(['lsRemote', ...args]);
+        return approvedSha;
+      },
     },
     remote: 'origin',
     branch: 'feat/example',
@@ -123,8 +183,13 @@ test('publish pushes an attested SHA and verifies a created pull request', async
     prBodyPath: join(runDir, 'pr.md'),
     approvedSha,
     backend: {
-      async precheck() { calls.push(['precheck']); },
-      async view() { calls.push(['view']); return pullRequest; },
+      async precheck() {
+        calls.push(['precheck']);
+      },
+      async view() {
+        calls.push(['view']);
+        return pullRequest;
+      },
       async create(options) {
         calls.push(['create', options.title, options.body]);
         pullRequest = {
@@ -135,14 +200,19 @@ test('publish pushes an attested SHA and verifies a created pull request', async
           isDraft: true,
         };
       },
-      async update() { throw new Error('create path expected'); },
+      async update() {
+        throw new Error('create path expected');
+      },
     },
   });
 
   assert.equal(result.remoteSha, approvedSha);
   assert.equal(result.created, true);
   assert.equal(result.pullRequest.url, 'https://github.com/example/project/pull/42');
-  assert.deepEqual(calls.map(([name]) => name), ['precheck', 'push', 'lsRemote', 'view', 'create', 'view']);
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    ['precheck', 'push', 'lsRemote', 'view', 'create', 'view'],
+  );
   assert.equal(await readFile(join(runDir, '.aloop-pr-body.md'), 'utf8').catch(() => null), null);
 });
 
@@ -155,8 +225,12 @@ test('hermetic publishing rejects in-process custom backends', async () => {
     publish({
       git: {
         cwd: runDir,
-        async push() { called = true; },
-        async lsRemote() { return 'a'.repeat(40); },
+        async push() {
+          called = true;
+        },
+        async lsRemote() {
+          return 'a'.repeat(40);
+        },
       },
       remote: 'origin',
       branch: 'feat/example',
@@ -166,7 +240,9 @@ test('hermetic publishing rejects in-process custom backends', async () => {
       env: { PATH: '/bin', GH_TOKEN: 'secret' },
       backend: {
         async precheck() {},
-        async view() { return null; },
+        async view() {
+          return null;
+        },
         async create() {},
         async update() {},
       },
@@ -187,7 +263,9 @@ test('publish fails closed before PR creation when the remote SHA diverges', asy
       git: {
         cwd: runDir,
         async push() {},
-        async lsRemote() { return 'b'.repeat(40); },
+        async lsRemote() {
+          return 'b'.repeat(40);
+        },
       },
       remote: 'origin',
       branch: 'feat/example',
@@ -196,7 +274,10 @@ test('publish fails closed before PR creation when the remote SHA diverges', asy
       approvedSha,
       backend: {
         async precheck() {},
-        async view() { viewed = true; return null; },
+        async view() {
+          viewed = true;
+          return null;
+        },
         async create() {},
         async update() {},
       },
@@ -222,8 +303,13 @@ test('publish updates an existing pull request instead of creating a duplicate',
   const result = await publish({
     git: {
       cwd: runDir,
-      async push() { calls.push('push'); },
-      async lsRemote() { calls.push('lsRemote'); return approvedSha; },
+      async push() {
+        calls.push('push');
+      },
+      async lsRemote() {
+        calls.push('lsRemote');
+        return approvedSha;
+      },
     },
     remote: 'origin',
     branch: 'feat/example',
@@ -231,10 +317,19 @@ test('publish updates an existing pull request instead of creating a duplicate',
     prBodyPath: join(runDir, 'pr.md'),
     approvedSha,
     backend: {
-      async precheck() { calls.push('precheck'); },
-      async view() { calls.push('view'); return existing; },
-      async create() { calls.push('create'); },
-      async update(options) { calls.push(['update', options.title]); },
+      async precheck() {
+        calls.push('precheck');
+      },
+      async view() {
+        calls.push('view');
+        return existing;
+      },
+      async create() {
+        calls.push('create');
+      },
+      async update(options) {
+        calls.push(['update', options.title]);
+      },
     },
   });
 
@@ -262,7 +357,9 @@ test('the GitHub publish backend drives gh and verifies the created draft PR', a
   await writeFile(join(runDir, 'pr.md'), 'Title: Publish fixture\n\nThis is a fixture PR.\n');
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   const prState = join(runDir, 'gh-pr.json');
-  await writeFile(join(binDir, 'gh'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'gh'),
+    `#!/bin/sh
 if [ "$1" = auth ] && [ "$2" = status ]; then exit 0; fi
 if [ "$1" = pr ] && [ "$2" = view ]; then
   if [ -f "$FAKE_PR_STATE" ]; then cat "$FAKE_PR_STATE"; exit 0; fi
@@ -275,7 +372,9 @@ if [ "$1" = pr ] && [ "$2" = create ]; then
 fi
 if [ "$1" = pr ] && [ "$2" = edit ]; then exit 0; fi
 exit 1
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalSha = process.env.FAKE_SHA;
@@ -286,10 +385,18 @@ exit 1
   const realGit = new GitFacade(root);
   const publishGit = {
     cwd: root,
-    async remoteUrl() { return 'git@github.com:example/project.git'; },
-    async revParse(...args) { return realGit.revParse(...args); },
-    async push(...args) { return realGit.push(...args); },
-    async lsRemote(...args) { return realGit.lsRemote(...args); },
+    async remoteUrl() {
+      return 'git@github.com:example/project.git';
+    },
+    async revParse(...args) {
+      return realGit.revParse(...args);
+    },
+    async push(...args) {
+      return realGit.push(...args);
+    },
+    async lsRemote(...args) {
+      return realGit.lsRemote(...args);
+    },
   };
   try {
     const result = await publish({
@@ -301,7 +408,10 @@ exit 1
       draft: true,
     });
     assert.equal(result.pullRequest.number, 42);
-    assert.equal(await git(root, 'ls-remote', 'origin', 'refs/heads/feat/publish').then((value) => value.split(/\s+/)[0]), approvedSha);
+    assert.equal(
+      await git(root, 'ls-remote', 'origin', 'refs/heads/feat/publish').then((value) => value.split(/\s+/)[0]),
+      approvedSha,
+    );
   } finally {
     process.env.PATH = originalPath;
     if (originalSha === undefined) delete process.env.FAKE_SHA;
@@ -324,9 +434,13 @@ test('the GitHub publish backend binds every PR command to the configured remote
   const repository = 'configured/project';
   const gitFacade = {
     cwd: root,
-    async remoteUrl(remote) { return new GitFacade(root).remoteUrl(remote); },
+    async remoteUrl(remote) {
+      return new GitFacade(root).remoteUrl(remote);
+    },
     async push() {},
-    async lsRemote() { return approvedSha; },
+    async lsRemote() {
+      return approvedSha;
+    },
   };
   const backend = githubBackend({
     cwd: root,
@@ -371,9 +485,10 @@ test('the GitHub publish backend binds every PR command to the configured remote
   await publish(publishOptions);
   await publish(publishOptions);
 
-  assert.deepEqual(ghCalls.map((args) => args[0] === 'pr' ? args[1] : args[0]), [
-    'auth', 'view', 'create', 'view', 'auth', 'view', 'edit', 'view',
-  ]);
+  assert.deepEqual(
+    ghCalls.map((args) => (args[0] === 'pr' ? args[1] : args[0])),
+    ['auth', 'view', 'create', 'view', 'auth', 'view', 'edit', 'view'],
+  );
   for (const args of ghCalls.filter((args) => args[0] === 'pr')) {
     assert.equal(args[args.indexOf('--repo') + 1], repository);
   }
@@ -381,10 +496,16 @@ test('the GitHub publish backend binds every PR command to the configured remote
 
 test('normalizePhases preserves the built-in plan with an explicit repair transition', () => {
   const phases = normalizePhases(defaults.phases, { maxRounds: 3 });
-  assert.deepEqual(phases.map((phase) => phase.name), ['implement', 'docs', 'gate', 'review', 'pr-description', 'publish']);
+  assert.deepEqual(
+    phases.map((phase) => phase.name),
+    ['implement', 'docs', 'gate', 'review', 'pr-description', 'publish'],
+  );
   const review = phases.find((phase) => phase.name === 'review');
   assert.equal(review.maxRounds, 3);
-  assert.deepEqual(review.repair.map((phase) => phase.name), ['address', 'gate']);
+  assert.deepEqual(
+    review.repair.map((phase) => phase.name),
+    ['address', 'gate'],
+  );
   assert.equal(review.repair.at(-1).recheck, true, 'the trailing gate re-runs after repair');
   assert.deepEqual(review.postconditions, ['verdict-recorded']);
   assert.deepEqual(review.permissions, ['read-only']);
@@ -395,47 +516,60 @@ test('normalizePhases preserves the built-in plan with an explicit repair transi
 });
 
 test('configured review roles use independent verdict descriptors', async () => {
-  const { root } = await repoFixture({ config: `export default {
+  const { root } = await repoFixture({
+    config: `export default {
     gate: ['git --version'],
     reviewRoles: ['security', 'api-compat', 'test-quality'],
-  };` });
+  };`,
+  });
   const config = await loadConfig(root);
   const review = config.resolvedPhases.find((phase) => phase.name === 'review');
-  assert.deepEqual(review.reviewers.map((role) => role.name), [
-    'review-security', 'review-api-compat', 'review-test-quality',
-  ]);
-  assert.deepEqual(review.reviewers.map((role) => role.prompt), [
-    'review-security', 'review-api', 'review-tests',
-  ]);
+  assert.deepEqual(
+    review.reviewers.map((role) => role.name),
+    ['review-security', 'review-api-compat', 'review-test-quality'],
+  );
+  assert.deepEqual(
+    review.reviewers.map((role) => role.prompt),
+    ['review-security', 'review-api', 'review-tests'],
+  );
   assert.ok(review.reviewers.every((role) => role.verdict && role.permissions.includes('read-only')));
-  assert.ok(review.reviewers.every((role) => role.role !== 'verdict'),
-    'specialized reviewers must not receive task-file write access');
-  assert.deepEqual((await loadConfig((await repoFixture()).root)).resolvedPhases
-    .find((phase) => phase.name === 'review').reviewers, undefined);
+  assert.ok(
+    review.reviewers.every((role) => role.role !== 'verdict'),
+    'specialized reviewers must not receive task-file write access',
+  );
+  assert.deepEqual(
+    (await loadConfig((await repoFixture()).root)).resolvedPhases.find((phase) => phase.name === 'review').reviewers,
+    undefined,
+  );
 });
 
 test('specialized reviewers inherit the review phase hermetic setting', async () => {
-  const { root } = await repoFixture({ config: `export default {
+  const { root } = await repoFixture({
+    config: `export default {
     gate: ['git --version'],
     reviewRoles: ['security'],
     hermetic: { runtime: 'podman', image: 'aloop:node', network: [] },
     phases: [{ name: 'review', hermetic: true }],
-  };` });
+  };`,
+  });
   const review = (await loadConfig(root)).resolvedPhases[0];
   assert.deepEqual(review.reviewers[0].hermetic, review.hermetic);
 });
 
 test('review role selection rejects unknown and duplicate roles', async () => {
   for (const roles of [['unknown'], ['security', 'security']]) {
-    const { root } = await repoFixture({ config: `export default {
+    const { root } = await repoFixture({
+      config: `export default {
       gate: ['git --version'], reviewRoles: ${JSON.stringify(roles)},
-    };` });
+    };`,
+    });
     await assert.rejects(loadConfig(root), /reviewRoles.*unique roles/);
   }
 });
 
 test('specialized blockers enter repair and all reviewers approve the repaired round', async () => {
-  const observeGate = 'node -p "require(\'./.loop/runs/ss-demo-feature/state.json\').currentPhase" >> .loop/runs/ss-demo-feature/observed-phases';
+  const observeGate =
+    'node -p "require(\'./.loop/runs/ss-demo-feature/state.json\').currentPhase" >> .loop/runs/ss-demo-feature/observed-phases';
   const agentScript = `
 const fs = require('node:fs');
 const path = require('node:path');
@@ -458,7 +592,8 @@ if (prompt.includes('## Blocking findings')) {
     : { verdict: 'APPROVED', blocking: [] }));
 }
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
     adapters: { fake: { command({ prompt }) {
       return { command: process.execPath, args: ['-e', ${JSON.stringify(agentScript)}, prompt] };
     } } },
@@ -468,7 +603,8 @@ if (prompt.includes('## Blocking findings')) {
     gate: [${JSON.stringify(observeGate)}],
     maxRounds: 2,
     worktrees: false,
-  };` });
+  };`,
+  });
   await writeFile(join(root, '.gitignore'), '.loop/\n');
   await git(root, 'add', 'loop.config.mjs');
   await git(root, 'add', '.gitignore');
@@ -485,23 +621,47 @@ if (prompt.includes('## Blocking findings')) {
   assert.equal(summary.phases.find((phase) => phase.name === 'review').rounds, 2);
   const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
   const verdicts = manifest.phases.filter((entry) => entry.verdict);
-  assert.deepEqual(verdicts.filter((entry) => entry.round === 1).map((entry) => entry.phase), [
-    'review', 'review-security', 'review-api-compat', 'review-test-quality', 'review',
-  ]);
-  assert.equal(verdicts.find((entry) => entry.phase === 'review-security' && entry.round === 1).verdict.verdict, 'CHANGES_REQUESTED');
-  assert.equal(verdicts.find((entry) => entry.phase === 'review-security' && entry.round === 1).engine.model, 'reviewer');
+  assert.deepEqual(
+    verdicts.filter((entry) => entry.round === 1).map((entry) => entry.phase),
+    ['review', 'review-security', 'review-api-compat', 'review-test-quality', 'review'],
+  );
+  assert.equal(
+    verdicts.find((entry) => entry.phase === 'review-security' && entry.round === 1).verdict.verdict,
+    'CHANGES_REQUESTED',
+  );
+  assert.equal(
+    verdicts.find((entry) => entry.phase === 'review-security' && entry.round === 1).engine.model,
+    'reviewer',
+  );
   assert.equal(verdicts.findLast((entry) => entry.reviewerSet).verdict.verdict, 'APPROVED');
   assert.ok(manifest.phases.some((entry) => entry.phase === 'address'));
   assert.deepEqual((await readFile(join(summary.runDir, 'observed-phases'), 'utf8')).trim().split('\n'), [
-    'gate', 'review', 'review-security', 'review-api-compat', 'review-test-quality', 'address', 'gate', 'review',
-    'review-security', 'review-api-compat', 'review-test-quality',
+    'gate',
+    'review',
+    'review-security',
+    'review-api-compat',
+    'review-test-quality',
+    'address',
+    'gate',
+    'review',
+    'review-security',
+    'review-api-compat',
+    'review-test-quality',
   ]);
   const saved = JSON.parse(await readFile(join(summary.runDir, 'state.json'), 'utf8'));
   assert.equal(saved.currentPhase, 'review-test-quality');
 });
 
 test('the work-item preset puts docs before the gated review loop', () => {
-  assert.deepEqual(workItemPreset.phases, ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish']);
+  assert.deepEqual(workItemPreset.phases, [
+    'implement',
+    'docs',
+    'gate',
+    'review',
+    'address',
+    'pr-description',
+    'publish',
+  ]);
 });
 
 test('normalizePhases leaves an explicitly repair-free verdict phase unlooped', () => {
@@ -511,65 +671,102 @@ test('normalizePhases leaves an explicitly repair-free verdict phase unlooped', 
 
 test('normalizePhases drops the default gate recheck when address is absent', () => {
   const phases = normalizePhases(['gate', 'review'], { maxRounds: 2 });
-  assert.deepEqual(phases.map((phase) => phase.name), ['gate', 'review']);
+  assert.deepEqual(
+    phases.map((phase) => phase.name),
+    ['gate', 'review'],
+  );
   assert.deepEqual(phases[1].repair, []);
 });
 
 test('normalizePhases keeps retry attempts separate from verdict rounds', () => {
-  const phases = normalizePhases([
-    { name: 'check', kind: 'agent', verdict: true, retry: { maxAttempts: 2 }, repair: [] },
-  ], { maxRounds: 3 });
+  const phases = normalizePhases(
+    [{ name: 'check', kind: 'agent', verdict: true, retry: { maxAttempts: 2 }, repair: [] }],
+    { maxRounds: 3 },
+  );
   assert.equal(phases[0].retry.maxAttempts, 2);
   assert.equal(phases[0].maxRounds, 3);
 });
 
 test('normalizePhases resolves a standalone gate repair transition', () => {
-  const phases = normalizePhases([
-    {
-      name: 'gate',
-      repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'] }],
-    },
-  ], { maxRounds: 2 });
+  const phases = normalizePhases(
+    [
+      {
+        name: 'gate',
+        repair: [
+          { name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'] },
+        ],
+      },
+    ],
+    { maxRounds: 2 },
+  );
   assert.equal(phases[0].maxRounds, 2);
-  assert.deepEqual(phases[0].repair.map((phase) => phase.name), ['fix-gate']);
+  assert.deepEqual(
+    phases[0].repair.map((phase) => phase.name),
+    ['fix-gate'],
+  );
 });
 
 test('normalizePhases rejects a repair phase not named by a verdict transition', () => {
-  assert.throws(() => normalizePhases(['address'], { maxRounds: 3 }), /must be declared by a phase that emits a verdict/);
+  assert.throws(
+    () => normalizePhases(['address'], { maxRounds: 3 }),
+    /must be declared by a phase that emits a verdict/,
+  );
 });
 
 test('normalizePhases does not infer a repair loop from adjacency', () => {
   assert.throws(
-    () => normalizePhases([
-      { name: 'check', kind: 'agent', verdict: true, prompt: 'review' },
-      { name: 'fix', kind: 'agent', role: 'repair', prompt: 'address' },
-    ], { maxRounds: 3 }),
+    () =>
+      normalizePhases(
+        [
+          { name: 'check', kind: 'agent', verdict: true, prompt: 'review' },
+          { name: 'fix', kind: 'agent', role: 'repair', prompt: 'address' },
+        ],
+        { maxRounds: 3 },
+      ),
     /must be declared by a phase that emits a verdict/,
   );
 });
 
 test('normalizePhases accepts an explicit custom repair transition', () => {
-  const phases = normalizePhases([
-    { name: 'check', kind: 'agent', verdict: true, prompt: 'review', repair: ['fix'] },
-    { name: 'fix', kind: 'agent', role: 'repair', prompt: 'address', postconditions: ['clean-tree'] },
-  ], { maxRounds: 3 });
-  assert.deepEqual(phases.map((phase) => phase.name), ['check']);
-  assert.deepEqual(phases[0].repair.map((phase) => phase.name), ['fix']);
+  const phases = normalizePhases(
+    [
+      { name: 'check', kind: 'agent', verdict: true, prompt: 'review', repair: ['fix'] },
+      { name: 'fix', kind: 'agent', role: 'repair', prompt: 'address', postconditions: ['clean-tree'] },
+    ],
+    { maxRounds: 3 },
+  );
+  assert.deepEqual(
+    phases.map((phase) => phase.name),
+    ['check'],
+  );
+  assert.deepEqual(
+    phases[0].repair.map((phase) => phase.name),
+    ['fix'],
+  );
 });
 
 test('normalizePhases accepts a standalone inline repair descriptor', () => {
-  const phases = normalizePhases([
-    {
-      name: 'check',
-      kind: 'agent',
-      verdict: true,
-      prompt: 'review',
-      repair: [{ name: 'fix', kind: 'agent', role: 'repair', prompt: 'address' }],
-    },
-  ], { maxRounds: 3 });
+  const phases = normalizePhases(
+    [
+      {
+        name: 'check',
+        kind: 'agent',
+        verdict: true,
+        prompt: 'review',
+        repair: [{ name: 'fix', kind: 'agent', role: 'repair', prompt: 'address' }],
+      },
+    ],
+    { maxRounds: 3 },
+  );
 
-  assert.deepEqual(phases.map((phase) => phase.name), ['check']);
-  assert.deepEqual(phases[0].repair.map((phase) => phase.name), ['fix']);
+  assert.deepEqual(
+    phases.map((phase) => phase.name),
+    ['check'],
+  );
+  assert.deepEqual(
+    phases[0].repair.map((phase) => phase.name),
+    ['fix'],
+  );
   assert.equal(phases[0].repair[0].role, 'repair');
 });
 
@@ -578,10 +775,9 @@ test('normalizePhases rejects an unknown phase name', () => {
 });
 
 test('normalizePhases accepts a custom phase object', () => {
-  const phases = normalizePhases(
-    ['implement', { name: 'perf', kind: 'gate', commands: ['echo bench'] }],
-    { maxRounds: 3 },
-  );
+  const phases = normalizePhases(['implement', { name: 'perf', kind: 'gate', commands: ['echo bench'] }], {
+    maxRounds: 3,
+  });
   assert.equal(phases[1].kind, 'gate');
   assert.deepEqual(phases[1].commands, ['echo bench']);
   assert.equal(phases[1].optional, false);
@@ -595,16 +791,25 @@ test('normalizePhases makes custom phases optional only for literal true', () =>
     ],
     { maxRounds: 3 },
   );
-  assert.deepEqual(phases.map((phase) => phase.optional), [true, false]);
+  assert.deepEqual(
+    phases.map((phase) => phase.optional),
+    [true, false],
+  );
 });
 
 test('normalizePhases gives custom phases a safe permission default and rejects unknown permissions', () => {
-  const phases = normalizePhases([
-    { name: 'custom', kind: 'agent' },
-    { name: 'custom-gate', kind: 'gate', commands: ['true'] },
-    { name: 'custom-publish', kind: 'publish' },
-  ], { maxRounds: 3 });
-  assert.deepEqual(phases.map((phase) => phase.permissions), [['read-only'], ['read-only'], ['publish']]);
+  const phases = normalizePhases(
+    [
+      { name: 'custom', kind: 'agent' },
+      { name: 'custom-gate', kind: 'gate', commands: ['true'] },
+      { name: 'custom-publish', kind: 'publish' },
+    ],
+    { maxRounds: 3 },
+  );
+  assert.deepEqual(
+    phases.map((phase) => phase.permissions),
+    [['read-only'], ['read-only'], ['publish']],
+  );
   assert.throws(
     () => normalizePhases([{ name: 'unsafe', kind: 'agent', permissions: ['dangerous'] }], { maxRounds: 3 }),
     /has invalid permissions; expected read-only, write-worktree, publish/,
@@ -613,7 +818,10 @@ test('normalizePhases gives custom phases a safe permission default and rejects 
 
 test('normalizePhases marks only docs optional by default', () => {
   const phases = normalizePhases(['implement', 'docs', 'gate', 'review', 'publish'], { maxRounds: 3 });
-  assert.deepEqual(phases.map((phase) => phase.optional), [false, true, false, false, false]);
+  assert.deepEqual(
+    phases.map((phase) => phase.optional),
+    [false, true, false, false, false],
+  );
 });
 
 test('a required gate cannot be skipped interactively', async () => {
@@ -720,10 +928,7 @@ test('loadConfig rejects commit phases after the final verdict before publishing
   const { root } = await repoFixture({
     phases: ['implement', 'gate', 'review', 'address', 'docs', 'pr-description', 'publish'],
   });
-  await assert.rejects(
-    loadConfig(root),
-    /docs commit after the "review" verdict but before "publish" publishes/,
-  );
+  await assert.rejects(loadConfig(root), /docs commit after the "review" verdict but before "publish" publishes/);
 });
 
 test('loadConfig accepts docs before the gated review loop', async () => {
@@ -731,12 +936,14 @@ test('loadConfig accepts docs before the gated review loop', async () => {
     phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   });
   const config = await loadConfig(root);
-  assert.deepEqual(config.resolvedPhases.map((phase) => phase.name), [
-    'implement', 'docs', 'gate', 'review', 'pr-description', 'publish',
-  ]);
-  assert.deepEqual(config.resolvedPhases.find((phase) => phase.name === 'review').repair.map((phase) => phase.name), [
-    'address', 'gate',
-  ]);
+  assert.deepEqual(
+    config.resolvedPhases.map((phase) => phase.name),
+    ['implement', 'docs', 'gate', 'review', 'pr-description', 'publish'],
+  );
+  assert.deepEqual(
+    config.resolvedPhases.find((phase) => phase.name === 'review').repair.map((phase) => phase.name),
+    ['address', 'gate'],
+  );
 });
 
 test('loadConfig accepts commit phases after review when nothing publishes', async () => {
@@ -767,10 +974,7 @@ test('loadConfig rejects commit phases between the description and actual publis
   const { root } = await repoFixture({
     phases: ['implement', 'gate', 'review', 'pr-description', 'docs', 'publish'],
   });
-  await assert.rejects(
-    loadConfig(root),
-    /docs commit after the "review" verdict but before "publish" publishes/,
-  );
+  await assert.rejects(loadConfig(root), /docs commit after the "review" verdict but before "publish" publishes/);
 });
 
 test('loadConfig checks an early publish against its latest preceding verdict', async () => {
@@ -784,10 +988,7 @@ test('loadConfig checks an early publish against its latest preceding verdict', 
       { name: 'final-review', kind: 'agent', prompt: 'review', verdict: true, role: 'verdict', repair: [] },
     ],
   });
-  await assert.rejects(
-    loadConfig(root),
-    /docs commit after the "review" verdict but before "publish" publishes/,
-  );
+  await assert.rejects(loadConfig(root), /docs commit after the "review" verdict but before "publish" publishes/);
 });
 
 test('loadConfig merges overrides over the config file', async () => {
@@ -815,20 +1016,28 @@ test('loadConfig rejects an empty configured shell', async () => {
 });
 
 test('normalizeCommandEntry accepts string, argv, and per-platform forms', () => {
+  assert.deepEqual(normalizeCommandEntry('npm test', { label: 'gate', index: 0 }), {
+    kind: 'shell',
+    shellString: 'npm test',
+    display: 'npm test',
+  });
+  assert.deepEqual(normalizeCommandEntry({ argv: ['npm', 'ci'] }, { label: 'setup', index: 0 }), {
+    kind: 'argv',
+    argv: ['npm', 'ci'],
+    display: 'npm ci',
+  });
   assert.deepEqual(
-    normalizeCommandEntry('npm test', { label: 'gate', index: 0 }),
-    { kind: 'shell', shellString: 'npm test', display: 'npm test' },
-  );
-  assert.deepEqual(
-    normalizeCommandEntry({ argv: ['npm', 'ci'] }, { label: 'setup', index: 0 }),
-    { kind: 'argv', argv: ['npm', 'ci'], display: 'npm ci' },
-  );
-  assert.deepEqual(
-    normalizeCommandEntry({ posix: 'npm test', windows: 'npm.cmd test' }, { label: 'gate', index: 0, platform: 'win32' }),
+    normalizeCommandEntry(
+      { posix: 'npm test', windows: 'npm.cmd test' },
+      { label: 'gate', index: 0, platform: 'win32' },
+    ),
     { kind: 'shell', shellString: 'npm.cmd test', display: 'npm.cmd test' },
   );
   assert.deepEqual(
-    normalizeCommandEntry({ posix: 'npm test', windows: 'npm.cmd test' }, { label: 'gate', index: 0, platform: 'linux' }),
+    normalizeCommandEntry(
+      { posix: 'npm test', windows: 'npm.cmd test' },
+      { label: 'gate', index: 0, platform: 'linux' },
+    ),
     { kind: 'shell', shellString: 'npm test', display: 'npm test' },
   );
 });
@@ -844,7 +1053,10 @@ test('normalizeCommandEntry tags pwsh/cmd variants with a shellHint that pins th
   );
   // `windows` is the generic key; it does not pin a specific shell.
   assert.deepEqual(
-    normalizeCommandEntry({ posix: 'npm test', windows: 'npm test', pwsh: 'npm test' }, { label: 'gate', index: 0, platform: 'win32' }),
+    normalizeCommandEntry(
+      { posix: 'npm test', windows: 'npm test', pwsh: 'npm test' },
+      { label: 'gate', index: 0, platform: 'win32' },
+    ),
     { kind: 'shell', shellString: 'npm test', display: 'npm test' },
   );
 });
@@ -884,13 +1096,10 @@ test('normalizeCommandEntry fails fast when the current platform has no matching
 });
 
 test('normalizeCommandList validates the whole array and rejects non-array input', () => {
-  assert.deepEqual(
-    normalizeCommandList(['true', { argv: ['npm', 'test'] }], { label: 'gate' }),
-    [
-      { kind: 'shell', shellString: 'true', display: 'true' },
-      { kind: 'argv', argv: ['npm', 'test'], display: 'npm test' },
-    ],
-  );
+  assert.deepEqual(normalizeCommandList(['true', { argv: ['npm', 'test'] }], { label: 'gate' }), [
+    { kind: 'shell', shellString: 'true', display: 'true' },
+    { kind: 'argv', argv: ['npm', 'test'], display: 'npm test' },
+  ]);
   assert.throws(() => normalizeCommandList('true', { label: 'gate' }), /`gate` must be an array of commands/);
 });
 
@@ -917,11 +1126,13 @@ test('loadConfig accepts argv and per-platform gate commands on the current plat
 });
 
 test('loadConfig validates run budget limits', async () => {
-  const { root } = await repoFixture({ config: `export default {
+  const { root } = await repoFixture({
+    config: `export default {
   budget: { tokens: 12, usd: 0.75, wallClockMs: 5000 },
   gate: ['true'],
 };
-` });
+`,
+  });
   const config = await loadConfig(root);
   assert.deepEqual(config.budget, { tokens: 12, usd: 0.75, wallClockMs: 5000 });
 
@@ -929,31 +1140,201 @@ test('loadConfig validates run budget limits', async () => {
   await assert.rejects(loadConfig(root), /budget\.tokens.*nonnegative integer/);
 });
 
+test('loadConfig resolves and validates optional repeated-blocker judges', async () => {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  gate: ['true'],
+  judges: { local: { kind: 'systemone', command: ['node', 'judge.mjs'] } },
+  judge: { name: 'local', onRepeat: 'continue' },
+};`,
+  });
+  const config = await loadConfig(root);
+  assert.equal(config.judge.name, 'local');
+  assert.equal(config.judge.minProbability, 0.9);
+  assert.equal(config.judge.timeoutMs, 180_000);
+  assert.equal(config.judge.onRepeat, 'continue');
+  const overridden = await loadConfig(root, { judge: { onRepeat: 'stall' } });
+  assert.equal(overridden.judge.name, 'local');
+  assert.equal(overridden.judge.kind, 'systemone');
+  assert.deepEqual(overridden.judge.command, ['node', 'judge.mjs']);
+  assert.equal(overridden.judge.onRepeat, 'stall');
+  await runLoop({ args: { taskFile: workItem, cwd: root, onRepeat: 'stall', dryRun: true, yes: true } });
+  await runLoop({ args: { taskFile: workItem, cwd: root, noJudge: true, onRepeat: 'stall', dryRun: true, yes: true } });
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    `export default { gate: ['true'], judge: { kind: 'systemone', baseUrl: 'http://x', command: ['node', 'x'] } };`,
+  );
+  await assert.rejects(loadConfig(root), /exactly one of baseUrl or command/);
+});
+
+test('dry-run prints the resolved judge override without invoking its transport', async () => {
+  const { root, workItem } = await repoFixture();
+  const marker = join(root, 'judge-transport-called');
+  const judgeScript = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'called');`;
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    `export default {
+  worktrees: false,
+  gate: ['true'],
+  judges: {
+    local: { kind: 'command', command: [process.execPath, '-e', ${JSON.stringify(judgeScript)}] },
+  },
+  judge: { name: 'local', onRepeat: 'stall' },
+};\n`,
+  );
+  const original = console.log;
+  const lines = [];
+  console.log = (line) => lines.push(String(line));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, onRepeat: 'continue', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+
+  assert.match(lines.join('\n'), /judge\s+: local kind=command transport=command on-repeat=continue/);
+  await assert.rejects(readFile(marker), { code: 'ENOENT' });
+});
+
 test('loadConfig normalizes engine descriptors and inherits the default settings', async () => {
-  const { root } = await repoFixture({ config: `export default {
+  const { root } = await repoFixture({
+    config: `export default {
   engines: {
     default: { name: 'claude', model: 'sonnet', effort: 'high' },
     review: { name: 'codex', effort: 'medium' },
   },
   gate: ['true'],
 };
-` });
+`,
+  });
   const config = await loadConfig(root);
   assert.deepEqual(agentForPhase(config, 'implement'), { name: 'claude', model: 'sonnet', effort: 'high' });
   assert.deepEqual(agentForPhase(config, 'review'), { name: 'codex', effort: 'medium' });
 });
 
+test('phase engine entries inherit partial settings and isolate different engines', async () => {
+  const { root } = await repoFixture({
+    config: `export default {
+  engines: {
+    default: { name: 'claude', model: 'default-model', effort: 'high' },
+    docs: { model: 'cheap-model' },
+    'pr-description': { effort: 'low' },
+    review: { name: 'claude' },
+    address: 'codex',
+  },
+  phases: ['implement', 'docs', 'review', 'address', 'pr-description'],
+};
+`,
+  });
+  const config = await loadConfig(root);
+  assert.deepEqual(agentForPhase(config, 'docs'), { name: 'claude', model: 'cheap-model', effort: 'high' });
+  assert.deepEqual(agentForPhase(config, 'pr-description'), { name: 'claude', model: 'default-model', effort: 'low' });
+  assert.deepEqual(agentForPhase(config, 'review'), { name: 'claude', model: 'default-model', effort: 'high' });
+  assert.deepEqual(agentForPhase(config, 'address'), { name: 'codex' });
+});
+
+test('phase engine entries validate effort after inheritance', async () => {
+  const { root } = await repoFixture({
+    config: `export default {
+  engines: { default: { name: 'agy' }, docs: { effort: 'xhigh' } },
+  phases: ['docs'],
+};
+`,
+  });
+  const config = await loadConfig(root);
+  assert.throws(() => agentForPhase(config, 'docs'), /does not support effort "xhigh"/);
+});
+
+test('specialized reviewers inherit their resolved review engine', async () => {
+  const { root } = await repoFixture({
+    config: `export default {
+  engines: {
+    default: { name: 'claude', model: 'default-model', effort: 'high' },
+    review: { name: 'claude', model: 'review-model' },
+    'review-security': { effort: 'low' },
+  },
+  reviewRoles: ['security'],
+  gate: ['true'],
+};
+`,
+  });
+  const config = await loadConfig(root);
+  const security = config.resolvedPhases.find((phase) => phase.name === 'review').reviewers[0];
+  assert.deepEqual(agentForPhase(config, 'review'), { name: 'claude', model: 'review-model', effort: 'high' });
+  assert.deepEqual(resolvePhaseAgent(config, security), { name: 'claude', model: 'review-model', effort: 'low' });
+});
+
+test('engine keys reject typos and non-agent phases while inactive known keys warn', async () => {
+  const typo = await repoFixture({
+    config: "export default { engines: { default: 'claude', implment: 'codex' }, gate: ['true'] };\n",
+  });
+  await assert.rejects(loadConfig(typo.root), /Unknown engines key "implment"\. Valid keys: default,/);
+
+  const nonAgent = await repoFixture({
+    config: "export default { engines: { default: 'claude', gate: 'codex' }, gate: ['true'] };\n",
+  });
+  await assert.rejects(loadConfig(nonAgent.root), /engines\.gate has no effect/);
+
+  const inactive = await repoFixture({
+    config: "export default { engines: { default: 'claude', docs: { model: 'cheap' } }, phases: ['implement'] };\n",
+  });
+  const original = console.error;
+  const warnings = [];
+  console.error = (line) => warnings.push(String(line));
+  try {
+    await loadConfig(inactive.root);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(warnings, ['engines.docs is set but "docs" is not in this run\'s phases; ignoring it.']);
+});
+
+test('engine entries reject unknown fields and a partial default', async () => {
+  const unknownField = await repoFixture({
+    config: "export default { engines: { default: 'claude', docs: { modle: 'cheap' } }, gate: ['true'] };\n",
+  });
+  await assert.rejects(loadConfig(unknownField.root), /Engine "docs" has unknown field "modle"/);
+
+  const partialDefault = await repoFixture({
+    config: "export default { engines: { default: { model: 'cheap' } }, gate: ['true'] };\n",
+  });
+  await assert.rejects(loadConfig(partialDefault.root), /Engine "default" is missing a non-empty name/);
+});
+
+test('CLI default model reaches partial phase entries and dry-run prints resolved engines', async () => {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  engines: { default: { name: 'claude', effort: 'high' }, docs: { effort: 'low' } },
+  phases: ['implement', 'docs'],
+  worktrees: false,
+};
+`,
+  });
+  const original = console.log;
+  const lines = [];
+  console.log = (line) => lines.push(String(line));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, model: 'override-model', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /engines\s+: implement\s+claude model=override-model effort=high/);
+  assert.match(lines.join('\n'), /\s+docs\s+claude model=override-model effort=low/);
+});
+
 test('loadConfig rejects unsupported engine effort combinations', async () => {
-  const { root } = await repoFixture({ config: `export default {
+  const { root } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'agy', effort: 'xhigh' } },
   gate: ['true'],
 };
-` });
+`,
+  });
   await assert.rejects(loadConfig(root), /does not support effort "xhigh"/);
 });
 
 test('loadConfig accepts a custom adapter and its dry-run command is rendered', async () => {
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     mytool: {
       command({ prompt, cwd, addDirs, agent = {} }) {
@@ -970,7 +1351,8 @@ test('loadConfig accepts a custom adapter and its dry-run command is rendered', 
   phases: ['implement'],
   worktrees: false,
 };
-` });
+`,
+  });
   const config = await loadConfig(root);
   assert.equal(config.engines.default.name, 'mytool');
   assert.equal(adapterFor('mytool', config.adapters), config.adapters.mytool);
@@ -1000,7 +1382,8 @@ fs.appendFileSync('attempt-starts', state.phaseStartedAt + '\\n');
 fs.writeFileSync(path, String(attempt));
 if (attempt < 2) process.exit(1);
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     mytool: {
       command({ prompt }) {
@@ -1012,7 +1395,8 @@ if (attempt < 2) process.exit(1);
   phases: [{ name: 'recoverable', kind: 'agent', prompt: 'docs', permissions: ['write-worktree'], retry: { maxAttempts: 2 } }],
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -1043,7 +1427,8 @@ fs.writeFileSync(attemptsPath, String(attempt));
 if (attempt < 2) process.exit(1);
 fs.writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [] }));
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     mytool: {
       command({ prompt }) {
@@ -1055,7 +1440,8 @@ fs.writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: []
   phases: [{ name: 'review', kind: 'agent', verdict: true, repair: [], maxRounds: 1, retry: { maxAttempts: 2 } }],
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -1073,7 +1459,8 @@ fs.writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: []
 test('a publish retry budget bounds push and PR attempts', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-publish-retry-trees-'));
   const attemptsPath = join(await mkdtemp(join(tmpdir(), 'loop-publish-retry-')), 'attempts');
-  const { root, workItem } = await repoFixture({ config: `
+  const { root, workItem } = await repoFixture({
+    config: `
 import { appendFile } from 'node:fs/promises';
 
 const backend = {
@@ -1093,18 +1480,25 @@ export default {
   publish: { backend, draft: true },
   phases: ['gate', 'review', 'pr-description', { name: 'publish', retry: { maxAttempts: 2 } }],
 };
-` });
+`,
+  });
   const remoteRepo = await mkdtemp(join(tmpdir(), 'loop-publish-retry-remote-'));
   await git(remoteRepo, 'init', '--bare');
   await git(root, 'remote', 'add', 'origin', remoteRepo);
 
   const binDir = await mkdtemp(join(tmpdir(), 'loop-publish-retry-bin-'));
   const realGitPath = (await exec('sh', ['-c', 'command -v git'])).stdout.trim();
-  await writeFile(join(binDir, 'git'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'git'),
+    `#!/bin/sh
 if [ "$1" = push ]; then printf '%s\\n' push >> "$PUBLISH_ATTEMPTS"; fi
 exec "$REAL_GIT" "$@"
-`, { mode: 0o755 });
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+`,
+    { mode: 0o755 },
+  );
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt=$2
 case "$prompt" in
   *'Take on the role of a senior developer'*)
@@ -1114,7 +1508,9 @@ case "$prompt" in
     printf '%s\\n\\n%s\\n' 'Title: Retry fixture' 'The description is ready.' > "$FIXTURE_PR_PATH"
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalAttempts = process.env.PUBLISH_ATTEMPTS;
@@ -1152,7 +1548,7 @@ esac
 });
 
 test('a verdict retry cannot consume an artifact from a failed attempt', async () => {
-const verdictScript = `
+  const verdictScript = `
 const fs = require('node:fs');
 const { dirname, join } = require('node:path');
 const prompt = process.argv[1];
@@ -1165,7 +1561,8 @@ if (attempt === 1) {
   process.exit(1);
 }
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     mytool: {
       command({ prompt }) {
@@ -1177,14 +1574,12 @@ if (attempt === 1) {
   phases: [{ name: 'review', kind: 'agent', verdict: true, repair: [], maxRounds: 1, retry: { maxAttempts: 2 } }],
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   try {
-    await assert.rejects(
-      runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }),
-      /did not write a verdict/,
-    );
+    await assert.rejects(runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }), /did not write a verdict/);
   } finally {
     console.log = original;
   }
@@ -1193,24 +1588,31 @@ if (attempt === 1) {
 });
 
 test('custom adapters without efforts accept any configured effort', async () => {
-  const { root } = await repoFixture({ config: `export default {
+  const { root } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command: () => ({ command: 'mytool', args: [] }) } },
   engines: { default: { name: 'mytool', effort: 'custom-effort' } },
   gate: ['true'],
 };
-` });
+`,
+  });
   const config = await loadConfig(root);
   assert.equal(config.engines.default.effort, 'custom-effort');
 });
 
 test('custom adapter efforts reject unsupported values', async () => {
-  const { root } = await repoFixture({ config: `export default {
+  const { root } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command: () => ({ command: 'mytool', args: [] }), efforts: ['fast', 'slow'] } },
   engines: { default: { name: 'mytool', effort: 'custom-effort' } },
   gate: ['true'],
 };
-` });
-  await assert.rejects(loadConfig(root), /Engine "mytool" does not support effort "custom-effort"; expected one of fast, slow/);
+`,
+  });
+  await assert.rejects(
+    loadConfig(root),
+    /Engine "mytool" does not support effort "custom-effort"; expected one of fast, slow/,
+  );
 });
 
 test('interpolate fills variables and rejects unresolved ones', () => {
@@ -1242,11 +1644,23 @@ test('loadTemplate searches project overrides, preset overrides, then packaged p
 
   assert.equal((await loadTemplate('implement', { promptDirs: [project, preset] })).body, 'project');
   assert.equal((await loadTemplate('docs', { promptDirs: [project, preset] })).body, 'preset');
-  assert.equal((await loadTemplate('review', { promptDirs: [project, preset] })).path, join(packagePrompts, 'review.md'));
+  assert.equal(
+    (await loadTemplate('review', { promptDirs: [project, preset] })).path,
+    join(packagePrompts, 'review.md'),
+  );
 });
 
 test('default prompts render cleanly for every task input mode', async () => {
-  const promptNames = ['implement', 'review', 'review-security', 'review-api', 'review-tests', 'address', 'docs', 'pr-description'];
+  const promptNames = [
+    'implement',
+    'review',
+    'review-security',
+    'review-api',
+    'review-tests',
+    'address',
+    'docs',
+    'pr-description',
+  ];
   const taskModes = [
     { task: 'Do the inline task.', taskFile: null },
     { task: null, taskFile: '/plans/example.md' },
@@ -1266,6 +1680,7 @@ test('default prompts render cleanly for every task input mode', async () => {
       RUN_DIR: '/repo/.loop/runs/example',
       REMOTE: 'origin',
       GATE_COMMANDS: 'npm test',
+      UNRESOLVED_FINDINGS: '(none)',
       ROUND: 1,
       MAX_ROUNDS: 3,
       VERDICT_FILE: '/repo/.loop/runs/example/verdict-round-1.json',
@@ -1286,7 +1701,17 @@ test('default prompts contain no work-item-specific references', async () => {
   const forbidden = /WORK_ITEM|## Code Review|## Changelog|IN PROGRESS|AGENTS\.md|CLAUDE\.md/;
   const promptFiles = (await readdir(packagePrompts)).filter((file) => file.endsWith('.md'));
 
-  assert.deepEqual(promptFiles.sort(), ['address.md', 'docs.md', 'fix-gate.md', 'implement.md', 'pr-description.md', 'review-api.md', 'review-security.md', 'review-tests.md', 'review.md']);
+  assert.deepEqual(promptFiles.sort(), [
+    'address.md',
+    'docs.md',
+    'fix-gate.md',
+    'implement.md',
+    'pr-description.md',
+    'review-api.md',
+    'review-security.md',
+    'review-tests.md',
+    'review.md',
+  ]);
   for (const file of promptFiles) {
     const body = await readFile(join(packagePrompts, file), 'utf8');
     assert.doesNotMatch(body, forbidden, `${file} should remain generic`);
@@ -1296,10 +1721,7 @@ test('default prompts contain no work-item-specific references', async () => {
 test('parseVerdict fails closed on malformed, empty, and unknown verdicts', () => {
   assert.throws(() => parseVerdict('not json'), /not valid JSON/);
   assert.throws(() => parseVerdict('{"verdict":"LGTM"}'), /must be APPROVED or CHANGES_REQUESTED/);
-  assert.throws(
-    () => parseVerdict('{"verdict":"CHANGES_REQUESTED","blocking":[]}'),
-    /lists no blocking findings/,
-  );
+  assert.throws(() => parseVerdict('{"verdict":"CHANGES_REQUESTED","blocking":[]}'), /lists no blocking findings/);
   assert.throws(
     () => parseVerdict('{"verdict":"APPROVED","blocking":[{"issue":"must fix"}]}'),
     /APPROVED.*1 blocking findings/,
@@ -1319,10 +1741,7 @@ test('parseVerdict validates blocking and nit finding shapes', () => {
       /** @type {any} */ (message),
     );
   }
-  assert.throws(
-    () => parseVerdict('{"verdict":"APPROVED","nits":[[]]}'),
-    /nits\[0\] is malformed: expected an object/,
-  );
+  assert.throws(() => parseVerdict('{"verdict":"APPROVED","nits":[[]]}'), /nits\[0\] is malformed: expected an object/);
   assert.throws(
     () => parseVerdict('{"verdict":"APPROVED","blocking":[{}]}'),
     /blocking\[0\] is malformed: expected a non-empty issue or summary string/,
@@ -1331,14 +1750,8 @@ test('parseVerdict validates blocking and nit finding shapes', () => {
 });
 
 test('parseVerdict rejects non-array finding collections', () => {
-  assert.throws(
-    () => parseVerdict('{"verdict":"APPROVED","blocking":"must fix"}'),
-    /blocking must be an array/,
-  );
-  assert.throws(
-    () => parseVerdict('{"verdict":"APPROVED","nits":{}}'),
-    /nits must be an array/,
-  );
+  assert.throws(() => parseVerdict('{"verdict":"APPROVED","blocking":"must fix"}'), /blocking must be an array/);
+  assert.throws(() => parseVerdict('{"verdict":"APPROVED","nits":{}}'), /nits must be an array/);
 });
 
 test('parseVerdict tolerates a markdown fence around the JSON', () => {
@@ -1356,7 +1769,11 @@ test('formatFindings renders file:line citations', () => {
 
 test('adapters place the prompt and every extra directory on the command line', () => {
   const request = {
-    prompt: 'do it', cwd: '/w', addDirs: ['/runs', '/wiki'], timeoutMs: 60000, permissions: ['write-worktree'],
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: ['/runs', '/wiki'],
+    timeoutMs: 60000,
+    permissions: ['write-worktree'],
   };
   for (const engine of ['claude', 'codex', 'agy', 'gemini']) {
     const { command, args, input } = adapterFor(engine).command(request);
@@ -1399,7 +1816,12 @@ test('adapters emit the configured model and engine-specific effort option', () 
 });
 
 test('the claude adapter asks for a streaming format so a long phase stays watchable', () => {
-  const args = adapterFor('claude').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['write-worktree'] }).args;
+  const args = adapterFor('claude').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    permissions: ['write-worktree'],
+  }).args;
   assert.ok(args.includes('--output-format') && args.includes('stream-json'), 'streams events');
   assert.ok(args.includes('--verbose'), 'stream-json needs verbose to emit every event');
   assert.equal(args[args.indexOf('--permission-mode') + 1], 'auto', 'a non-interactive run cannot answer a prompt');
@@ -1407,17 +1829,32 @@ test('the claude adapter asks for a streaming format so a long phase stays watch
 });
 
 test('built-in adapters map read-only permissions to their safest modes', () => {
-  const claude = adapterFor('claude').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['read-only'] }).args;
+  const claude = adapterFor('claude').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    permissions: ['read-only'],
+  }).args;
   assert.equal(claude[claude.indexOf('--permission-mode') + 1], 'plan');
 
-  const codex = adapterFor('codex').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['read-only'] }).args;
+  const codex = adapterFor('codex').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    permissions: ['read-only'],
+  }).args;
   assert.equal(codex[codex.indexOf('--sandbox') + 1], 'read-only');
 
   const agy = adapterFor('agy').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['read-only'] }).args;
   assert.equal(agy[agy.indexOf('--mode') + 1], 'plan');
   assert.equal(agy.includes('--dangerously-skip-permissions'), false);
 
-  const gemini = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['read-only'] }).args;
+  const gemini = adapterFor('gemini').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    permissions: ['read-only'],
+  }).args;
   assert.equal(gemini[gemini.indexOf('--approval-mode') + 1], 'plan');
   assert.equal(gemini.includes('yolo'), false);
 });
@@ -1456,15 +1893,19 @@ test('built-in adapters scope artifact-only writes away from the worktree', () =
 });
 
 test('a native Codex artifact-only review isolates source reads from worktree writes', async () => {
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   engines: { default: 'codex' },
   phases: ['review'],
   worktrees: false,
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'codex'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'codex'),
+    `#!/usr/bin/env node
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -1492,7 +1933,9 @@ writeFileSync(join(runDir, 'README.md'), 'artifact cwd\\n');
 writeFileSync(join(runDir, 'custom-cwd.txt'), process.cwd());
 writeFileSync(join(runDir, 'source-read.md'), readFileSync(join(sourceDir, 'README.md')));
 if (addDirs.includes(taskDir)) appendFileSync(taskFile, '\\n## Code Review\\n\\nReview complete.\\n');
-` , { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalWorktree = process.env.FIXTURE_WORKTREE;
@@ -1525,15 +1968,19 @@ if (addDirs.includes(taskDir)) appendFileSync(taskFile, '\\n## Code Review\\n\\n
 
 test('a native Codex pr-description phase does not receive the external task-file repo as writable', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   engines: { default: 'codex' },
   phases: ['pr-description'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'codex'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'codex'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -1553,7 +2000,9 @@ if (addDirs.includes(taskDir)) {
 }
 writeFileSync(join(dirname(prPath), 'custom-cwd.txt'), process.cwd());
 writeFileSync(prPath, 'Title: fixture pr\\n\\nBody text.\\n');
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalLog = console.log;
@@ -1578,7 +2027,8 @@ writeFileSync(prPath, 'Title: fixture pr\\n\\nBody text.\\n');
 });
 
 test('an unaware custom read-only adapter starts in the source snapshot', async () => {
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     unaware: {
       command: ({ prompt }) => ({
@@ -1599,7 +2049,8 @@ test('an unaware custom read-only adapter starts in the source snapshot', async 
   phases: ['review'],
   worktrees: false,
 };
-` });
+`,
+  });
 
   const originalLog = console.log;
   console.log = () => {};
@@ -1620,7 +2071,10 @@ test('an unaware custom read-only adapter starts in the source snapshot', async 
 
 test('the claude renderer turns stream events into readable progress lines', () => {
   assert.equal(
-    renderClaudeEvent({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'yarn  test' } }] } }),
+    renderClaudeEvent({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'yarn  test' } }] },
+    }),
     '  \u2192 Bash yarn test\n',
   );
   assert.equal(
@@ -1635,7 +2089,12 @@ test('the claude renderer turns stream events into readable progress lines', () 
 });
 
 test('the agy adapter auto-approves tools and streams so a long phase is not mistaken for a hang', () => {
-  const args = adapterFor('agy').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['write-worktree'] }).args;
+  const args = adapterFor('agy').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    permissions: ['write-worktree'],
+  }).args;
   // Headless agy cannot answer a permission prompt, so without this it denies the
   // first command tool and exits 0 having done nothing.
   assert.ok(args.includes('--dangerously-skip-permissions'), 'auto-approves tools in headless mode');
@@ -1651,7 +2110,15 @@ test('the agy renderer turns stream events into readable progress lines', () => 
     '  · session 4358ea87 model gemini-3.6-flash\n',
   );
   assert.equal(
-    renderAgyEvent({ event: 'step_update', step_update: { step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'echo  hi' } } } }),
+    renderAgyEvent({
+      event: 'step_update',
+      step_update: {
+        step_type: 'tool',
+        state: 'ACTIVE',
+        tool_name: 'run_command',
+        tool_info: { parameters: { CommandLine: 'echo  hi' } },
+      },
+    }),
     '  → run_command echo hi\n',
   );
   assert.equal(
@@ -1659,10 +2126,16 @@ test('the agy renderer turns stream events into readable progress lines', () => 
     'all done',
   );
   assert.equal(
-    renderAgyEvent({ event: 'step_update', step_update: { step_type: 'tool', state: 'DONE', tool_info: { error: 'boom' } } }),
+    renderAgyEvent({
+      event: 'step_update',
+      step_update: { step_type: 'tool', state: 'DONE', tool_info: { error: 'boom' } },
+    }),
     '  ✗ boom\n',
   );
-  assert.equal(renderAgyEvent({ event: 'result', result: { status: 'SUCCESS', num_turns: 1, duration_seconds: 1.96 } }), '  ✓ done 1 turn 2s\n');
+  assert.equal(
+    renderAgyEvent({ event: 'result', result: { status: 'SUCCESS', num_turns: 1, duration_seconds: 1.96 } }),
+    '  ✓ done 1 turn 2s\n',
+  );
   assert.equal(
     renderAgyEvent({ event: 'result', result: { status: 'ERROR', error: 'invalid model', num_turns: 0 } }),
     '  ✗ error: invalid model\n',
@@ -1672,7 +2145,12 @@ test('the agy renderer turns stream events into readable progress lines', () => 
 });
 
 test('the gemini adapter carries the prompt on stdin, not the command line', () => {
-  const result = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['write-worktree'] });
+  const result = adapterFor('gemini').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    permissions: ['write-worktree'],
+  });
   // The Windows launcher is a .cmd/.ps1 shim, so on Git Bash the prompt would
   // ride through cmd.exe, which truncates past ~8191 chars and mangles newlines
   // and metacharacters. stdin is a pipe cmd.exe never parses.
@@ -1684,7 +2162,12 @@ test('the gemini adapter carries the prompt on stdin, not the command line', () 
 });
 
 test('the gemini adapter trusts the workspace, auto-approves tools, and streams', () => {
-  const args = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], permissions: ['write-worktree'] }).args;
+  const args = adapterFor('gemini').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    permissions: ['write-worktree'],
+  }).args;
   // Headless gemini cannot answer a permission prompt, so a worktree-writing
   // phase needs yolo to auto-approve the shell tools that build/test/commit.
   assert.equal(args[args.indexOf('--approval-mode') + 1], 'yolo', 'auto-approves tools in headless mode');
@@ -1697,7 +2180,12 @@ test('the gemini adapter trusts the workspace, auto-approves tools, and streams'
 });
 
 test('the gemini adapter passes a configured model and never emits an effort flag', () => {
-  const args = adapterFor('gemini').command({ prompt: 'do it', cwd: '/w', addDirs: [], agent: { model: 'gemini-3-pro', effort: 'high' } }).args;
+  const args = adapterFor('gemini').command({
+    prompt: 'do it',
+    cwd: '/w',
+    addDirs: [],
+    agent: { model: 'gemini-3-pro', effort: 'high' },
+  }).args;
   assert.ok(args.includes('--model') && args.includes('gemini-3-pro'));
   // Gemini CLI has no effort flag; a configured effort is silently ignored.
   assert.equal(args.includes('--effort'), false);
@@ -1712,26 +2200,39 @@ test('the gemini renderer turns real stream events into readable progress lines'
     '  · session ca1237fb model auto\n',
   );
   // Assistant text streams as deltas, passed through verbatim (no forced newline).
-  assert.equal(
-    renderGeminiEvent({ type: 'message', role: 'assistant', content: 'all done', delta: true }),
-    'all done',
-  );
+  assert.equal(renderGeminiEvent({ type: 'message', role: 'assistant', content: 'all done', delta: true }), 'all done');
   // The user turn is the prompt aloop already wrote; echoing it back is noise.
   assert.equal(renderGeminiEvent({ type: 'message', role: 'user', content: 'do it' }), '');
   // A tool call surfaces the tool and its most descriptive parameter.
   assert.equal(
-    renderGeminiEvent({ type: 'tool_use', tool_name: 'run_shell_command', tool_id: 'call-1', parameters: { command: 'npm  test' } }),
+    renderGeminiEvent({
+      type: 'tool_use',
+      tool_name: 'run_shell_command',
+      tool_id: 'call-1',
+      parameters: { command: 'npm  test' },
+    }),
     '  → run_shell_command npm test\n',
   );
   // A failed tool result is surfaced; a successful one is not (its output is huge).
   assert.equal(
-    renderGeminiEvent({ type: 'tool_result', tool_id: 'call-1', status: 'error', error: { type: 'TOOL_EXECUTION_ERROR', message: 'boom' } }),
+    renderGeminiEvent({
+      type: 'tool_result',
+      tool_id: 'call-1',
+      status: 'error',
+      error: { type: 'TOOL_EXECUTION_ERROR', message: 'boom' },
+    }),
     '  ✗ boom\n',
   );
   assert.equal(renderGeminiEvent({ type: 'tool_result', tool_id: 'call-2', status: 'success', output: 'ok' }), '');
   // Non-fatal warnings and system errors stay visible so a stall is not silent.
-  assert.equal(renderGeminiEvent({ type: 'error', severity: 'warning', message: 'Agent execution blocked' }), '  ⚠ Agent execution blocked\n');
-  assert.equal(renderGeminiEvent({ type: 'error', severity: 'error', message: 'quota exhausted' }), '  ✗ quota exhausted\n');
+  assert.equal(
+    renderGeminiEvent({ type: 'error', severity: 'warning', message: 'Agent execution blocked' }),
+    '  ⚠ Agent execution blocked\n',
+  );
+  assert.equal(
+    renderGeminiEvent({ type: 'error', severity: 'error', message: 'quota exhausted' }),
+    '  ✗ quota exhausted\n',
+  );
   assert.equal(
     renderGeminiEvent({ type: 'result', status: 'success', stats: { tool_calls: 1, duration_ms: 1960 } }),
     '  ✓ done 1 tool call 2s\n',
@@ -1746,7 +2247,9 @@ test('the gemini renderer turns real stream events into readable progress lines'
 
 test('the jsonl renderer captures Gemini token counts reported under result stats', () => {
   const renderer = createJsonlRenderer(renderGeminiEvent);
-  renderer.write('{"type":"result","status":"success","stats":{"total_tokens":42,"input_tokens":30,"output_tokens":12}}\n');
+  renderer.write(
+    '{"type":"result","status":"success","stats":{"total_tokens":42,"input_tokens":30,"output_tokens":12}}\n',
+  );
   assert.deepEqual(renderer.usage(), { tokens: 42 });
 });
 
@@ -1773,7 +2276,9 @@ test('the jsonl renderer captures Claude result total_cost_usd', () => {
 
 test('the jsonl renderer combines Claude result usage and total cost', () => {
   const renderer = createJsonlRenderer(renderClaudeEvent);
-  renderer.write('{"type":"result","subtype":"success","usage":{"input_tokens":12,"output_tokens":8},"total_cost_usd":0.37}\n');
+  renderer.write(
+    '{"type":"result","subtype":"success","usage":{"input_tokens":12,"output_tokens":8},"total_cost_usd":0.37}\n',
+  );
   assert.deepEqual(renderer.usage(), { tokens: 20, cost: 0.37 });
 });
 
@@ -1794,18 +2299,9 @@ test('buildTaskContext formats all four combinations of task and taskFile', () =
     buildTaskContext({ task: 'Do X', taskFile: 'spec.md' }),
     'Your task:\n\nDo X\n\nFull details in `spec.md`.',
   );
-  assert.equal(
-    buildTaskContext({ task: 'Do X', taskFile: null }),
-    'Your task:\n\nDo X',
-  );
-  assert.equal(
-    buildTaskContext({ task: null, taskFile: 'spec.md' }),
-    'Your task is described in `spec.md`.',
-  );
-  assert.equal(
-    buildTaskContext({ task: null, taskFile: null }),
-    '',
-  );
+  assert.equal(buildTaskContext({ task: 'Do X', taskFile: null }), 'Your task:\n\nDo X');
+  assert.equal(buildTaskContext({ task: null, taskFile: 'spec.md' }), 'Your task is described in `spec.md`.');
+  assert.equal(buildTaskContext({ task: null, taskFile: null }), '');
 });
 
 test('manifest hashes are deterministic and ignore function-valued config', async () => {
@@ -1823,26 +2319,46 @@ test('manifest hashes are deterministic and ignore function-valued config', asyn
     RUN_DIR: '/run',
     GATE_COMMANDS: 'true',
   });
-  const firstRender = await renderPrompt('implement', renderVariables('same task'), { projectPromptDir: '/missing-project-prompts' });
-  const secondRender = await renderPrompt('implement', renderVariables('same task'), { projectPromptDir: '/missing-project-prompts' });
-  const changedRender = await renderPrompt('implement', renderVariables('changed task'), { projectPromptDir: '/missing-project-prompts' });
+  const firstRender = await renderPrompt('implement', renderVariables('same task'), {
+    projectPromptDir: '/missing-project-prompts',
+  });
+  const secondRender = await renderPrompt('implement', renderVariables('same task'), {
+    projectPromptDir: '/missing-project-prompts',
+  });
+  const changedRender = await renderPrompt('implement', renderVariables('changed task'), {
+    projectPromptDir: '/missing-project-prompts',
+  });
   assert.equal(hashText(firstRender.prompt), hashText(secondRender.prompt));
   assert.notEqual(hashText(firstRender.prompt), hashText(changedRender.prompt));
 });
 
 test('run metrics aggregate phase usage and reviewer convergence', () => {
-  const metrics = computeRunMetrics({ phases: [
-    { phase: 'implement', role: 'agent', status: 'completed', durationMs: 100, tokens: 10, cost: 0.1 },
-    {
-      phase: 'review', role: 'verdict', round: 1, status: 'completed', durationMs: 20,
-      tokens: 5, cost: 0.05, verdict: { verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'fix' }] },
-    },
-    { phase: 'address', role: 'repair', round: 1, status: 'completed', durationMs: 30, tokens: 7, cost: 0.07 },
-    {
-      phase: 'review', role: 'verdict', round: 2, status: 'completed', durationMs: 25,
-      tokens: 6, cost: 0.06, verdict: { verdict: 'APPROVED', blocking: [] },
-    },
-  ] });
+  const metrics = computeRunMetrics({
+    phases: [
+      { phase: 'implement', role: 'agent', status: 'completed', durationMs: 100, tokens: 10, cost: 0.1 },
+      {
+        phase: 'review',
+        role: 'verdict',
+        round: 1,
+        status: 'completed',
+        durationMs: 20,
+        tokens: 5,
+        cost: 0.05,
+        verdict: { verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'fix' }] },
+      },
+      { phase: 'address', role: 'repair', round: 1, status: 'completed', durationMs: 30, tokens: 7, cost: 0.07 },
+      {
+        phase: 'review',
+        role: 'verdict',
+        round: 2,
+        status: 'completed',
+        durationMs: 25,
+        tokens: 6,
+        cost: 0.06,
+        verdict: { verdict: 'APPROVED', blocking: [] },
+      },
+    ],
+  });
 
   assert.deepEqual(metrics.total, {
     durationMs: 175,
@@ -1866,19 +2382,23 @@ test('run metrics aggregate phase usage and reviewer convergence', () => {
 
 test('review group metrics count only aggregate verdicts and real agent usage', () => {
   const verdict = (phase, round, result, blocking = []) => ({
-    phase, round, reviewGroup: 'review', status: 'completed', durationMs: 10,
-    tokens: 2, cost: 0.02, verdict: { verdict: result, blocking },
+    phase,
+    round,
+    reviewGroup: 'review',
+    status: 'completed',
+    durationMs: 10,
+    tokens: 2,
+    cost: 0.02,
+    verdict: { verdict: result, blocking },
   });
   const blocked = [{ issue: 'fix security finding' }];
   const entries = [
     verdict('review', 1, 'APPROVED'),
     verdict('review-security', 1, 'CHANGES_REQUESTED', blocked),
-    { ...verdict('review', 1, 'CHANGES_REQUESTED', blocked), aggregate: true,
-      tokens: undefined, cost: undefined },
+    { ...verdict('review', 1, 'CHANGES_REQUESTED', blocked), aggregate: true, tokens: undefined, cost: undefined },
     verdict('review', 2, 'APPROVED'),
     verdict('review-security', 2, 'APPROVED'),
-    { ...verdict('review', 2, 'APPROVED'), aggregate: true,
-      tokens: undefined, cost: undefined },
+    { ...verdict('review', 2, 'APPROVED'), aggregate: true, tokens: undefined, cost: undefined },
   ];
   const metrics = computeRunMetrics({ phases: entries });
   assert.equal(metrics.reviewer.rounds, 2);
@@ -1893,9 +2413,9 @@ test('review group metrics count only aggregate verdicts and real agent usage', 
 });
 
 test('metrics preserve unknown usage while reporting duration', () => {
-  const metrics = computeRunMetrics({ phases: [
-    { phase: 'gate', role: 'gate', status: 'completed', durationMs: 42, gateReceipts: [] },
-  ] });
+  const metrics = computeRunMetrics({
+    phases: [{ phase: 'gate', role: 'gate', status: 'completed', durationMs: 42, gateReceipts: [] }],
+  });
   assert.deepEqual(metrics.total, {
     durationMs: 42,
     tokens: null,
@@ -1914,10 +2434,12 @@ test('metrics preserve unknown usage while reporting duration', () => {
 });
 
 test('run metrics sum agent usage without gate entries erasing totals', () => {
-  const metrics = computeRunMetrics({ phases: [
-    { phase: 'implement', kind: 'agent', role: 'agent', status: 'completed', durationMs: 80, tokens: 10, cost: 0.1 },
-    { phase: 'gate', kind: 'gate', role: 'gate', status: 'completed', durationMs: 40, gateReceipts: [] },
-  ] });
+  const metrics = computeRunMetrics({
+    phases: [
+      { phase: 'implement', kind: 'agent', role: 'agent', status: 'completed', durationMs: 80, tokens: 10, cost: 0.1 },
+      { phase: 'gate', kind: 'gate', role: 'gate', status: 'completed', durationMs: 40, gateReceipts: [] },
+    ],
+  });
 
   assert.equal(metrics.total.durationMs, 120);
   assert.equal(metrics.total.tokens, 10);
@@ -1931,13 +2453,82 @@ test('run metrics sum agent usage without gate entries erasing totals', () => {
   });
 });
 
+test('run metrics sum review usage without judge entries erasing totals', () => {
+  const judge = (details) => ({
+    phase: 'review',
+    role: 'judge',
+    round: 2,
+    status: 'completed',
+    durationMs: 5,
+    ...details,
+  });
+  const metrics = computeRunMetrics({
+    phases: [
+      { phase: 'review', role: 'verdict', round: 2, status: 'completed', durationMs: 50, tokens: 100, cost: 1 },
+      judge({ decision: { skipped: 'no previous blocking findings' } }),
+      judge({ status: 'stalled', failure: { reason: 'timeout' } }),
+      judge({ status: 'skipped' }),
+      judge({ judge: 'byo', decision: { repeated: false, matches: [] }, action: 'keep going' }),
+      { phase: 'review', role: 'review-override', round: 2, status: 'completed', reason: 'repeated-blockers' },
+    ],
+  });
+
+  assert.equal(metrics.total.tokens, 100);
+  assert.equal(metrics.total.cost, 1);
+  assert.equal(metrics.total.usageCoverage.applicableEntries, 1);
+  assert.equal(metrics.phases.review.tokens, 100);
+  assert.equal(metrics.phases.review.cost, 1);
+  assert.equal(metrics.phases.review.attempts, 1);
+  assert.equal(metrics.phases.review.entries, 1);
+  assert.equal(metrics.phases.review.completed, 1);
+  assert.equal(metrics.phases.review.stalled, 0);
+  assert.equal(metrics.phases.review.skipped, 0);
+  assert.equal(metrics.phases.review.stallRate, 0);
+  assert.equal(metrics.phases.review.durationMs, 50);
+  assert.equal(metrics.total.durationMs, 50);
+  assert.equal(metrics.judge.decisions, 4);
+  assert.equal(metrics.judge.failedClosedStalls, 1);
+  assert.equal(metrics.judge.reviewOverrides, 1);
+  const aggregate = computeAggregateMetrics([
+    {
+      phases: [
+        { phase: 'review', status: 'completed', durationMs: 50, tokens: 100, cost: 1 },
+        judge({ status: 'stalled', failure: { reason: 'timeout' } }),
+      ],
+    },
+  ]);
+  assert.equal(aggregate.phases.review.attempts, 1);
+  assert.equal(aggregate.phases.review.stalled, 0);
+  assert.equal(aggregate.total.durationMs, aggregate.phases.review.durationMs);
+});
+
 test('aggregate metrics combine runs and calculate distributions', () => {
-  const first = { phases: [
-    { phase: 'review', role: 'verdict', round: 1, status: 'completed', durationMs: 10, tokens: 2, cost: 0.02, verdict: { verdict: 'APPROVED', blocking: [] } },
-  ] };
-  const second = { phases: [
-    { phase: 'review', role: 'verdict', round: 1, status: 'completed', durationMs: 20, verdict: { verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'fix' }] } },
-  ] };
+  const first = {
+    phases: [
+      {
+        phase: 'review',
+        role: 'verdict',
+        round: 1,
+        status: 'completed',
+        durationMs: 10,
+        tokens: 2,
+        cost: 0.02,
+        verdict: { verdict: 'APPROVED', blocking: [] },
+      },
+    ],
+  };
+  const second = {
+    phases: [
+      {
+        phase: 'review',
+        role: 'verdict',
+        round: 1,
+        status: 'completed',
+        durationMs: 20,
+        verdict: { verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'fix' }] },
+      },
+    ],
+  };
   const metrics = computeAggregateMetrics([first, second]);
   assert.equal(metrics.runs, 2);
   assert.equal(metrics.total.durationMs, 30);
@@ -1958,16 +2549,32 @@ test('read operations surface per-run and aggregate metrics from saved manifests
   const runs = await mkdtemp(join(tmpdir(), 'loop-runs-'));
   const runDir = join(runs, 'demo');
   await mkdir(runDir, { recursive: true });
-  await writeFile(join(runDir, 'state.json'), JSON.stringify({
-    runId: 'run-1', status: 'completed', completed: ['review'], branch: 'feat/demo',
-    startedAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:01:00.000Z',
-  }));
-  await writeFile(join(runDir, 'manifest.json'), JSON.stringify({
-    phases: [{
-      phase: 'review', role: 'verdict', round: 1, status: 'completed', durationMs: 60,
-      verdict: { verdict: 'APPROVED', blocking: [] },
-    }],
-  }));
+  await writeFile(
+    join(runDir, 'state.json'),
+    JSON.stringify({
+      runId: 'run-1',
+      status: 'completed',
+      completed: ['review'],
+      branch: 'feat/demo',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:01:00.000Z',
+    }),
+  );
+  await writeFile(
+    join(runDir, 'manifest.json'),
+    JSON.stringify({
+      phases: [
+        {
+          phase: 'review',
+          role: 'verdict',
+          round: 1,
+          status: 'completed',
+          durationMs: 60,
+          verdict: { verdict: 'APPROVED', blocking: [] },
+        },
+      ],
+    }),
+  );
 
   const status = await getRunStatus(runs, 'demo');
   assert.equal(status.status, 'completed');
@@ -1996,15 +2603,30 @@ test('read-only commands inspect saved runs when the pipeline config is invalid'
 
   const runDir = join(root, '.loop', 'runs', 'demo');
   await mkdir(runDir, { recursive: true });
-  await writeFile(join(runDir, 'state.json'), JSON.stringify({
-    runId: 'run-1', status: 'completed', completed: ['review'], branch: 'feat/demo',
-  }));
-  await writeFile(join(runDir, 'manifest.json'), JSON.stringify({
-    phases: [{
-      phase: 'review', role: 'verdict', round: 1, status: 'completed', durationMs: 60,
-      verdict: { verdict: 'APPROVED', blocking: [] },
-    }],
-  }));
+  await writeFile(
+    join(runDir, 'state.json'),
+    JSON.stringify({
+      runId: 'run-1',
+      status: 'completed',
+      completed: ['review'],
+      branch: 'feat/demo',
+    }),
+  );
+  await writeFile(
+    join(runDir, 'manifest.json'),
+    JSON.stringify({
+      phases: [
+        {
+          phase: 'review',
+          role: 'verdict',
+          round: 1,
+          status: 'completed',
+          durationMs: 60,
+          verdict: { verdict: 'APPROVED', blocking: [] },
+        },
+      ],
+    }),
+  );
 
   const original = console.log;
   const lines = [];
@@ -2071,7 +2693,7 @@ test('a read-only RunState stays in memory and ignores persisted state', async (
   assert.equal(preview.data.task, undefined);
   await preview.enterPhase('implement');
   assert.equal(preview.data.currentPhase, undefined);
-  assert.equal((JSON.parse(await readFile(persisted.path, 'utf8'))).currentPhase, undefined);
+  assert.equal(JSON.parse(await readFile(persisted.path, 'utf8')).currentPhase, undefined);
 
   await openFixtureState(runs, 'uncreated', {}, { readOnly: true });
   await assert.rejects(readdir(join(runs, 'uncreated')), { code: 'ENOENT' });
@@ -2100,10 +2722,7 @@ test('RunState keeps the last good state and manifest when a temp write is aband
 test('RunState rejects a second active open and releases the lock', async () => {
   const runs = await mkdtemp(join(tmpdir(), 'loop-runs-'));
   const state = await RunState.open(runs, 'demo', {});
-  await assert.rejects(
-    RunState.open(runs, 'demo', {}),
-    /Run already active/,
-  );
+  await assert.rejects(RunState.open(runs, 'demo', {}), /Run already active/);
   await state.release();
 
   const reopened = await RunState.open(runs, 'demo', {}, { resume: true });
@@ -2126,10 +2745,7 @@ test('RunState serializes concurrent stale-lock takeover', async () => {
   const lockDir = join(runDir, 'lock');
   await mkdir(runDir);
   await mkdir(lockDir);
-  await writeFile(
-    join(lockDir, 'owner-2147483647-deadbeef'),
-    JSON.stringify({ pid: 2147483647, token: 'deadbeef' }),
-  );
+  await writeFile(join(lockDir, 'owner-2147483647-deadbeef'), JSON.stringify({ pid: 2147483647, token: 'deadbeef' }));
 
   const results = await Promise.allSettled([
     RunState.acquireLock(runDir, 'first'),
@@ -2140,8 +2756,8 @@ test('RunState serializes concurrent stale-lock takeover', async () => {
   const rejected = results.filter(({ status }) => status === 'rejected');
   assert.equal(acquired.length, 1, 'exactly one contender may take over the stale lock');
   assert.equal(rejected.length, 1, 'the other contender must observe the new active lock');
-  assert.match((/** @type {any} */ (rejected[0])).reason.message, /Run already active/);
-  await RunState.releaseLock(runDir, (/** @type {any} */ (acquired[0])).value);
+  assert.match(/** @type {any} */ (rejected[0]).reason.message, /Run already active/);
+  await RunState.releaseLock(runDir, /** @type {any} */ (acquired[0]).value);
 });
 
 test('RunState refuses unsupported and non-integer state and manifest schema versions', async () => {
@@ -2151,10 +2767,7 @@ test('RunState refuses unsupported and non-integer state and manifest schema ver
   await state.release();
   const saved = JSON.parse(await readFile(join(runs, 'demo', 'state.json'), 'utf8'));
   await writeFile(join(runs, 'demo', 'state.json'), JSON.stringify({ ...saved, schemaVersion: 999 }));
-  await assert.rejects(
-    RunState.open(runs, 'demo', {}, { resume: true }),
-    /Unsupported state schemaVersion 999/,
-  );
+  await assert.rejects(RunState.open(runs, 'demo', {}, { resume: true }), /Unsupported state schemaVersion 999/);
   await writeFile(join(runs, 'demo', 'state.json'), JSON.stringify({ ...saved, schemaVersion: 'corrupt' }));
   await assert.rejects(
     RunState.open(runs, 'demo', {}, { resume: true }),
@@ -2164,10 +2777,7 @@ test('RunState refuses unsupported and non-integer state and manifest schema ver
   const valid = await RunState.open(runs, 'other', {});
   await valid.release();
   await writeFile(join(runs, 'other', 'manifest.json'), JSON.stringify({ schemaVersion: 999, task: 'bad' }));
-  await assert.rejects(
-    RunState.open(runs, 'other', {}, { resume: true }),
-    /Unsupported manifest schemaVersion 999/,
-  );
+  await assert.rejects(RunState.open(runs, 'other', {}, { resume: true }), /Unsupported manifest schemaVersion 999/);
 });
 
 test('RunState refuses to reuse an existing slug without --resume', async () => {
@@ -2176,20 +2786,23 @@ test('RunState refuses to reuse an existing slug without --resume', async () => 
   await state.markComplete('gate');
   await state.release();
 
-  await assert.rejects(
-    RunState.open(runs, 'demo', {}),
-    /already contains a run.*--resume.*new --name/,
-  );
+  await assert.rejects(RunState.open(runs, 'demo', {}), /already contains a run.*--resume.*new --name/);
 });
 
 test('parseLoopArgs validates task options and numeric bounds', () => {
   const args = parseLoopArgs([
-    '--task-file', 'wi.md',
-    '--task', 'do it',
-    '--name', 'my-name',
-    '--phases', 'implement, gate',
-    '--max-rounds', '2',
-    '--base-branch', 'other-branch',
+    '--task-file',
+    'wi.md',
+    '--task',
+    'do it',
+    '--name',
+    'my-name',
+    '--phases',
+    'implement, gate',
+    '--max-rounds',
+    '2',
+    '--base-branch',
+    'other-branch',
     '-y',
   ]);
   assert.equal(args.taskFile, 'wi.md');
@@ -2218,6 +2831,8 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
     config: undefined,
     phases: undefined,
     maxRounds: undefined,
+    noJudge: undefined,
+    onRepeat: undefined,
     from: undefined,
     resume: undefined,
     note: undefined,
@@ -2254,6 +2869,8 @@ test('parseLoopArgs validates task options and numeric bounds', () => {
     config: undefined,
     phases: undefined,
     maxRounds: undefined,
+    noJudge: undefined,
+    onRepeat: undefined,
     from: undefined,
     resume: undefined,
     note: undefined,
@@ -2295,6 +2912,8 @@ test('init scaffolds an importable config and complete editable default prompts'
   const configPath = join(root, 'loop.config.mjs');
   const config = await readFile(configPath, 'utf8');
   assert.match(config, /REVIEW THESE before your first run/);
+  assert.match(config, /Any agent phase can override default/);
+  assert.match(config, /default \+ per-phase/);
   assert.match(config, /Prompts live in \.loop\/prompts/);
   assert.match(config, /happy agentic looping/);
   const loaded = await import(`${pathToFileURL(configPath).href}?t=${Date.now()}`);
@@ -2305,7 +2924,10 @@ test('init scaffolds an importable config and complete editable default prompts'
 test('init uses bundled preset config and overlays its prompts', async () => {
   const root = await mkdtemp(join(tmpdir(), 'loop-init-preset-'));
   const result = await initScaffold({ cwd: root, preset: 'work-item' });
-  const presetPrompt = await readFile(join(dirname(packagePrompts), 'presets', 'work-item', 'prompts', 'implement.md'), 'utf8');
+  const presetPrompt = await readFile(
+    join(dirname(packagePrompts), 'presets', 'work-item', 'prompts', 'implement.md'),
+    'utf8',
+  );
   const copiedPrompt = await readFile(join(root, '.loop', 'prompts', 'implement.md'), 'utf8');
   const config = await readFile(join(root, 'loop.config.mjs'), 'utf8');
 
@@ -2326,16 +2948,21 @@ test('init refuses partial clobbers, supports force, and leaves extra prompts in
   await writeFile(join(root, '.loop', 'prompts', 'custom.md'), 'keep me\n');
   await initScaffold({ cwd: root, force: true });
   assert.equal(await readFile(join(root, '.loop', 'prompts', 'custom.md'), 'utf8'), 'keep me\n');
-  await assert.rejects(initScaffold({ cwd: root, preset: 'unknown' }), /Unknown preset "unknown"\. Available: work-item/);
+  await assert.rejects(
+    initScaffold({ cwd: root, preset: 'unknown' }),
+    /Unknown preset "unknown"\. Available: work-item/,
+  );
 });
 
 test('init command dispatch returns JSON scaffold results', async () => {
   const root = await mkdtemp(join(tmpdir(), 'loop-init-command-'));
   const output = [];
-  const result = /** @type {any} */ (await runCliOperationalCommand(
-    parseLoopArgs(['init', '--json']),
-    /** @type {any} */ ({ cwd: root, output: { log: (line) => output.push(line) } }),
-  ));
+  const result = /** @type {any} */ (
+    await runCliOperationalCommand(
+      parseLoopArgs(['init', '--json']),
+      /** @type {any} */ ({ cwd: root, output: { log: (line) => output.push(line) } }),
+    )
+  );
 
   assert.equal(result.preset, null);
   assert.deepEqual(JSON.parse(output[0]), result);
@@ -2459,18 +3086,24 @@ test('a dry run plans every phase without creating state, a worktree, or a branc
 
 test('a completed agent phase writes a commit-attested manifest entry', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 printf 'done\\n' > implemented.txt
 git add implemented.txt
 git commit -m 'feat: implement fixture'
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const original = console.log;
   console.log = () => {};
@@ -2515,7 +3148,8 @@ git add "$file"
 git commit -m "feat: metered phase $next"
 printf '%s\\n' '{"type":"result","usage":{"input_tokens":6,"output_tokens":4,"cost":0.1}}'
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     metered: {
       command() {
@@ -2532,7 +3166,8 @@ printf '%s\\n' '{"type":"result","usage":{"input_tokens":6,"output_tokens":4,"co
   budget: { tokens: 10, usd: 0.2 },
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -2547,12 +3182,17 @@ printf '%s\\n' '{"type":"result","usage":{"input_tokens":6,"output_tokens":4,"co
   assert.equal(firstSummary.stalled.phase, 'second');
   assert.equal(firstSummary.stalled.reason, 'budget exhausted: tokens');
   const firstManifest = JSON.parse(await readFile(join(firstSummary.runDir, 'manifest.json'), 'utf8'));
-  assert.deepEqual(firstManifest.phases.map((entry) => [entry.phase, entry.status]), [
-    ['first', 'completed'],
-    ['second', 'stalled'],
-  ]);
+  assert.deepEqual(
+    firstManifest.phases.map((entry) => [entry.phase, entry.status]),
+    [
+      ['first', 'completed'],
+      ['second', 'stalled'],
+    ],
+  );
 
-  await writeFile(join(root, 'loop.config.mjs'), `export default {
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    `export default {
   adapters: {
     metered: {
       command() {
@@ -2569,7 +3209,8 @@ printf '%s\\n' '{"type":"result","usage":{"input_tokens":6,"output_tokens":4,"co
   budget: { tokens: 30, usd: 0.3 },
   worktrees: false,
 };
-`);
+`,
+  );
   let resumedSummary;
   try {
     resumedSummary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
@@ -2577,7 +3218,10 @@ printf '%s\\n' '{"type":"result","usage":{"input_tokens":6,"output_tokens":4,"co
     process.exitCode = originalExitCode;
   }
   assert.equal(resumedSummary.stalled, null);
-  assert.deepEqual(resumedSummary.phases.map((phase) => phase.name), ['second']);
+  assert.deepEqual(
+    resumedSummary.phases.map((phase) => phase.name),
+    ['second'],
+  );
 });
 
 async function assertZeroBudgetStopsBeforeAgent(field) {
@@ -2586,7 +3230,8 @@ async function assertZeroBudgetStopsBeforeAgent(field) {
 const fs = require('node:fs');
 fs.writeFileSync(${JSON.stringify(marker)}, 'ran');
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     metered: {
       command() {
@@ -2599,7 +3244,8 @@ fs.writeFileSync(${JSON.stringify(marker)}, 'ran');
   budget: { ${field}: 0 },
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -2625,7 +3271,7 @@ test('a zero dollar budget stalls before the first agent invocation', async () =
 });
 
 test('a budget stall inside a review repair preserves usage and blocks unchanged resume', async () => {
-const verdictScript = `
+  const verdictScript = `
 const fs = require('node:fs');
 const { dirname, join } = require('node:path');
 const prompt = process.argv[1];
@@ -2635,7 +3281,8 @@ const attempts = fs.existsSync(attemptsPath) ? Number(fs.readFileSync(attemptsPa
 fs.writeFileSync(attemptsPath, String(attempts));
 fs.writeFileSync(verdictPath, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'fix it' }] }));
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     metered: {
       command({ prompt }) {
@@ -2649,7 +3296,8 @@ fs.writeFileSync(verdictPath, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blo
   budget: { tokens: 10 },
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -2667,7 +3315,11 @@ fs.writeFileSync(verdictPath, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blo
   assert.equal(firstSummary.stalled.reason, 'budget exhausted: tokens');
   assert.equal(resumedSummary.stalled.phase, 'review');
   assert.equal(resumedSummary.stalled.reason, 'budget exhausted: tokens');
-  assert.equal(await readFile(join(firstSummary.runDir, 'review-attempts'), 'utf8'), '1', 'unchanged resume must not invoke the reviewer again');
+  assert.equal(
+    await readFile(join(firstSummary.runDir, 'review-attempts'), 'utf8'),
+    '1',
+    'unchanged resume must not invoke the reviewer again',
+  );
 
   const manifest = JSON.parse(await readFile(join(firstSummary.runDir, 'manifest.json'), 'utf8'));
   const repairStall = manifest.phases.find((entry) => entry.phase === 'address');
@@ -2685,7 +3337,8 @@ const fs = require('node:fs');
 const attempts = fs.existsSync('final-runs') ? Number(fs.readFileSync('final-runs', 'utf8')) + 1 : 1;
 fs.writeFileSync('final-runs', String(attempts));
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     metered: {
       command() {
@@ -2699,7 +3352,8 @@ fs.writeFileSync('final-runs', String(attempts));
   budget: { tokens: 10 },
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -2721,16 +3375,26 @@ fs.writeFileSync('final-runs', String(attempts));
   assert.equal(resumedSummary.stalled.reason, 'budget exhausted: tokens');
   assert.equal(forcedSummary.stalled.phase, 'final');
   assert.equal(forcedSummary.stalled.reason, 'budget exhausted: tokens');
-  assert.equal(await readFile(join(root, 'final-runs'), 'utf8'), '1', 'unchanged resume must not rerun the final phase');
+  assert.equal(
+    await readFile(join(root, 'final-runs'), 'utf8'),
+    '1',
+    'unchanged resume must not rerun the final phase',
+  );
 
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
-  assert.deepEqual(state.data.completed, ['final'], 'terminal budget exhaustion must checkpoint the completed final phase');
+  assert.deepEqual(
+    state.data.completed,
+    ['final'],
+    'terminal budget exhaustion must checkpoint the completed final phase',
+  );
   assert.equal(state.data.phases.final.budgetExhausted, true);
   const manifest = JSON.parse(await readFile(join(firstSummary.runDir, 'manifest.json'), 'utf8'));
   assert.equal(manifest.phases.filter((entry) => entry.phase === 'final').length, 4);
   assert.equal(manifest.phases.at(-1).budgetStall, true);
 
-  await writeFile(join(root, 'loop.config.mjs'), `export default {
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    `export default {
   adapters: {
     metered: {
       command() {
@@ -2744,11 +3408,19 @@ fs.writeFileSync('final-runs', String(attempts));
   budget: { tokens: 20 },
   worktrees: false,
 };
-`);
+`,
+  );
   const completedSummary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
   assert.equal(completedSummary.stalled, null);
-  assert.deepEqual(completedSummary.phases.map((phase) => phase.name), ['final']);
-  assert.equal(await readFile(join(root, 'final-runs'), 'utf8'), '1', 'raised-budget resume must not rerun the final phase');
+  assert.deepEqual(
+    completedSummary.phases.map((phase) => phase.name),
+    ['final'],
+  );
+  assert.equal(
+    await readFile(join(root, 'final-runs'), 'utf8'),
+    '1',
+    'raised-budget resume must not rerun the final phase',
+  );
 
   const completedState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   assert.deepEqual(completedState.data.completed, ['final']);
@@ -2756,7 +3428,8 @@ fs.writeFileSync('final-runs', String(attempts));
 });
 
 test('a wall-clock budget stalls between phases', async () => {
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   phases: [
     { name: 'slow', kind: 'gate', commands: ['sleep 0.6'] },
     { name: 'next', kind: 'gate', commands: ['true'] },
@@ -2764,7 +3437,8 @@ test('a wall-clock budget stalls between phases', async () => {
   budget: { wallClockMs: 500 },
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -2785,7 +3459,8 @@ test('an agent with unavailable cost warns and does not silently pass a dollar b
 const fs = require('node:fs');
 fs.writeFileSync(${JSON.stringify(marker)}, 'ran');
 `;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     unmetered: {
       command() {
@@ -2798,7 +3473,8 @@ fs.writeFileSync(${JSON.stringify(marker)}, 'ran');
   budget: { usd: 1 },
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   const lines = [];
@@ -2817,22 +3493,23 @@ fs.writeFileSync(${JSON.stringify(marker)}, 'ran');
 
 test('a failing implementation agent writes a stalled manifest entry before rejecting', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), '#!/bin/sh\nprintf \'implementation failed\\n\' >&2\nexit 7\n', { mode: 0o755 });
+  await writeFile(join(binDir, 'claude'), "#!/bin/sh\nprintf 'implementation failed\\n' >&2\nexit 7\n", {
+    mode: 0o755,
+  });
   const originalPath = process.env.PATH;
   const original = console.log;
   console.log = () => {};
   process.env.PATH = `${binDir}:${originalPath}`;
   try {
-    await assert.rejects(
-      runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }),
-      /Command failed: claude/,
-    );
+    await assert.rejects(runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }), /Command failed: claude/);
   } finally {
     process.env.PATH = originalPath;
     console.log = original;
@@ -2855,22 +3532,21 @@ test('a failing implementation agent writes a stalled manifest entry before reje
 
 test('a failing verdict agent writes a stalled manifest entry before rejecting', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   phases: ['review'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), '#!/bin/sh\nprintf \'review failed\\n\' >&2\nexit 9\n', { mode: 0o755 });
+  await writeFile(join(binDir, 'claude'), "#!/bin/sh\nprintf 'review failed\\n' >&2\nexit 9\n", { mode: 0o755 });
   const originalPath = process.env.PATH;
   const original = console.log;
   console.log = () => {};
   process.env.PATH = `${binDir}:${originalPath}`;
   try {
-    await assert.rejects(
-      runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }),
-      /Command failed: claude/,
-    );
+    await assert.rejects(runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }), /Command failed: claude/);
   } finally {
     process.env.PATH = originalPath;
     console.log = original;
@@ -2888,12 +3564,14 @@ test('a failing verdict agent writes a stalled manifest entry before rejecting',
 
 test('a gate manifest entry records each command receipt and a stall', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true', 'false'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-  ` });
+  `,
+  });
   const originalExitCode = process.exitCode;
   const original = console.log;
   console.log = () => {};
@@ -2910,18 +3588,26 @@ test('a gate manifest entry records each command receipt and a stall', async () 
   const [entry] = manifest.phases;
   assert.equal(entry.role, 'gate');
   assert.equal(entry.status, 'stalled');
-  assert.deepEqual(entry.gateReceipts.map((receipt) => [receipt.command, receipt.exitCode]), [['true', 0], ['false', 1]]);
+  assert.deepEqual(
+    entry.gateReceipts.map((receipt) => [receipt.command, receipt.exitCode]),
+    [
+      ['true', 0],
+      ['false', 1],
+    ],
+  );
   assert.ok(entry.gateReceipts.every((receipt) => typeof receipt.durationMs === 'number'));
 });
 
 test('a silent passing gate declares a log artifact that exists', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -2940,18 +3626,24 @@ test('a silent passing gate declares a log artifact that exists', async () => {
 
 test('a verdict manifest entry binds the verdict to its reviewed SHA', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   phases: ['review'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 const prompt = process.argv[process.argv.indexOf('-p') + 1];
 const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
 writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [], nits: [], summary: 'looks good' }));
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const original = console.log;
   console.log = () => {};
@@ -2976,19 +3668,23 @@ writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [], n
 
 test('the approved description is pushed and published with verified PR metadata', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   remote: 'origin',
   phases: ['implement', 'docs', 'gate', 'review', 'pr-description', 'publish'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const remoteRepo = await mkdtemp(join(tmpdir(), 'loop-remote-'));
   await git(remoteRepo, 'init', '--bare');
   await git(root, 'remote', 'add', 'origin', 'git@github.com:example/project.git');
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   const realGitPath = (await exec('sh', ['-c', 'command -v git'])).stdout.trim();
-  await writeFile(join(binDir, 'git'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'git'),
+    `#!/bin/sh
 if [ "$1" = push ] && [ "$3" = origin ]; then
   exec "$FAKE_GIT_PATH" push "$2" "$FAKE_REMOTE" "$4"
 fi
@@ -2996,10 +3692,14 @@ if [ "$1" = ls-remote ] && [ "$2" = origin ]; then
   exec "$FAKE_GIT_PATH" ls-remote "$FAKE_REMOTE" "$3"
 fi
 exec "$FAKE_GIT_PATH" "$@"
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const prState = join(root, '.loop/runs/ss-demo-feature/gh-pr.json');
   const ghLog = join(root, '.loop/runs/ss-demo-feature/gh.log');
-  await writeFile(join(binDir, 'gh'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'gh'),
+    `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
 if [ "$1" = auth ] && [ "$2" = status ]; then exit 0; fi
 if [ "$1" = pr ] && [ "$2" = view ]; then
@@ -3013,8 +3713,12 @@ if [ "$1" = pr ] && [ "$2" = create ]; then
   exit 0
 fi
 exit 1
-`, { mode: 0o755 });
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+`,
+    { mode: 0o755 },
+  );
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt=$2
 case "$prompt" in
   *documentation-as-built*)
@@ -3036,7 +3740,9 @@ case "$prompt" in
     git commit -m 'feat: implement fixture'
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalVerdictPath = process.env.FIXTURE_VERDICT_PATH;
@@ -3076,7 +3782,10 @@ esac
 
   assert.equal(summary.stalled, null);
   const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
-  assert.deepEqual(manifest.phases.map((entry) => entry.phase), ['implement', 'docs', 'gate', 'review', 'pr-description', 'publish']);
+  assert.deepEqual(
+    manifest.phases.map((entry) => entry.phase),
+    ['implement', 'docs', 'gate', 'review', 'pr-description', 'publish'],
+  );
   const gate = manifest.phases.find((entry) => entry.phase === 'gate');
   const review = manifest.phases.find((entry) => entry.phase === 'review');
   const description = manifest.phases.find((entry) => entry.phase === 'pr-description');
@@ -3084,7 +3793,10 @@ esac
   assert.equal(gate.outputSha, review.verdict.sha);
   assert.equal(description.status, 'completed');
   assert.equal(description.artifacts.includes('pr.md'), true);
-  assert.equal(await readFile(join(summary.runDir, 'pr.md'), 'utf8'), 'Title: Fixture description\n\nThe description is ready.\n');
+  assert.equal(
+    await readFile(join(summary.runDir, 'pr.md'), 'utf8'),
+    'Title: Fixture description\n\nThe description is ready.\n',
+  );
   assert.equal(await git(remoteRepo, 'rev-parse', 'refs/heads/feat/ss-demo-feature'), review.verdict.sha);
   assert.deepEqual(publishPhase.pullRequest, {
     url: 'https://github.com/example/project/pull/42',
@@ -3101,14 +3813,18 @@ esac
 
 test('an approved run can resume PR description after a clean-tree stall', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['gate', 'review', 'pr-description'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt=$2
 case "$prompt" in
   *documentation-as-built*)
@@ -3134,7 +3850,9 @@ case "$prompt" in
     git commit -m 'feat: implement fixture'
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalVerdictPath = process.env.FIXTURE_VERDICT_PATH;
@@ -3172,7 +3890,10 @@ esac
   const reviews = manifest.phases.filter((entry) => entry.role === 'verdict');
   const approvedReview = reviews.findLast((entry) => entry.status === 'completed');
   const gitPhase = manifest.phases.at(-1);
-  assert.ok(reviews.some((entry) => entry.status === 'skipped'), 'resume should record skipped review bookkeeping');
+  assert.ok(
+    reviews.some((entry) => entry.status === 'skipped'),
+    'resume should record skipped review bookkeeping',
+  );
   assert.ok(approvedReview, 'the completed approval should remain discoverable');
   assert.equal(approvedReview.verdict.verdict, 'APPROVED');
   assert.equal(gitPhase.phase, 'pr-description');
@@ -3183,14 +3904,18 @@ esac
 test('a missing or malformed PR description stalls and can resume', async () => {
   for (const mode of ['missing', 'malformed']) {
     const worktreeRoot = await mkdtemp(join(tmpdir(), `loop-pr-description-${mode}-trees-`));
-    const { root, workItem } = await repoFixture({ config: `export default {
+    const { root, workItem } = await repoFixture({
+      config: `export default {
   gate: ['true'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
   phases: ['gate', 'review', 'pr-description'],
 };
-` });
+`,
+    });
     const binDir = await mkdtemp(join(tmpdir(), `loop-pr-description-${mode}-`));
-    await writeFile(join(binDir, 'claude'), `#!/bin/sh
+    await writeFile(
+      join(binDir, 'claude'),
+      `#!/bin/sh
 prompt=$2
 case "$prompt" in
   *'Take on the role of a senior developer'*)
@@ -3207,7 +3932,9 @@ case "$prompt" in
     fi
     ;;
 esac
-`, { mode: 0o755 });
+`,
+      { mode: 0o755 },
+    );
 
     const originalPath = process.env.PATH;
     const originalMode = process.env.DESCRIPTION_MODE;
@@ -3256,14 +3983,18 @@ esac
 
 test('a review that advances HEAD is rejected before its verdict is approved', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['gate', 'review'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt=$2
 case "$prompt" in
   *'Take on the role of a senior developer'*)
@@ -3275,7 +4006,9 @@ case "$prompt" in
   *'Push to '*)
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalVerdictPath = process.env.FIXTURE_VERDICT_PATH;
@@ -3302,7 +4035,10 @@ esac
   assert.equal(summary.stalled.phase, 'review');
   assert.match(summary.stalled.reason, /review phase advanced HEAD/);
   const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
-  assert.deepEqual(manifest.phases.map((entry) => entry.phase), ['gate', 'review']);
+  assert.deepEqual(
+    manifest.phases.map((entry) => entry.phase),
+    ['gate', 'review'],
+  );
   const gate = manifest.phases.find((entry) => entry.phase === 'gate');
   const review = manifest.phases.find((entry) => entry.phase === 'review');
   assert.equal(gate.outputSha, review.inputSha);
@@ -3313,14 +4049,18 @@ esac
 
 test('a reviewer mutation forces the completed gate to run again before resume approval', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['gate', 'review'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt=$2
 case "$prompt" in
   *'Take on the role of a senior developer'*)
@@ -3334,7 +4074,9 @@ case "$prompt" in
   *'Push to '*)
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalVerdictPath = process.env.FIXTURE_VERDICT_PATH;
@@ -3374,13 +4116,15 @@ esac
 
 test('setup runs in a new worktree before the first phase', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   setup: ['echo setup > setup-marker'],
   gate: ['test -f setup-marker'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -3395,13 +4139,15 @@ test('setup runs in a new worktree before the first phase', async () => {
 
 test('setup runs in a fresh worktree for an existing branch', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   setup: ['echo setup > setup-marker'],
   gate: ['test -f setup-marker'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   await git(root, 'branch', 'feat/ss-demo-feature');
 
   const original = console.log;
@@ -3419,33 +4165,34 @@ test('setup runs in a fresh worktree for an existing branch', async () => {
 
 test('a failing setup command aborts before any phase runs', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   setup: ['false'],
   gate: ['echo should-not-run'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
 
   await assert.rejects(
     runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }),
     /Worktree setup failed for `false`/,
   );
-  await assert.rejects(
-    readFile(join(root, '.loop/runs/ss-demo-feature/gate.log')),
-    { code: 'ENOENT' },
-  );
+  await assert.rejects(readFile(join(root, '.loop/runs/ss-demo-feature/gate.log')), { code: 'ENOENT' });
 });
 
 test('setup is skipped when resuming a reused worktree', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   setup: ['echo setup >> setup-count'],
   gate: ['test "$(wc -l < setup-count)" -eq 1'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   try {
@@ -3460,13 +4207,15 @@ test('setup is skipped when resuming a reused worktree', async () => {
 
 test('setup is skipped during a dry run', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   setup: ['echo setup > setup-marker'],
   gate: ['true'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -3482,12 +4231,14 @@ test('setup is skipped during a dry run', async () => {
 
 test('an implement phase with no commit stalls and points to its log', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   await writeFile(join(binDir, 'claude'), '#!/usr/bin/env node\n', { mode: 0o755 });
   const originalPath = process.env.PATH;
@@ -3514,12 +4265,14 @@ test('an implement phase with no commit stalls and points to its log', async () 
 
 test('a phase with only head-advanced stalls without a commit', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: [{ name: 'commit-only', kind: 'agent', prompt: 'implement', postconditions: ['head-advanced'] }],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   await writeFile(join(binDir, 'claude'), '#!/usr/bin/env node\n', { mode: 0o755 });
   const originalPath = process.env.PATH;
@@ -3543,7 +4296,8 @@ test('a phase with only head-advanced stalls without a commit', async () => {
 test('resume recognizes a manual commit from the stalled phase baseline', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const attemptsPath = join(await mkdtemp(join(tmpdir(), 'loop-attempts-')), 'count');
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: {
     recorder: {
       command: () => ({ command: 'sh', args: ['-c', ${JSON.stringify(`printf x >> ${attemptsPath}`)}] }),
@@ -3553,7 +4307,8 @@ test('resume recognizes a manual commit from the stalled phase baseline', async 
   phases: [{ name: 'implement', kind: 'agent', prompt: 'implement', postconditions: ['clean-tree', 'head-advanced'] }],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -3576,7 +4331,10 @@ test('resume recognizes a manual commit from the stalled phase baseline', async 
 
   const resumedSummary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, yes: true } });
   assert.equal(resumedSummary.stalled, null);
-  assert.deepEqual(resumedSummary.phases.map((phase) => phase.name), ['implement']);
+  assert.deepEqual(
+    resumedSummary.phases.map((phase) => phase.name),
+    ['implement'],
+  );
   assert.equal(await readFile(attemptsPath, 'utf8'), 'x', 'resume must not invoke the agent again');
 
   const resumedState = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
@@ -3596,14 +4354,20 @@ test('resume recognizes a manual commit from the stalled phase baseline', async 
 
 test('an implement phase that leaves edits uncommitted stalls', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), "#!/usr/bin/env node\nimport { writeFileSync } from 'node:fs';\nwriteFileSync('changed.txt', 'changed\\n');\n", { mode: 0o755 });
+  await writeFile(
+    join(binDir, 'claude'),
+    "#!/usr/bin/env node\nimport { writeFileSync } from 'node:fs';\nwriteFileSync('changed.txt', 'changed\\n');\n",
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const original = console.log;
   const originalExitCode = process.exitCode;
@@ -3629,13 +4393,15 @@ test('resume with a note re-drives only the stalled phase and records it in the 
 printf '%s\\n---\\n' "$prompt" >> ${JSON.stringify(promptCapture)}
 if [ ! -f changed.txt ]; then printf 'changed\\n' > changed.txt; fi
 case "$prompt" in *'commit and stop'*) git add changed.txt && git commit -m 'fix: finish implementation' >/dev/null ;; esac`;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'note-agent', prompt] }; } } },
   engines: { default: 'mytool' },
   phases: ['implement', 'docs'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -3643,7 +4409,9 @@ case "$prompt" in *'commit and stop'*) git add changed.txt && git commit -m 'fix
   let resumed;
   try {
     initial = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
-    resumed = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, note: 'commit and stop', yes: true } });
+    resumed = await runLoop({
+      args: { taskFile: workItem, cwd: root, resume: true, note: 'commit and stop', yes: true },
+    });
   } finally {
     console.log = original;
     process.exitCode = originalExitCode;
@@ -3685,18 +4453,22 @@ test('operator notes prefer --note over --note-file and reject blank input', asy
 test('--from with a note re-runs an already completed phase', async () => {
   const promptCapture = join(await mkdtemp(join(tmpdir(), 'loop-prompts-')), 'from-prompts.txt');
   const agentScript = `printf '%s\\n---\\n' "$1" >> ${JSON.stringify(promptCapture)}`;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'from-agent', prompt] }; } } },
   engines: { default: 'mytool' },
   phases: ['docs'],
   worktrees: false,
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   try {
     await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
-    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'docs', note: 'run docs again', yes: true } });
+    await runLoop({
+      args: { taskFile: workItem, cwd: root, resume: true, from: 'docs', note: 'run docs again', yes: true },
+    });
   } finally {
     console.log = original;
   }
@@ -3708,12 +4480,14 @@ test('--from with a note re-runs an already completed phase', async () => {
 
 test('an implement phase that only prints text stalls', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   await writeFile(join(binDir, 'claude'), '#!/bin/sh\necho "could not complete"\n', { mode: 0o755 });
   const originalPath = process.env.PATH;
@@ -3736,18 +4510,24 @@ test('an implement phase that only prints text stalls', async () => {
 
 test('a silent code phase that commits completes normally', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 printf 'committed\\n' > committed.txt
 git add committed.txt
 git commit -m 'feat: silent implementation' >/dev/null
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const original = console.log;
   console.log = () => {};
@@ -3760,20 +4540,27 @@ git commit -m 'feat: silent implementation' >/dev/null
     console.log = original;
   }
   assert.equal(summary.stalled, null);
-  assert.deepEqual(summary.phases.map((phase) => phase.name), ['implement']);
+  assert.deepEqual(
+    summary.phases.map((phase) => phase.name),
+    ['implement'],
+  );
   assert.equal(await git(summary.worktree, 'log', '-1', '--pretty=%s'), 'feat: silent implementation');
 });
 
 test('an address phase that commits its fix completes normally', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review', 'address'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt="$2"
 case "$prompt" in
   *"Machine-readable verdict"*)
@@ -3789,7 +4576,9 @@ case "$prompt" in
     git commit -m 'fix: address finding' >/dev/null
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const original = console.log;
   console.log = () => {};
@@ -3812,21 +4601,32 @@ esac
     selector: 'phases[*].promptHash',
   });
   const agentInvocations = manifest.phases.filter((entry) => entry.promptHash);
-  assert.deepEqual(agentInvocations.map((entry) => entry.phase), ['review', 'address', 'review']);
+  assert.deepEqual(
+    agentInvocations.map((entry) => entry.phase),
+    ['review', 'address', 'review'],
+  );
   assert.ok(agentInvocations.every((entry) => /^[a-f0-9]{64}$/.test(entry.promptHash)));
-  assert.notEqual(agentInvocations[0].promptHash, agentInvocations[2].promptHash, 'later review uses its actual round context');
+  assert.notEqual(
+    agentInvocations[0].promptHash,
+    agentInvocations[2].promptHash,
+    'later review uses its actual round context',
+  );
 });
 
 test('an address phase with a written rebuttal may complete without a commit', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review', 'address'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 const prompt = process.argv[process.argv.indexOf('-p') + 1];
 if (prompt.includes('Machine-readable verdict')) {
@@ -3839,7 +4639,9 @@ if (prompt.includes('Machine-readable verdict')) {
   const rebuttalPath = prompt.slice(prompt.indexOf('Write any rebuttal to')).split(String.fromCharCode(96))[1];
   writeFileSync(rebuttalPath, 'The finding does not apply.\\n');
 }
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const original = console.log;
   console.log = () => {};
@@ -3858,14 +4660,18 @@ if (prompt.includes('Machine-readable verdict')) {
 
 test('an address phase with findings but no fix or rebuttal stalls', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review', 'address'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 const prompt = process.argv[process.argv.indexOf('-p') + 1];
 if (prompt.includes('Machine-readable verdict')) {
@@ -3875,7 +4681,9 @@ if (prompt.includes('Machine-readable verdict')) {
     blocking: [{ file: 'src/x.mjs', line: 1, issue: 'fix it' }],
   }));
 }
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const originalExitCode = process.exitCode;
   const original = console.log;
@@ -3896,7 +4704,8 @@ if (prompt.includes('Machine-readable verdict')) {
 
 test('an inline repair with only head-advanced-or-rebuttal stalls without a fix or rebuttal', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: [{
     name: 'check',
@@ -3913,9 +4722,12 @@ test('an inline repair with only head-advanced-or-rebuttal stalls without a fix 
   }],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 const prompt = process.argv[process.argv.indexOf('-p') + 1];
 if (prompt.includes('Machine-readable verdict')) {
@@ -3925,7 +4737,9 @@ if (prompt.includes('Machine-readable verdict')) {
     blocking: [{ file: 'src/x.mjs', line: 1, issue: 'fix it' }],
   }));
 }
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const originalPath = process.env.PATH;
   const originalExitCode = process.exitCode;
   const original = console.log;
@@ -3946,12 +4760,14 @@ if (prompt.includes('Machine-readable verdict')) {
 
 test('a non-code phase may complete without output or changes', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['docs'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   await writeFile(join(binDir, 'claude'), '#!/usr/bin/env node\n', { mode: 0o755 });
   const originalPath = process.env.PATH;
@@ -3967,7 +4783,10 @@ test('a non-code phase may complete without output or changes', async () => {
   }
 
   assert.equal(summary.stalled, null);
-  assert.deepEqual(summary.phases.map((phase) => phase.name), ['docs']);
+  assert.deepEqual(
+    summary.phases.map((phase) => phase.name),
+    ['docs'],
+  );
 });
 
 test('a dry run reports prompts for the requested base branch without creating it', async () => {
@@ -4087,11 +4906,13 @@ test('a dry-run --resume --from previews a completed phase without changing save
 });
 
 test('implement prompt shows the current platform gate commands', async () => {
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['echo plain', { posix: 'echo posix', windows: 'echo win' }, { argv: ['node', '-v'] }],
   phases: ['implement'],
 };
-` });
+`,
+  });
   const original = console.log;
   const lines = [];
   console.log = (message) => lines.push(String(message));
@@ -4197,22 +5018,28 @@ test('a dry-run resume ignores a persisted review round cap', async () => {
 
 test('a cap reached with outstanding findings checkpoints the owed repair', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review', 'address'],
   maxRounds: 1,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 const prompt = process.argv[process.argv.indexOf('-p') + 1];
 if (prompt.includes('Machine-readable verdict')) {
   const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
   writeFileSync(verdictPath, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ file: 'src/x.mjs', line: 1, issue: 'fix it' }] }));
 }
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalExitCode = process.exitCode;
@@ -4237,15 +5064,19 @@ if (prompt.includes('Machine-readable verdict')) {
 test('a resumed repair reruns the agent when HEAD is still the reviewed tree', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const attemptsPath = join(await mkdtemp(join(tmpdir(), 'loop-attempts-')), 'count');
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review', 'address'],
   maxRounds: 1,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 const promptIndex = process.argv.indexOf('-p');
@@ -4257,7 +5088,9 @@ if (prompt?.includes('Machine-readable verdict')) {
   appendFileSync(${JSON.stringify(attemptsPath)}, 'x');
   execFileSync('git', ['commit', '--allow-empty', '-m', 'fix: address findings']);
 }
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalExitCode = process.exitCode;
@@ -4454,15 +5287,18 @@ test('a failing gate stalls the run and exits non-zero', async () => {
 
 test('a failing gate uses its bounded repair transition and re-gates', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const repairScript = "printf 'fixed\\n' > gate-fixed\ngit add gate-fixed && git commit -m 'fix: repair gate' >/dev/null";
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const repairScript =
+    "printf 'fixed\\n' > gate-fixed\ngit add gate-fixed && git commit -m 'fix: repair gate' >/dev/null";
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command() { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(repairScript)}] }; } } },
   engines: { default: 'mytool' },
   gate: ['test -f gate-fixed'],
   phases: [{ name: 'gate', repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'], postconditions: ['clean-tree', 'head-advanced'] }] }],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -4472,24 +5308,36 @@ test('a failing gate uses its bounded repair transition and re-gates', async () 
     console.log = original;
   }
   assert.equal(summary.stalled, null);
-  assert.deepEqual(summary.phases.map((phase) => phase.name), ['gate']);
+  assert.deepEqual(
+    summary.phases.map((phase) => phase.name),
+    ['gate'],
+  );
   const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
-  assert.deepEqual(manifest.phases.map((entry) => entry.status), ['stalled', 'completed', 'completed']);
+  assert.deepEqual(
+    manifest.phases.map((entry) => entry.status),
+    ['stalled', 'completed', 'completed'],
+  );
   assert.equal(manifest.phases.at(-1).outputSha, await git(summary.worktree, 'rev-parse', 'HEAD'));
 });
 
 test('a resumed gate repair starts at its saved repair checkpoint before re-gating', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const eventLog = join(await mkdtemp(join(tmpdir(), 'loop-events-')), 'events.log');
-  const repairScript = [`printf 'repair\\n' >> ${JSON.stringify(eventLog)}`, 'printf fixed > gate-fixed', "git add gate-fixed && git commit -m 'fix: repair gate' >/dev/null"].join('\n');
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const repairScript = [
+    `printf 'repair\\n' >> ${JSON.stringify(eventLog)}`,
+    'printf fixed > gate-fixed',
+    "git add gate-fixed && git commit -m 'fix: repair gate' >/dev/null",
+  ].join('\n');
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command() { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(repairScript)}] }; } } },
   engines: { default: 'mytool' },
   gate: [${JSON.stringify(`printf 'gate\\n' >> ${eventLog}; test -f gate-fixed`)}],
   phases: [{ name: 'gate', repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'], postconditions: ['clean-tree', 'head-advanced'] }] }],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({
     pendingRepairs: {
@@ -4526,13 +5374,14 @@ test('a noted completed phase invalidates downstream gate and review attestation
     'prompt=$1',
     `case "$prompt" in *'Take on the role of a senior developer'*)`,
     "  verdict_path=$(printf '%s\\n' \"$prompt\" | sed -n 's/.*write this JSON to `\\([^`]*\\)`.*/\\1/p')",
-    "  printf '%s\\n' '{\"verdict\":\"APPROVED\",\"blocking\":[]}' > \"$verdict_path\"",
+    '  printf \'%s\\n\' \'{"verdict":"APPROVED","blocking":[]}\' > "$verdict_path"',
     '  ;;',
     `*'second implementation'*) printf implemented > second.txt; git add second.txt && git commit -m 'feat: implement fixture' >/dev/null ;;`,
     "*) printf implemented > first.txt; git add first.txt && git commit -m 'feat: implement fixture' >/dev/null ;;",
     'esac',
   ].join('\n');
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'note-agent', prompt] }; } } },
   engines: { default: 'mytool' },
   gate: [${JSON.stringify(`printf 'gate\\n' >> ${gateLog}`)}],
@@ -4540,7 +5389,8 @@ test('a noted completed phase invalidates downstream gate and review attestation
   maxRounds: 1,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
 
   const original = console.log;
   console.log = () => {};
@@ -4548,7 +5398,16 @@ test('a noted completed phase invalidates downstream gate and review attestation
   let resumed;
   try {
     initial = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
-    resumed = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'implement', note: 'second implementation', yes: true } });
+    resumed = await runLoop({
+      args: {
+        taskFile: workItem,
+        cwd: root,
+        resume: true,
+        from: 'implement',
+        note: 'second implementation',
+        yes: true,
+      },
+    });
   } finally {
     console.log = original;
   }
@@ -4571,16 +5430,17 @@ test('--resume --from reruns a completed implement phase and clears downstream s
   const gateLog = join(await mkdtemp(join(tmpdir(), 'loop-events-')), 'gates.log');
   const agentScript = [
     'prompt=$1',
-    "case \"$prompt\" in *'Take on the role of a senior developer'*)",
+    'case "$prompt" in *\'Take on the role of a senior developer\'*)',
     "  verdict_path=$(printf '%s\\n' \"$prompt\" | sed -n 's/.*write this JSON to `\\([^`]*\\)`.*/\\1/p')",
-    "  printf '%s\\n' '{\"verdict\":\"APPROVED\",\"blocking\":[]}' > \"$verdict_path\"",
+    '  printf \'%s\\n\' \'{"verdict":"APPROVED","blocking":[]}\' > "$verdict_path"',
     '  ;;',
     "*'documentation-as-built pass'*) ;;",
-    "*) if test -f second.txt; then exit 1; elif test -f first.txt; then file=second.txt; else file=first.txt; fi",
-    "   printf implemented > \"$file\"; git add \"$file\" && git commit -m 'feat: implement fixture' >/dev/null ;;",
+    '*) if test -f second.txt; then exit 1; elif test -f first.txt; then file=second.txt; else file=first.txt; fi',
+    '   printf implemented > "$file"; git add "$file" && git commit -m \'feat: implement fixture\' >/dev/null ;;',
     'esac',
   ].join('\n');
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'from-agent', prompt] }; } } },
   engines: { default: 'mytool' },
   gate: [${JSON.stringify(`printf 'gate\\n' >> ${gateLog}`)}],
@@ -4588,7 +5448,8 @@ test('--resume --from reruns a completed implement phase and clears downstream s
   maxRounds: 1,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
 
   const original = console.log;
   console.log = () => {};
@@ -4608,7 +5469,10 @@ test('--resume --from reruns a completed implement phase and clears downstream s
 
   assert.equal(initial.stalled, null);
   assert.equal(resumed.stalled, null);
-  assert.deepEqual(resumed.phases.map((phase) => phase.name), ['implement', 'docs', 'gate', 'review']);
+  assert.deepEqual(
+    resumed.phases.map((phase) => phase.name),
+    ['implement', 'docs', 'gate', 'review'],
+  );
   assert.deepEqual((await readFile(gateLog, 'utf8')).trim().split('\n'), ['gate', 'gate']);
   const manifest = JSON.parse(await readFile(join(resumed.runDir, 'manifest.json'), 'utf8'));
   for (const phase of ['implement', 'docs', 'gate', 'review']) {
@@ -4622,15 +5486,26 @@ test('--resume --from reruns a completed implement phase and clears downstream s
 
   console.log = () => {};
   try {
-    const reviewOnly = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'review', yes: true } });
+    const reviewOnly = await runLoop({
+      args: { taskFile: workItem, cwd: root, resume: true, from: 'review', yes: true },
+    });
     assert.equal(reviewOnly.stalled, null);
-    assert.deepEqual(reviewOnly.phases.map((phase) => phase.name), ['review']);
+    assert.deepEqual(
+      reviewOnly.phases.map((phase) => phase.name),
+      ['review'],
+    );
   } finally {
     console.log = original;
   }
   const afterReviewOnly = JSON.parse(await readFile(join(resumed.runDir, 'manifest.json'), 'utf8'));
-  assert.equal(afterReviewOnly.phases.filter((entry) => entry.phase === 'review' && entry.status === 'completed').length, 3);
-  assert.equal(afterReviewOnly.phases.filter((entry) => entry.phase === 'implement' && entry.status === 'completed').length, 2);
+  assert.equal(
+    afterReviewOnly.phases.filter((entry) => entry.phase === 'review' && entry.status === 'completed').length,
+    3,
+  );
+  assert.equal(
+    afterReviewOnly.phases.filter((entry) => entry.phase === 'implement' && entry.status === 'completed').length,
+    2,
+  );
   assert.deepEqual((await readFile(gateLog, 'utf8')).trim().split('\n'), ['gate', 'gate']);
 });
 
@@ -4651,7 +5526,8 @@ test('a noted review rerun clears nested repair baselines before addressing find
     "  printf repaired > repair.txt; git add repair.txt && git commit -m 'fix: address finding' >/dev/null",
     'fi',
   ].join('\n');
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command({ prompt }) { return { command: '/bin/sh', args: ['-c', ${JSON.stringify(agentScript)}, 'review-agent', prompt] }; } } },
   engines: { default: 'mytool' },
   gate: ['true'],
@@ -4659,7 +5535,8 @@ test('a noted review rerun clears nested repair baselines before addressing find
   maxRounds: 2,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
 
   const original = console.log;
   const originalExitCode = process.exitCode;
@@ -4668,7 +5545,9 @@ test('a noted review rerun clears nested repair baselines before addressing find
   let resumed;
   try {
     initial = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
-    resumed = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, from: 'review', note: 'recheck the review', yes: true } });
+    resumed = await runLoop({
+      args: { taskFile: workItem, cwd: root, resume: true, from: 'review', note: 'recheck the review', yes: true },
+    });
   } finally {
     console.log = original;
     process.exitCode = originalExitCode;
@@ -4681,14 +5560,16 @@ test('a noted review rerun clears nested repair baselines before addressing find
 
 test('a gate repair cap stalls with the last gate output', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command() { return { command: '/bin/sh', args: ['-c', ''] }; } } },
   engines: { default: 'mytool' },
   gate: ['printf last-gate >&2; exit 1'],
   phases: [{ name: 'gate', repair: [{ name: 'fix-gate', kind: 'agent', role: 'repair', prompt: 'fix-gate', permissions: ['write-worktree'], postconditions: ['clean-tree'] }] }],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   const originalExitCode = process.exitCode;
   console.log = () => {};
@@ -4722,7 +5603,10 @@ test('gate commands run through a shell so quoting and && survive', async () => 
     console.log = original;
   }
   assert.equal(summary.stalled, null);
-  assert.deepEqual(summary.phases.map((phase) => phase.name), ['gate']);
+  assert.deepEqual(
+    summary.phases.map((phase) => phase.name),
+    ['gate'],
+  );
 });
 
 test('gate commands accept argv entries and run without a shell', async () => {
@@ -4742,7 +5626,10 @@ test('gate commands accept argv entries and run without a shell', async () => {
     console.log = original;
   }
   assert.equal(summary.stalled, null);
-  assert.deepEqual(summary.phases.map((phase) => phase.name), ['gate']);
+  assert.deepEqual(
+    summary.phases.map((phase) => phase.name),
+    ['gate'],
+  );
   const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
   const gateEntry = manifest.phases.find((entry) => entry.phase === 'gate');
   assert.equal(gateEntry.gateReceipts.length, 1);
@@ -4771,13 +5658,15 @@ test('gate commands accept per-platform entries and pick the current platform va
 
 test('setup commands accept argv entries and run without a shell', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   setup: [{ argv: ['node', '-e', "require('fs').writeFileSync('setup-marker', 'ok')"] }],
   gate: [{ argv: ['node', '-e', "process.exit(require('fs').readFileSync('setup-marker', 'utf8') === 'ok' ? 0 : 1)"] }],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -4792,14 +5681,16 @@ test('setup commands accept argv entries and run without a shell', async () => {
 
 test('configured shell runs setup and gate commands', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   shell: 'bash',
   setup: ['[[ "setup" == "setup" ]] && printf setup > shell-marker'],
   gate: ['[[ -f shell-marker ]] && [[ "$(cat shell-marker)" == setup ]]'],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   console.log = () => {};
   let summary;
@@ -4921,14 +5812,18 @@ test('a snapshot omits unavailable engine versions', async () => {
 test('an approving reviewer after a failed repair gate stalls cleanly', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const reviewMarker = `review-one-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['test ! -f ${reviewMarker}'],
   phases: ['gate', 'review', 'address'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
-const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+`,
+  });
+  const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt="$2"
 if [ "$1" = '--version' ]; then
   exit 0
@@ -4948,7 +5843,9 @@ case "$prompt" in
     git -C "$FIXTURE_WORKTREE" commit -m 'fix: preserve failed repair gate' >/dev/null
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalWorktree = process.env.FIXTURE_WORKTREE;
@@ -4971,14 +5868,18 @@ esac
 });
 
 test('a read-only reviewer stalls when it changes a worktree file', async () => {
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review'],
   worktrees: false,
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const prompt = process.argv[process.argv.indexOf('-p') + 1];
@@ -4987,7 +5888,9 @@ const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(Str
 const worktree = process.env.FIXTURE_WORKTREE;
 writeFileSync(join(worktree, 'review-tampered.txt'), 'must be rejected');
 writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [] }));
-` , { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalWorktree = process.env.FIXTURE_WORKTREE;
@@ -5014,24 +5917,30 @@ writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [] })
 
 test('a reviewer cannot consume a stale approval from the same round', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const runDir = join(root, '.loop/runs/ss-demo-feature');
   await mkdir(runDir, { recursive: true });
   const verdictPath = join(runDir, 'verdict-round-1.json');
   await writeFile(verdictPath, '{"verdict":"APPROVED","blocking":[]}');
 
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/usr/bin/env node
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 const prompt = process.argv[process.argv.indexOf('-p') + 1];
 const path = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
 writeFileSync(path, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'fix it' }] }));
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalLog = console.log;
@@ -5058,12 +5967,14 @@ writeFileSync(path, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ 
 
 test('a silent reviewer stalls instead of consuming a stale verdict', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const runDir = join(root, '.loop/runs/ss-demo-feature');
   await mkdir(runDir, { recursive: true });
   await writeFile(join(runDir, 'verdict-round-1.json'), '{"verdict":"APPROVED","blocking":[]}');
@@ -5098,18 +6009,23 @@ test('a dry run honours an overridden phase list', async () => {
   } finally {
     console.log = original;
   }
-  assert.deepEqual(summary.phases.map((phase) => phase.name), ['implement']);
+  assert.deepEqual(
+    summary.phases.map((phase) => phase.name),
+    ['implement'],
+  );
 });
 
 test('switching engines drops the configured model and effort (they are vendor-specific)', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   const lines = [];
   console.log = (message) => lines.push(String(message));
@@ -5126,13 +6042,15 @@ test('switching engines drops the configured model and effort (they are vendor-s
 
 test('--engine keeps the configured model and effort when the engine is unchanged', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   const lines = [];
   console.log = (message) => lines.push(String(message));
@@ -5146,13 +6064,15 @@ test('--engine keeps the configured model and effort when the engine is unchange
 
 test('--model and --effort override the default engine model and effort', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   const lines = [];
   console.log = (message) => lines.push(String(message));
@@ -5166,33 +6086,119 @@ test('--model and --effort override the default engine model and effort', async 
 
 test('--engine and --model together select a new engine and its model', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'sonnet', effort: 'high' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const original = console.log;
   const lines = [];
   console.log = (message) => lines.push(String(message));
   try {
-    await runLoop({ args: { taskFile: workItem, cwd: root, engine: 'gemini', model: 'gemini-3-pro', dryRun: true, yes: true } });
+    await runLoop({
+      args: { taskFile: workItem, cwd: root, engine: 'gemini', model: 'gemini-3-pro', dryRun: true, yes: true },
+    });
   } finally {
     console.log = original;
   }
   assert.match(lines.join('\n'), /engine: gemini\s+model: gemini-3-pro/);
 });
 
+test('switching engines drops model and effort from name-less phase entries that move engines', async () => {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  engines: {
+    default: { name: 'claude', model: 'sonnet', effort: 'high' },
+    docs: { model: 'haiku', effort: 'low' },
+    review: { name: 'claude', model: 'opus' },
+    'review-security': { effort: 'max' },
+  },
+  reviewRoles: ['security'],
+  gate: ['true'],
+  phases: ['implement', 'docs', 'gate', 'review'],
+  worktrees: false,
+};
+`,
+  });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({
+      args: { taskFile: workItem, cwd: root, engine: 'codex', model: 'gpt-x', dryRun: true, yes: true },
+    });
+  } finally {
+    console.log = original;
+  }
+  const output = lines.join('\n');
+  // docs inherited claude; its claude model and effort must not reach codex.
+  assert.match(output, /engines\.docs: dropped model=haiku effort=low \(configured for claude; this run uses codex\)/);
+  assert.match(output, /\s+docs\s+codex model=gpt-x\n/);
+  // review names its own engine, so it and its specialized reviewer keep their
+  // settings (review no longer inherits effort from the codex default).
+  assert.match(output, /\s+review\s+claude model=opus\n/);
+  assert.match(output, /\s+review-security\s+claude model=opus effort=max/);
+  assert.doesNotMatch(output, /engines\.review(-security)?: dropped/);
+});
+
+test('switching engines keeps a specialized reviewer entry whose review engine is a string', async () => {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  engines: { default: { name: 'claude' }, review: 'claude', 'review-security': { model: 'opus' } },
+  reviewRoles: ['security'],
+  phases: ['implement', 'review'],
+  worktrees: false,
+};
+`,
+  });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, engine: 'codex', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /\s+review-security\s+claude model=opus/);
+  assert.doesNotMatch(lines.join('\n'), /dropped/);
+});
+
+test('switching engines keeps phase entries when the engine is unchanged', async () => {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  engines: { default: { name: 'claude', model: 'sonnet' }, docs: { model: 'haiku' } },
+  phases: ['implement', 'docs'],
+  worktrees: false,
+};
+`,
+  });
+  const original = console.log;
+  const lines = [];
+  console.log = (message) => lines.push(String(message));
+  try {
+    await runLoop({ args: { taskFile: workItem, cwd: root, engine: 'claude', dryRun: true, yes: true } });
+  } finally {
+    console.log = original;
+  }
+  assert.match(lines.join('\n'), /\s+docs\s+claude model=haiku/);
+  assert.doesNotMatch(lines.join('\n'), /dropped/);
+});
+
 test('a dry-run resume uses configured agent settings instead of persisted settings', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'new-model', effort: 'high' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({
     agentSettings: { implement: { name: 'agy', model: 'saved-model', effort: 'low' } },
@@ -5209,9 +6215,9 @@ test('a dry-run resume uses configured agent settings instead of persisted setti
 });
 
 test('a supplied config file replaces the repository config', async () => {
-  const { root } = await repoFixture({ config: 'export default { gate: [\'false\'] };\n' });
+  const { root } = await repoFixture({ config: "export default { gate: ['false'] };\n" });
   const suppliedConfig = join(await mkdtemp(join(tmpdir(), 'loop-config-')), 'loop.config.mjs');
-  await writeFile(suppliedConfig, 'export default { gate: [\'true\'], phases: [\'gate\'], maxRounds: 7 };\n');
+  await writeFile(suppliedConfig, "export default { gate: ['true'], phases: ['gate'], maxRounds: 7 };\n");
 
   const config = await loadConfig(root, {}, suppliedConfig);
 
@@ -5222,22 +6228,27 @@ test('a supplied config file replaces the repository config', async () => {
 
 test('a supplied config overrides saved agent settings and phase list on resume', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'repository-model', effort: 'high' } },
   gate: ['false'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const suppliedConfig = join(await mkdtemp(join(tmpdir(), 'loop-config-')), 'resume.config.mjs');
-  await writeFile(suppliedConfig, `export default {
+  await writeFile(
+    suppliedConfig,
+    `export default {
   engines: { default: { name: 'codex', model: 'override-model', effort: 'medium' } },
   gate: ['true'],
   phases: ['gate', 'review'],
   maxRounds: 5,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-`);
+`,
+  );
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({
     agentSettings: { implement: { name: 'agy', model: 'saved-model', effort: 'low' } },
@@ -5247,7 +6258,9 @@ test('a supplied config overrides saved agent settings and phase list on resume'
   const lines = [];
   console.log = (message) => lines.push(String(message));
   try {
-    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, config: suppliedConfig, dryRun: true, yes: true } });
+    await runLoop({
+      args: { taskFile: workItem, cwd: root, resume: true, config: suppliedConfig, dryRun: true, yes: true },
+    });
   } finally {
     console.log = original;
   }
@@ -5262,7 +6275,10 @@ test('a supplied config overrides saved agent settings and phase list on resume'
 test('a supplied resume config is snapshot in run state', async () => {
   const { root, workItem } = await repoFixture({ phases: ['implement'] });
   const suppliedConfig = join(await mkdtemp(join(tmpdir(), 'loop-config-')), 'resume.config.mjs');
-  await writeFile(suppliedConfig, "export default { gate: ['true'], phases: ['gate'], maxRounds: 7, worktrees: false };\n");
+  await writeFile(
+    suppliedConfig,
+    "export default { gate: ['true'], phases: ['gate'], maxRounds: 7, worktrees: false };\n",
+  );
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({ agentSettings: { implement: { name: 'agy', model: 'saved-model', effort: 'low' } } });
 
@@ -5296,9 +6312,14 @@ test('a dry-run resume config does not consume a saved branch or worktree', asyn
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({ branch: 'feat/saved-run', worktree: savedWorktree, baseBranch: 'master' });
   const suppliedConfig = join(await mkdtemp(join(tmpdir(), 'loop-config-')), 'resume.config.mjs');
-  await writeFile(suppliedConfig, "export default { branchPrefix: 'feat/other-', gate: ['true'], phases: ['gate'], worktrees: false };\n");
+  await writeFile(
+    suppliedConfig,
+    "export default { branchPrefix: 'feat/other-', gate: ['true'], phases: ['gate'], worktrees: false };\n",
+  );
 
-  const summary = await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, config: suppliedConfig, dryRun: true, yes: true } });
+  const summary = await runLoop({
+    args: { taskFile: workItem, cwd: root, resume: true, config: suppliedConfig, dryRun: true, yes: true },
+  });
 
   assert.equal(summary.branch, 'feat/other-ss-demo-feature');
   assert.equal(summary.worktree, root);
@@ -5312,7 +6333,16 @@ test('a supplied config must exist and cannot be combined with an engine-only re
   );
   await assert.rejects(
     runLoop({
-      args: { taskFile: workItem, cwd: root, resume: true, config: 'loop.config.mjs', engine: 'agy', overrideEngine: true, dryRun: true, yes: true },
+      args: {
+        taskFile: workItem,
+        cwd: root,
+        resume: true,
+        config: 'loop.config.mjs',
+        engine: 'agy',
+        overrideEngine: true,
+        dryRun: true,
+        yes: true,
+      },
     }),
     /--config and --override-engine cannot be used together/,
   );
@@ -5320,13 +6350,15 @@ test('a supplied config must exist and cannot be combined with an engine-only re
 
 test('resume can override saved engines and records the change in state and phase logs', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'new-model', effort: 'xhigh' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({
     agentSettings: { implement: { name: 'claude', model: 'saved-model', effort: 'low' } },
@@ -5340,7 +6372,9 @@ test('resume can override saved engines and records the change in state and phas
   process.env.PATH = `${binDir}:${originalPath}`;
   console.log = (message) => lines.push(String(message));
   try {
-    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, engine: 'agy', overrideEngine: true, yes: true } });
+    await runLoop({
+      args: { taskFile: workItem, cwd: root, resume: true, engine: 'agy', overrideEngine: true, yes: true },
+    });
   } finally {
     process.env.PATH = originalPath;
     process.exitCode = originalExitCode;
@@ -5362,13 +6396,15 @@ test('resume can override saved engines and records the change in state and phas
 
 test('a resume engine override applies --model and --effort to the new engine', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'new-model', effort: 'xhigh' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({
     agentSettings: { implement: { name: 'claude', model: 'saved-model', effort: 'low' } },
@@ -5382,7 +6418,18 @@ test('a resume engine override applies --model and --effort to the new engine', 
   process.env.PATH = `${binDir}:${originalPath}`;
   console.log = (message) => lines.push(String(message));
   try {
-    await runLoop({ args: { taskFile: workItem, cwd: root, resume: true, engine: 'agy', model: 'agy-pro', effort: 'high', overrideEngine: true, yes: true } });
+    await runLoop({
+      args: {
+        taskFile: workItem,
+        cwd: root,
+        resume: true,
+        engine: 'agy',
+        model: 'agy-pro',
+        effort: 'high',
+        overrideEngine: true,
+        yes: true,
+      },
+    });
   } finally {
     process.env.PATH = originalPath;
     process.exitCode = originalExitCode;
@@ -5396,18 +6443,23 @@ test('a resume engine override applies --model and --effort to the new engine', 
     from: { name: 'claude', model: 'saved-model', effort: 'low' },
     to: { name: 'agy', model: 'agy-pro', effort: 'high' },
   });
-  assert.match(lines.join('\n'), /resumed engine override:[\s\S]*implement: claude model=saved-model effort=low → agy model=agy-pro effort=high/);
+  assert.match(
+    lines.join('\n'),
+    /resumed engine override:[\s\S]*implement: claude model=saved-model effort=low → agy model=agy-pro effort=high/,
+  );
 });
 
 test('a resume engine override rejects an effort the new engine cannot honor', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'new-model', effort: 'xhigh' } },
   gate: ['true'],
   phases: ['implement'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({
     agentSettings: { implement: { name: 'claude', model: 'saved-model', effort: 'low' } },
@@ -5419,7 +6471,17 @@ test('a resume engine override rejects an effort the new engine cannot honor', a
   try {
     // agy supports low/medium/high, so xhigh must be rejected before any phase runs.
     await assert.rejects(
-      runLoop({ args: { taskFile: workItem, cwd: root, resume: true, engine: 'agy', effort: 'xhigh', overrideEngine: true, yes: true } }),
+      runLoop({
+        args: {
+          taskFile: workItem,
+          cwd: root,
+          resume: true,
+          engine: 'agy',
+          effort: 'xhigh',
+          overrideEngine: true,
+          yes: true,
+        },
+      }),
       /does not support effort "xhigh"/,
     );
   } finally {
@@ -5428,14 +6490,16 @@ test('a resume engine override rejects an effort the new engine cannot honor', a
 });
 
 test('a dry-run engine override cannot consume persisted agent settings', async () => {
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   adapters: { mytool: { command: ({ prompt }) => ({ command: 'mytool', args: [prompt] }) } },
   engines: { default: 'claude' },
   gate: ['true'],
   phases: ['implement'],
   worktrees: false,
 };
-` });
+`,
+  });
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({ agentSettings: { implement: { name: 'claude', effort: 'low' } } });
 
@@ -5445,7 +6509,15 @@ test('a dry-run engine override cannot consume persisted agent settings', async 
   try {
     await assert.rejects(
       runLoop({
-        args: { taskFile: workItem, cwd: root, resume: true, engine: 'mytool', overrideEngine: true, dryRun: true, yes: true },
+        args: {
+          taskFile: workItem,
+          cwd: root,
+          resume: true,
+          engine: 'mytool',
+          overrideEngine: true,
+          dryRun: true,
+          yes: true,
+        },
       }),
       /--override-engine requires saved agent settings from an earlier run/,
     );
@@ -5547,14 +6619,18 @@ test('publishing stalls when the approved SHA has no gate receipt before its rev
   // A partial run that begins at `review` never runs a gate: the review loop
   // starts with gateOk defaulted true and can approve HEAD. Publishing must
   // refuse a SHA no gate ever exercised.
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ['true'],
   phases: ['review', 'publish'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
-  await writeFile(join(binDir, 'claude'), `#!/bin/sh
+  await writeFile(
+    join(binDir, 'claude'),
+    `#!/bin/sh
 prompt=$2
 case "$prompt" in
   *'Take on the role of a senior developer'*)
@@ -5563,7 +6639,9 @@ case "$prompt" in
   *'Push to '*)
     ;;
 esac
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
 
   const originalPath = process.env.PATH;
   const originalVerdictPath = process.env.FIXTURE_VERDICT_PATH;
@@ -5585,11 +6663,18 @@ esac
   }
 
   assert.equal(summary.stalled.phase, 'publish');
-  assert.equal(summary.stalled.reason, `current HEAD matches approved review SHA ${await git(summary.worktree, 'rev-parse', 'HEAD')}, but no passing gate receipt for that SHA was recorded before the review`);
+  assert.equal(
+    summary.stalled.reason,
+    `current HEAD matches approved review SHA ${await git(summary.worktree, 'rev-parse', 'HEAD')}, but no passing gate receipt for that SHA was recorded before the review`,
+  );
   assert.doesNotMatch(summary.stalled.reason, /publishing requires the approved SHA/);
   assert.doesNotMatch(lines.join('\n'), /Push to/, 'the git agent never runs over an ungated approval');
   const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.phases.some((entry) => entry.role === 'gate'), false, 'no gate ran in this partial pipeline');
+  assert.equal(
+    manifest.phases.some((entry) => entry.role === 'gate'),
+    false,
+    'no gate ran in this partial pipeline',
+  );
   const publishPhase = manifest.phases.at(-1);
   assert.equal(publishPhase.phase, 'publish');
   assert.equal(publishPhase.status, 'stalled');
@@ -5689,13 +6774,15 @@ test('a resume through the publish phase stalls without a completed current-SHA 
 
 test('a dry-run resume does not use persisted nested repair settings', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   engines: { default: { name: 'claude', model: 'new-model', effort: 'high' } },
   gate: ['true'],
   phases: ['review', 'address'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const state = await openFixtureState(join(root, '.loop/runs'), 'ss-demo-feature', {});
   await state.record({
     agentSettings: {
@@ -5805,7 +6892,10 @@ process.stdout.write('adapter args captured\\n');
     }
   }
 
-  assert.ok(addDirs.includes(externalTaskRepo), `expected adapter command args to include external repo dir ${externalTaskRepo}`);
+  assert.ok(
+    addDirs.includes(externalTaskRepo),
+    `expected adapter command args to include external repo dir ${externalTaskRepo}`,
+  );
   assert.notEqual(externalTaskRepo, root);
 });
 
@@ -5850,7 +6940,10 @@ process.stdout.write('adapter args captured\\n');
 
   assert.notEqual(summary.worktree, root, 'the adapter should run in a separate worktree');
   assert.equal(summary.taskFile, taskFile);
-  assert.ok(addDirs.includes(dirname(taskFile)), `expected adapter command args to include task-file directory ${dirname(taskFile)}`);
+  assert.ok(
+    addDirs.includes(dirname(taskFile)),
+    `expected adapter command args to include task-file directory ${dirname(taskFile)}`,
+  );
 });
 
 test('name-only mode runs with empty TASK and TASK_FILE', async () => {
@@ -6027,7 +7120,11 @@ test('task-file - confirms through an injected terminal opener with piped stdin'
     });
     assert.equal(summary.stalled, null);
     assert.equal(openedInputs.length, 2, 'terminal opener must be used for availability and confirmation');
-    assert.equal(openedInputs.every((input) => input.destroyed), true, 'terminal inputs must be closed');
+    assert.equal(
+      openedInputs.every((input) => input.destroyed),
+      true,
+      'terminal inputs must be closed',
+    );
   } finally {
     Object.defineProperty(process, 'stdin', { value: oldStdin, configurable: true });
   }
@@ -6044,7 +7141,9 @@ test('a piped non-yes run without a controlling terminal gives an actionable err
     await assert.rejects(
       runLoop({
         args: { taskFile: '-', name: 'stdin-no-terminal', cwd: root, phases: ['gate'] },
-        terminalOpener: async () => { throw new Error('not attached to a terminal'); },
+        terminalOpener: async () => {
+          throw new Error('not attached to a terminal');
+        },
       }),
       /no terminal available to confirm phases; re-run with --yes to run unattended/,
     );
@@ -6129,7 +7228,11 @@ test('hermetic settings normalize phase network and publish secret policies', as
   });
   const config = await loadConfig(root);
   assert.deepEqual(config.resolvedPhases[0].hermetic, {
-    runtime: 'podman', image: 'aloop:node', networks: ['registry-net'], env: ['CI'], secrets: [],
+    runtime: 'podman',
+    image: 'aloop:node',
+    networks: ['registry-net'],
+    env: ['CI'],
+    secrets: [],
   });
   assert.deepEqual(config.resolvedPhases[1].hermetic.secrets, ['GH_TOKEN']);
   assert.deepEqual(normalizeHermeticConfig(false).networks, []);
@@ -6142,7 +7245,11 @@ test('hermetic settings normalize phase network and publish secret policies', as
 test('hermetic invocation denies network by default and mounts declared paths', () => {
   const invocation = hermeticInvocation({
     settings: {
-      runtime: 'docker', image: 'aloop:node', networks: [], env: ['CI'], secrets: [],
+      runtime: 'docker',
+      image: 'aloop:node',
+      networks: [],
+      env: ['CI'],
+      secrets: [],
     },
     command: 'codex',
     args: ['exec', 'do it'],
@@ -6164,16 +7271,17 @@ test('hermetic invocation denies network by default and mounts declared paths', 
 
 test('hermetic environment exposes only declared publish credentials', () => {
   const settings = {
-    runtime: 'docker', image: 'aloop:node', networks: [], env: ['CI'], secrets: ['GH_TOKEN'],
+    runtime: 'docker',
+    image: 'aloop:node',
+    networks: [],
+    env: ['CI'],
+    secrets: ['GH_TOKEN'],
   };
   assert.deepEqual(
     hermeticEnvironment(settings, { PATH: '/bin', CI: '1', GH_TOKEN: 'secret', AWS_SECRET_ACCESS_KEY: 'hidden' }),
     { PATH: '/bin', CI: '1', GH_TOKEN: 'secret' },
   );
-  assert.throws(
-    () => hermeticEnvironment(settings, { PATH: '/bin', CI: '1' }),
-    /secret "GH_TOKEN" is not set/,
-  );
+  assert.throws(() => hermeticEnvironment(settings, { PATH: '/bin', CI: '1' }), /secret "GH_TOKEN" is not set/);
 });
 
 test('a hermetic agent is wrapped by the configured runtime and recorded in the snapshot', async () => {
@@ -6181,7 +7289,9 @@ test('a hermetic agent is wrapped by the configured runtime and recorded in the 
   const binDir = await mkdtemp(join(tmpdir(), 'loop-bin-'));
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-hermetic-trees-'));
   const runtimePath = join(binDir, 'fake-runtime');
-  await writeFile(runtimePath, `#!/usr/bin/env node
+  await writeFile(
+    runtimePath,
+    `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 const args = process.argv.slice(2);
@@ -6190,7 +7300,9 @@ const workdir = args[args.indexOf('--workdir') + 1];
 const imageIndex = args.indexOf('fixture-image');
 const result = spawnSync(args[imageIndex + 1], args.slice(imageIndex + 2), { cwd: workdir, env: process.env, stdio: 'inherit' });
 process.exit(result.status ?? 1);
-`, { mode: 0o755 });
+`,
+    { mode: 0o755 },
+  );
   const { root } = await repoFixture({
     config: `export default {
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
@@ -6230,15 +7342,27 @@ process.exit(result.status ?? 1);
   assert.notEqual(summary.worktree, root, 'the integration path must use the default linked worktree');
   assert.equal(await readFile(join(summary.worktree, 'hermetic.txt'), 'utf8'), 'ran\n');
   const runtimeArgs = JSON.parse((await readFile(runtimeLog, 'utf8')).trim());
-  assert.deepEqual(runtimeArgs.slice(0, 6), ['run', '--rm', '--workdir', summary.worktree, '--network', 'registry-net']);
+  assert.deepEqual(runtimeArgs.slice(0, 6), [
+    'run',
+    '--rm',
+    '--workdir',
+    summary.worktree,
+    '--network',
+    'registry-net',
+  ]);
   assert.ok(runtimeArgs.some((arg) => arg === `type=bind,src=${summary.worktree},dst=${summary.worktree}`));
   assert.ok(runtimeArgs.some((arg) => arg === `type=bind,src=${join(root, '.git')},dst=${join(root, '.git')}`));
   const snapshot = JSON.parse(await readFile(join(summary.runDir, 'snapshot.json'), 'utf8'));
   assert.equal(snapshot.hermetic.runtime, 'fake-runtime');
   assert.equal(snapshot.hermetic.image, 'fixture-image');
   assert.deepEqual(snapshot.hermetic.phases[0], {
-    name: 'work', enabled: true, runtime: 'fake-runtime', image: 'fixture-image',
-    networks: ['registry-net'], env: ['FAKE_RUNTIME_LOG'], secrets: [],
+    name: 'work',
+    enabled: true,
+    runtime: 'fake-runtime',
+    image: 'fixture-image',
+    networks: ['registry-net'],
+    env: ['FAKE_RUNTIME_LOG'],
+    secrets: [],
   });
 });
 
@@ -6251,7 +7375,11 @@ async function detectHermeticIntegrationRuntime() {
     try {
       await exec(runtime, ['info'], { timeout: 5_000 });
       await exec(runtime, ['image', 'inspect', image], { timeout: 5_000 });
-      await exec(runtime, ['run', '--rm', image, 'sh', '-c', 'command -v git >/dev/null && command -v wget >/dev/null'], { timeout: 10_000 });
+      await exec(
+        runtime,
+        ['run', '--rm', image, 'sh', '-c', 'command -v git >/dev/null && command -v wget >/dev/null'],
+        { timeout: 10_000 },
+      );
       return { runtime, image };
     } catch {
       // Try the next installed runtime; capability-gated tests must stay green
@@ -6303,7 +7431,9 @@ test('real hermetic runtime mounts the default worktree and enforces network pol
   });
 
   try {
-    const summary = await runLoop({ args: { name: 'hermetic-runtime', task: 'exercise the runtime boundary', cwd: root, yes: true } });
+    const summary = await runLoop({
+      args: { name: 'hermetic-runtime', task: 'exercise the runtime boundary', cwd: root, yes: true },
+    });
     assert.equal(summary.stalled, null);
     assert.notEqual(summary.worktree, root);
     assert.equal(await readFile(join(summary.worktree, 'hermetic-commit.txt'), 'utf8'), 'committed\n');
@@ -6321,13 +7451,15 @@ async function captureTerminal(run) {
   const chunks = [];
   console.log = (message = '') => chunks.push(`${message}\n`);
   // Only capture text; the test runner's own binary traffic passes through.
-  process.stdout.write = /** @type {any} */ ((chunk, ...rest) => {
-    if (typeof chunk === 'string') {
-      chunks.push(chunk);
-      return true;
+  process.stdout.write = /** @type {any} */ (
+    (chunk, ...rest) => {
+      if (typeof chunk === 'string') {
+        chunks.push(chunk);
+        return true;
+      }
+      return originalWrite.call(process.stdout, chunk, ...rest);
     }
-    return originalWrite.call(process.stdout, chunk, ...rest);
-  });
+  );
   try {
     const summary = await run();
     return { summary, text: chunks.join('') };
@@ -6340,14 +7472,18 @@ async function captureTerminal(run) {
 
 test('--quiet hides setup and gate streams on the terminal but keeps them in logs', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   setup: ["printf 'SETUP-%s\\n' SENTINEL"],
   gate: ["printf 'GATE-%s\\n' SENTINEL"],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
-  const { summary, text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, quiet: true } }));
+`,
+  });
+  const { summary, text } = await captureTerminal(() =>
+    runLoop({ args: { taskFile: workItem, cwd: root, yes: true, quiet: true } }),
+  );
   assert.equal(summary.stalled, null);
   assert.doesNotMatch(text, /SETUP-SENTINEL/);
   assert.doesNotMatch(text, /GATE-SENTINEL/);
@@ -6361,27 +7497,33 @@ test('--quiet hides setup and gate streams on the terminal but keeps them in log
 
 test('without --quiet, non-TTY output still streams raw gate output', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ["printf 'GATE-%s\\n' SENTINEL"],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
-  const { text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, noTui: true } }));
+`,
+  });
+  const { text } = await captureTerminal(() =>
+    runLoop({ args: { taskFile: workItem, cwd: root, yes: true, noTui: true } }),
+  );
   assert.match(text, /GATE-SENTINEL/);
   assert.doesNotMatch(text, /output {4}: quiet/);
 });
 
 test('config quiet: true is honored and --quiet disables the TUI on a TTY', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ["printf 'GATE-%s\\n' SENTINEL"],
   phases: ['gate'],
   quiet: true,
   heartbeatMinutes: 0,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
+`,
+  });
   const originalTTY = process.stdout.isTTY;
   process.stdout.isTTY = true;
   let result;
@@ -6397,28 +7539,48 @@ test('config quiet: true is honored and --quiet disables the TUI on a TTY', asyn
 
 test('--no-quiet overrides config quiet: true', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ["printf 'GATE-%s\\n' SENTINEL"],
   phases: ['gate'],
   quiet: true,
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
-  const { text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, noTui: true, noQuiet: true } }));
+`,
+  });
+  const { text } = await captureTerminal(() =>
+    runLoop({ args: { taskFile: workItem, cwd: root, yes: true, noTui: true, noQuiet: true } }),
+  );
   assert.match(text, /GATE-SENTINEL/);
 });
 
 test('a stalled run under --quiet still prints the stall report with the output tail', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
-  const { root, workItem } = await repoFixture({ config: `export default {
+  const { root, workItem } = await repoFixture({
+    config: `export default {
   gate: ["printf 'STALL-%s\\n' TAIL; exit 1"],
   phases: ['gate'],
   worktreeRoot: ${JSON.stringify(worktreeRoot)},
 };
-` });
-  const { summary, text } = await captureTerminal(() => runLoop({ args: { taskFile: workItem, cwd: root, yes: true, quiet: true } }));
+`,
+  });
+  const { summary, text } = await captureTerminal(() =>
+    runLoop({ args: { taskFile: workItem, cwd: root, yes: true, quiet: true } }),
+  );
   assert.equal(summary.stalled.phase, 'gate');
   assert.match(text, /✗ stalled in "gate"/);
   assert.match(text, /STALL-TAIL/);
   assert.match(text, /Resume: {3}aloop/);
+});
+
+test('on-repeat requires a configured judge and preserves misconfiguration errors', async () => {
+  for (const judge of [undefined, null, {}]) {
+    const { root } = await repoFixture({ config: `export default ${JSON.stringify({ gate: ['true'], judge })};` });
+    await assert.rejects(
+      loadConfig(root, { judge: { onRepeat: 'continue' } }),
+      judge == null
+        ? /--on-repeat needs a configured judge; set `judge` in loop.config.mjs \(see docs\/judge.md\)./
+        : /judge.kind must be/,
+    );
+  }
 });

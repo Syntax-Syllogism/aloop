@@ -1,14 +1,16 @@
+import { agentPhases, diagnoseAgents } from './agents.mjs';
 import { access, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { adapterFor, agentForPhase } from './adapters.mjs';
+import { adapterFor, resolvePhaseAgent } from './adapters.mjs';
 import { runCommand, signalProcessGroup } from './command.mjs';
 import { defaults, loadConfig, loadRunsDir } from './config.mjs';
 import { GitFacade } from './git.mjs';
 import { hashConfig, hashText } from './manifest.mjs';
 import { computeAggregateMetrics, computeRunMetrics, readRunManifests } from './metrics.mjs';
+import { describeJudgeEntry, judgeOutcome } from './judge.mjs';
 import { interpolate, packagePrompts, withOperatorNote } from './prompts.mjs';
 import { RunState, slugFor } from './state.mjs';
 
@@ -21,7 +23,8 @@ const CONFIG_HEADER = `// aloop configuration — see docs/loop.md for the full 
 // REVIEW THESE before your first run:
 //   baseBranch     the branch you merge into (for example, 'main' or 'master')
 //   remote         set this when your repository has more than one remote
-//   engines        choose the agent that runs each phase
+//   engines        choose the engine/model for each phase (default + per-phase)
+//                  agent selects a named CLI persona; see docs/agents.md
 //
 // SAFE TO CHANGE anytime:
 //   phases         the pipeline stages and their order
@@ -41,7 +44,10 @@ const EMBEDDED_STARTER = `export default {
   remote: null,           // <- set this if you have more than one remote
   engines: {
     default: { name: 'claude' },
-    // review: { name: 'codex' },  // optional: use a different reviewer
+    // Any agent phase can override default; omitted fields are inherited.
+    // review: { name: 'codex' },              // different engine: nothing inherited
+    // docs: { model: 'claude-haiku-5-5' },    // cheaper model, same engine/effort
+    // 'pr-description': { effort: 'low' },
   },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   gate: [],               // <- e.g. ['npm test'] before review
@@ -231,9 +237,7 @@ function printInspection(result) {
   printAggregate({
     runs: 1,
     total: result.metrics.total,
-    convergence: result.metrics.convergence.roundsToConverge === null
-      ? { convergenceRate: 0 }
-      : { convergenceRate: 1 },
+    convergence: result.metrics.convergence.roundsToConverge === null ? { convergenceRate: 0 } : { convergenceRate: 1 },
     reviewer: result.metrics.reviewer,
   });
 }
@@ -246,23 +250,27 @@ export async function runOperationalCommand(args) {
   if (args.command === 'status') {
     if (!args.name) throw new Error('status requires a run name.');
     const result = await getRunStatus(runsDir, args.name);
-    if (args.json) printJson(result); else printStatus(result);
+    if (args.json) printJson(result);
+    else printStatus(result);
     return result;
   }
   if (args.command === 'inspect') {
     if (!args.name) throw new Error('inspect requires a run name.');
     const result = inspectRunMetrics(await runInfo(runsDir, args.name));
-    if (args.json) printJson(result); else printInspection(result);
+    if (args.json) printJson(result);
+    else printInspection(result);
     return result;
   }
   if (args.command === 'list') {
     const result = await listRunStatuses(runsDir, { includeMetrics: args.metrics });
-    if (args.json) printJson(result); else printRunTable(result, args.metrics);
+    if (args.json) printJson(result);
+    else printRunTable(result, args.metrics);
     return result;
   }
   if (args.command === 'metrics') {
     const result = await getAggregateMetrics(runsDir);
-    if (args.json) printJson(result); else printAggregate(result);
+    if (args.json) printJson(result);
+    else printAggregate(result);
     return result;
   }
   throw new Error(`Unknown command "${args.command}".`);
@@ -281,7 +289,8 @@ function isProcessAlive(pid) {
 }
 
 function isProcessGroupAlive(groupId) {
-  if (process.platform === 'win32' || !Number.isInteger(groupId) || groupId <= 0 || groupId === process.pid) return false;
+  if (process.platform === 'win32' || !Number.isInteger(groupId) || groupId <= 0 || groupId === process.pid)
+    return false;
   try {
     process.kill(-groupId, 0);
     return true;
@@ -326,6 +335,17 @@ async function readLock(runDir) {
     };
   }
   const owner = await readJson(join(lockDir, ownerName));
+  // Release atomically moves the lock directory before removing its contents.
+  // The owner can disappear between listing the directory and reading it.
+  if (!owner) {
+    return {
+      present: false,
+      active: isActiveProcessAlive(activeProcess),
+      owner: null,
+      activeProcessPid,
+      activeProcessGroupId,
+    };
+  }
   return {
     present: true,
     active: isProcessAlive(owner.pid) || isActiveProcessAlive(activeProcess),
@@ -340,21 +360,16 @@ function latestEntry(entries, predicate = () => true) {
 }
 
 function prUrl(value) {
-  return typeof value === 'string' ? value.match(PULL_REQUEST_URL)?.[0] ?? null : null;
+  return typeof value === 'string' ? (value.match(PULL_REQUEST_URL)?.[0] ?? null) : null;
 }
 
 function canonicalPrUrl(state, manifest) {
-  const phaseUrls = (manifest.phases ?? []).flatMap((phase) => [
-    phase.prUrl,
-    phase.pullRequest?.url,
-  ]);
-  return [
-    state.prUrl,
-    state.pullRequest?.url,
-    manifest.prUrl,
-    manifest.pullRequest?.url,
-    ...phaseUrls,
-  ].map(prUrl).find(Boolean) ?? null;
+  const phaseUrls = (manifest.phases ?? []).flatMap((phase) => [phase.prUrl, phase.pullRequest?.url]);
+  return (
+    [state.prUrl, state.pullRequest?.url, manifest.prUrl, manifest.pullRequest?.url, ...phaseUrls]
+      .map(prUrl)
+      .find(Boolean) ?? null
+  );
 }
 
 function deriveStatus(data, manifest, lock) {
@@ -383,6 +398,37 @@ function deriveGateStatus(phases) {
   return latestEntry(phases, (entry) => entry.role === 'gate' || entry.kind === 'gate')?.status ?? null;
 }
 
+function deriveJudge(phases) {
+  const decision = latestEntry(phases, (entry) => entry.role === 'judge');
+  if (!decision) return null;
+  const override = latestEntry(
+    phases,
+    (entry) => entry.role === 'review-override' && entry.round === decision.round && entry.status === 'completed',
+  );
+  return {
+    round: decision.round ?? null,
+    status: decision.status ?? null,
+    repeated: decision.decision?.repeated ?? null,
+    matches: decision.decision?.matches ?? [],
+    unmatched: decision.decision?.unmatched ?? [],
+    matchSummary: decision.matchSummary ?? null,
+    failure: decision.failure?.reason ?? null,
+    skipped: decision.decision?.skipped ?? null,
+    action: override?.reason === 'repeated-blockers' ? 'continue' : null,
+  };
+}
+
+function deriveDecisions(phases) {
+  return phases
+    .filter((entry) => entry.role === 'judge' || (entry.role === 'review-override' && entry.status === 'completed'))
+    .map((entry) => ({
+      phase: entry.phase ?? null,
+      round: entry.round ?? null,
+      outcome: judgeOutcome(entry),
+      message: describeJudgeEntry(entry),
+    }));
+}
+
 function summarizeRun(slug, runDir, state, manifest, lock) {
   const phases = manifest.phases ?? [];
   const stalled = state.stalled;
@@ -402,11 +448,16 @@ function summarizeRun(slug, runDir, state, manifest, lock) {
     phaseStartedAt: state.phaseStartedAt ?? null,
     verdict: deriveVerdict(state, phases),
     gateStatus: deriveGateStatus(phases),
+    judge: deriveJudge(phases),
+    decisions: deriveDecisions(phases),
     prUrl: canonicalPrUrl(state, manifest),
-    stalled: status === 'stalled' && stalled ? {
-      phase: stalled.phase ?? null,
-      reason: typeof stalled.reason === 'string' ? stalled.reason.slice(0, 300) : '',
-    } : null,
+    stalled:
+      status === 'stalled' && stalled
+        ? {
+            phase: stalled.phase ?? null,
+            reason: typeof stalled.reason === 'string' ? stalled.reason.slice(0, 300) : '',
+          }
+        : null,
     runDir,
     lock: {
       present: lock.present,
@@ -422,7 +473,7 @@ async function readRun(runsDir, slug) {
   const runDir = join(runsDir, slug);
   const state = await readJson(join(runDir, 'state.json'), { optional: true });
   if (!state) return null;
-  const manifest = await readJson(join(runDir, 'manifest.json'), { optional: true }) ?? { phases: [] };
+  const manifest = (await readJson(join(runDir, 'manifest.json'), { optional: true })) ?? { phases: [] };
   const lock = await readLock(runDir);
   return {
     summary: summarizeRun(slug, runDir, state, manifest, lock),
@@ -473,7 +524,9 @@ async function listRunsIn(runsDir) {
     throw error;
   }
   const runs = [];
-  for (const entry of entries.filter((candidate) => candidate.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of entries
+    .filter((candidate) => candidate.isDirectory())
+    .sort((a, b) => a.name.localeCompare(b.name))) {
     const run = await readRun(runsDir, entry.name);
     if (run) runs.push(run.summary);
   }
@@ -486,7 +539,7 @@ export async function listRuns(options = {}) {
   return listRunsIn(context.runsDir);
 }
 
-function watchEvent(type, repoRoot, run, at, from = null, to = null) {
+function watchEvent(type, repoRoot, run, at, from = null, to = null, extra = {}) {
   return {
     type,
     at: at.toISOString(),
@@ -503,7 +556,16 @@ function watchEvent(type, repoRoot, run, at, from = null, to = null) {
     prUrl: run.prUrl,
     ...(run.stalled ? { stalled: run.stalled } : {}),
     runDir: run.runDir,
+    ...extra,
   };
+}
+
+// Judge decisions recorded since the previous poll, one event each, in
+// manifest order. Entries are append-only, so a count is enough to diff.
+function decisionEvents(repoRoot, run, at, seen) {
+  return (run.decisions ?? [])
+    .slice(seen)
+    .map((decision) => watchEvent('decision', repoRoot, run, at, null, null, { decision }));
 }
 
 /**
@@ -514,9 +576,17 @@ function watchEvent(type, repoRoot, run, at, from = null, to = null) {
  *   warn?: (message: string) => void}} options
  */
 export async function* watchRuns(options) {
-  const { repos, configPath, names = [], intervalMs = 15_000, initial = false,
-    signal, now = () => new Date(), sleep = (ms, abortSignal) => delay(ms, undefined, { signal: abortSignal }),
-    warn = (message) => console.error(message) } = options;
+  const {
+    repos,
+    configPath,
+    names = [],
+    intervalMs = 15_000,
+    initial = false,
+    signal,
+    now = () => new Date(),
+    sleep = (ms, abortSignal) => delay(ms, undefined, { signal: abortSignal }),
+    warn = (message) => console.error(message),
+  } = options;
   const hasNameFilter = names.length > 0;
   const wanted = new Set(names.map((name) => slugFor(name)).filter(Boolean));
   const resolvedConfigPath = configPath ? resolve(configPath) : undefined;
@@ -540,9 +610,11 @@ export async function* watchRuns(options) {
         warn(`aloop watch: could not read runs in ${context.repoRoot}: ${error.message}`);
         continue;
       }
-      const current = new Map(runs
-        .filter((run) => !hasNameFilter || wanted.has(run.slug))
-        .map((run) => [`${context.repoRoot}\0${run.slug}`, run]));
+      const current = new Map(
+        runs
+          .filter((run) => !hasNameFilter || wanted.has(run.slug))
+          .map((run) => [`${context.repoRoot}\0${run.slug}`, run]),
+      );
       const priorForRepo = new Map([...previous].filter(([key]) => key.startsWith(`${context.repoRoot}\0`)));
       const at = now();
 
@@ -553,6 +625,7 @@ export async function* watchRuns(options) {
             if (initial) yield watchEvent('snapshot', context.repoRoot, run, at);
           } else {
             yield watchEvent('appeared', context.repoRoot, run, at);
+            yield* decisionEvents(context.repoRoot, run, at, 0);
           }
           continue;
         }
@@ -561,6 +634,7 @@ export async function* watchRuns(options) {
         } else if (prior.currentPhase !== run.currentPhase) {
           yield watchEvent('phase', context.repoRoot, run, at, prior.currentPhase, run.currentPhase);
         }
+        yield* decisionEvents(context.repoRoot, run, at, prior.decisions?.length ?? 0);
       }
       if (initializedRoots.has(context.repoRoot)) {
         for (const [key, run] of priorForRepo) {
@@ -594,6 +668,7 @@ export async function inspectRun(name, options = {}) {
   const run = await getRun(name, options);
   return {
     ...run.summary,
+    agentSettings: run.state.agentSettings ?? {},
     state: run.state,
     manifest: run.manifest,
     phases: run.manifest.phases ?? [],
@@ -609,7 +684,11 @@ function replayPrompt(entry) {
     return { status: 'unverifiable', reason: 'prompt input is incomplete' };
   }
   try {
-    const actualHash = hashText(withOperatorNote(interpolate(input.templateBody, input.variables), input.operatorNote));
+    const actualHash = hashText(
+      input.wrappedPrompt ??
+        (input.agentPrefix ?? '') +
+          withOperatorNote(interpolate(input.templateBody, input.variables), input.operatorNote),
+    );
     return {
       status: actualHash === entry.promptHash ? 'verified' : 'mismatch',
       template: input.template ?? null,
@@ -648,8 +727,7 @@ function replayTimeline(phases) {
 
 export async function replayRun(name, options = {}) {
   const run = await getRun(name, options);
-  const repoRoot = run.summary.repoRoot
-    ?? await new GitFacade(options.cwd ?? process.cwd()).toplevel();
+  const repoRoot = run.summary.repoRoot ?? (await new GitFacade(options.cwd ?? process.cwd()).toplevel());
   const snapshot = await readJson(join(run.summary.runDir, 'snapshot.json'));
   const phases = run.manifest.phases ?? [];
   const divergences = [];
@@ -670,7 +748,11 @@ export async function replayRun(name, options = {}) {
   }
   for (const entry of phases) {
     if (snapshot?.configHash && entry.configHash && entry.configHash !== snapshot.configHash) {
-      divergences.push({ type: 'config', phase: entry.phase, message: `Phase configHash differs from snapshot: ${entry.phase}` });
+      divergences.push({
+        type: 'config',
+        phase: entry.phase,
+        message: `Phase configHash differs from snapshot: ${entry.phase}`,
+      });
     }
   }
   const timeline = replayTimeline(phases);
@@ -711,7 +793,7 @@ export async function cancelRun(name, options = {}) {
   if (!isActiveProcessAlive(activeProcess) && run.lock.owner?.pid && run.lock.owner.pid !== process.pid) {
     activeProcess = await discoverActiveProcess(run.summary.runDir, run.lock.owner.pid);
   }
-  if (activeProcess && !await stopProcesses([activeProcess])) {
+  if (activeProcess && !(await stopProcesses([activeProcess]))) {
     throw new Error(`Cancellation timed out for run "${name}"; its lock was retained.`);
   }
   const runnerTargets = [];
@@ -719,10 +801,10 @@ export async function cancelRun(name, options = {}) {
     killedPid = run.lock.owner.pid;
     runnerTargets.push({ pid: run.lock.owner.pid });
   }
-  if (runnerTargets.length && !await stopProcesses(runnerTargets)) {
+  if (runnerTargets.length && !(await stopProcesses(runnerTargets))) {
     throw new Error(`Cancellation timed out for run "${name}"; its lock was retained.`);
   }
-  if (!await stopActiveProcessesAfterRunner(run.summary.runDir, runnerTargets[0]?.pid ?? null)) {
+  if (!(await stopActiveProcessesAfterRunner(run.summary.runDir, runnerTargets[0]?.pid ?? null))) {
     throw new Error(`Cancellation timed out for run "${name}"; its lock was retained.`);
   }
 
@@ -757,9 +839,11 @@ function signalProcess(pid, signal) {
 }
 
 async function waitForProcessesToStop(targets, timeoutMs) {
-  const watched = targets.filter(({ pid, processGroupId }) =>
-    (Number.isInteger(processGroupId) && processGroupId > 0 && processGroupId !== process.pid)
-    || (Number.isInteger(pid) && pid > 0 && pid !== process.pid));
+  const watched = targets.filter(
+    ({ pid, processGroupId }) =>
+      (Number.isInteger(processGroupId) && processGroupId > 0 && processGroupId !== process.pid) ||
+      (Number.isInteger(pid) && pid > 0 && pid !== process.pid),
+  );
   const deadline = Date.now() + timeoutMs;
   while (watched.some(isActiveProcessAlive) && Date.now() < deadline) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
@@ -780,7 +864,7 @@ async function discoverActiveProcess(runDir, runnerPid) {
 async function stopActiveProcessesAfterRunner(runDir, runnerPid) {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const activeProcess = await readJson(join(runDir, 'active-command.json'), { optional: true });
-    if (activeProcess && isActiveProcessAlive(activeProcess) && !await stopProcesses([activeProcess])) {
+    if (activeProcess && isActiveProcessAlive(activeProcess) && !(await stopProcesses([activeProcess]))) {
       return false;
     }
 
@@ -799,9 +883,11 @@ function signalTarget(target, signal) {
 }
 
 async function stopProcesses(targets) {
-  const watched = targets.filter(({ pid, processGroupId }) =>
-    (Number.isInteger(processGroupId) && processGroupId > 0 && processGroupId !== process.pid)
-    || (Number.isInteger(pid) && pid > 0 && pid !== process.pid));
+  const watched = targets.filter(
+    ({ pid, processGroupId }) =>
+      (Number.isInteger(processGroupId) && processGroupId > 0 && processGroupId !== process.pid) ||
+      (Number.isInteger(pid) && pid > 0 && pid !== process.pid),
+  );
   if (!watched.length) return true;
   for (const target of watched) signalTarget(target, 'SIGTERM');
   if (await waitForProcessesToStop(watched, 1000)) return true;
@@ -810,7 +896,13 @@ async function stopProcesses(targets) {
 }
 
 export async function cleanRuns(options = {}) {
-  const { cwd = process.cwd(), configPath, olderThanDays = 30, dryRun = false, yes = false } = /** @type {any} */ (options);
+  const {
+    cwd = process.cwd(),
+    configPath,
+    olderThanDays = 30,
+    dryRun = false,
+    yes = false,
+  } = /** @type {any} */ (options);
   const context = await operationalContext(cwd, configPath);
   const runs = await listRuns({ cwd, configPath });
   const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
@@ -857,7 +949,7 @@ async function bundledPresets() {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const root = join(packagePresets, entry.name);
-    if (await pathExists(join(root, 'loop.config.mjs')) && await isDirectory(join(root, 'prompts'))) {
+    if ((await pathExists(join(root, 'loop.config.mjs'))) && (await isDirectory(join(root, 'prompts')))) {
       presets.set(entry.name, root);
     }
   }
@@ -874,9 +966,7 @@ async function resolvePresetRoot(name) {
 }
 
 async function renderInitConfig(presetRoot) {
-  const body = presetRoot
-    ? await readFile(join(presetRoot, 'loop.config.mjs'), 'utf8')
-    : EMBEDDED_STARTER;
+  const body = presetRoot ? await readFile(join(presetRoot, 'loop.config.mjs'), 'utf8') : EMBEDDED_STARTER;
   return `${CONFIG_HEADER}\n${body.trimEnd()}\n\n${CONFIG_FOOTER}`;
 }
 
@@ -894,16 +984,22 @@ export async function init({ cwd = process.cwd(), preset = null, force = false }
 
   const plan = /** @type {any[]} */ ([
     { target: join(cwd, 'loop.config.mjs'), kind: 'config' },
-    ...[...prompts.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([name, source]) => ({
-      target: join(promptTargetDir, name), source, kind: 'prompt',
-    })),
+    ...[...prompts.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, source]) => ({
+        target: join(promptTargetDir, name),
+        source,
+        kind: 'prompt',
+      })),
   ]);
   const existing = [];
   for (const item of plan) {
     if (await pathExists(item.target)) existing.push(relative(cwd, item.target));
   }
   if (existing.length && !force) {
-    const error = new Error(`Refusing to overwrite existing files:\n  ${existing.join('\n  ')}\nRe-run with --force to overwrite.`);
+    const error = new Error(
+      `Refusing to overwrite existing files:\n  ${existing.join('\n  ')}\nRe-run with --force to overwrite.`,
+    );
     error.command = true;
     throw error;
   }
@@ -921,7 +1017,10 @@ async function checkCommand(command, args, cwd) {
     await runCommand(command, args, { cwd });
     return { ok: true, detail: `${command} is available` };
   } catch (error) {
-    return { ok: false, detail: error.code === 'ENOENT' ? `${command} is not installed` : (error.output || error.message).trim() };
+    return {
+      ok: false,
+      detail: error.code === 'ENOENT' ? `${command} is not installed` : (error.output || error.message).trim(),
+    };
   }
 }
 
@@ -946,18 +1045,40 @@ export async function doctor(options = {}) {
       checks.push({ name: 'git worktree', ok: false, detail: error.message });
     }
     const agents = new Map();
-    for (const phase of context.config.resolvedPhases.flatMap((item) => [item, ...(item.repair ?? [])])) {
+    for (const phase of agentPhases(context.config)) {
       if (phase.kind !== 'agent') continue;
-      const agent = agentForPhase(context.config, phase.name);
+      const agent = resolvePhaseAgent(context.config, phase);
       agents.set(agent.name, agent);
     }
     for (const [name, agent] of agents) {
       try {
-        const command = adapterFor(name, context.config.adapters).command({ prompt: '', cwd: repoRoot, addDirs: [], agent }).command;
-        checks.push({ name: `engine ${name}`, ...(await checkCommand(process.platform === 'win32' ? 'where' : 'which', [command], repoRoot)) });
+        const command = adapterFor(name, context.config.adapters).command({
+          prompt: '',
+          cwd: repoRoot,
+          addDirs: [],
+          agent,
+        }).command;
+        checks.push({
+          name: `engine ${name}`,
+          ...(await checkCommand(process.platform === 'win32' ? 'where' : 'which', [command], repoRoot)),
+        });
       } catch (error) {
         checks.push({ name: `engine ${name}`, ok: false, detail: error.message });
       }
+    }
+  }
+  if (context) {
+    const diagnostics = await diagnoseAgents(context.config, { repoRoot, baseBranch: context.config.baseBranch });
+    for (const diagnostic of diagnostics) {
+      checks.push({
+        name: `agent ${diagnostic.phase}`,
+        ok: true,
+        warn: diagnostic.level === 'warn',
+        detail: `${diagnostic.engine} / ${diagnostic.agent}: ${diagnostic.message}`,
+        code: diagnostic.code,
+        hint: diagnostic.hint,
+        docs: diagnostic.docs,
+      });
     }
   }
   checks.push({ name: 'gh auth', ...(await checkCommand('gh', ['auth', 'status'], repoRoot)) });

@@ -117,22 +117,33 @@ test('runCommand wraps Windows command shims and leaves POSIX commands unchanged
   assert.equal(calls[1].command, 'C:\\Tools\\node.exe');
   assert.deepEqual(calls[1].args, ['--version']);
   assert.match(calls[2].command, /powershell\.exe$/i);
-  assert.deepEqual(calls[2].args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\Tools\\script.ps1', '--version']);
+  assert.deepEqual(calls[2].args, [
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    'C:\\Tools\\script.ps1',
+    '--version',
+  ]);
   assert.equal(calls[3].command, 'sh');
   assert.deepEqual(calls[3].args, ['-c', 'true']);
   assert.equal(calls[3].options.detached, true);
 });
 
-test('Windows launches a PATH-resolved .cmd fixture through ComSpec', { skip: process.platform !== 'win32' }, async () => {
-  const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), 'platform-fixtures');
-  const result = await runCommand('echo', ['alpha', 'beta'], {
-    platform: 'win32',
-    cwd: fixtureDir,
-    env: { ...process.env, PATH: `${fixtureDir};${process.env.PATH}` },
-  });
+test(
+  'Windows launches a PATH-resolved .cmd fixture through ComSpec',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), 'platform-fixtures');
+    const result = await runCommand('echo', ['alpha', 'beta'], {
+      platform: 'win32',
+      cwd: fixtureDir,
+      env: { ...process.env, PATH: `${fixtureDir};${process.env.PATH}` },
+    });
 
-  assert.equal(result.stdout.trim(), 'platform-fixture alpha beta');
-});
+    assert.equal(result.stdout.trim(), 'platform-fixture alpha beta');
+  },
+);
 
 test('Windows command timeouts terminate the whole process tree with taskkill', async () => {
   const child = fakeChild(4321);
@@ -170,12 +181,15 @@ test('Windows command timeouts fall back when taskkill cannot start', async () =
     return child;
   };
 
-  await assert.rejects(runCommand('claude', [], {
-    platform: 'win32',
-    timeoutMs: 1,
-    resolveExecutable: () => 'C:\\Tools\\claude.exe',
-    spawnImpl,
-  }), (error) => /** @type {any} */ (error).code === 'ETIMEDOUT');
+  await assert.rejects(
+    runCommand('claude', [], {
+      platform: 'win32',
+      timeoutMs: 1,
+      resolveExecutable: () => 'C:\\Tools\\claude.exe',
+      spawnImpl,
+    }),
+    (error) => /** @type {any} */ (error).code === 'ETIMEDOUT',
+  );
   assert.equal(child.directlyKilled, true);
 });
 
@@ -190,12 +204,15 @@ test('Windows command timeouts fall back when taskkill exits unsuccessfully', as
     return child;
   };
 
-  await assert.rejects(runCommand('claude', [], {
-    platform: 'win32',
-    timeoutMs: 1,
-    resolveExecutable: () => 'C:\\Tools\\claude.exe',
-    spawnImpl,
-  }), (error) => /** @type {any} */ (error).code === 'ETIMEDOUT');
+  await assert.rejects(
+    runCommand('claude', [], {
+      platform: 'win32',
+      timeoutMs: 1,
+      resolveExecutable: () => 'C:\\Tools\\claude.exe',
+      spawnImpl,
+    }),
+    (error) => /** @type {any} */ (error).code === 'ETIMEDOUT',
+  );
   assert.equal(child.directlyKilled, true);
 });
 
@@ -208,7 +225,8 @@ test('shell resolution prefers sh (Git Bash) on Windows when it is on PATH', () 
   assert.deepEqual(
     resolveShell({
       platform: 'win32',
-      resolveExecutable: (command) => (command === 'sh' ? 'C:\\Program Files\\Git\\bin\\sh.exe' : 'C:\\Tools\\pwsh.exe'),
+      resolveExecutable: (command) =>
+        command === 'sh' ? 'C:\\Program Files\\Git\\bin\\sh.exe' : 'C:\\Tools\\pwsh.exe',
     }),
     { bin: 'C:\\Program Files\\Git\\bin\\sh.exe', flag: '-c' },
   );
@@ -222,10 +240,10 @@ test('shell resolution falls back to pwsh, then powershell.exe, when sh is unava
     }),
     { bin: 'pwsh', flag: '-Command' },
   );
-  assert.deepEqual(
-    resolveShell({ platform: 'win32', resolveExecutable: () => null }),
-    { bin: 'powershell.exe', flag: '-Command' },
-  );
+  assert.deepEqual(resolveShell({ platform: 'win32', resolveExecutable: () => null }), {
+    bin: 'powershell.exe',
+    flag: '-Command',
+  });
 });
 
 test('shell resolution couples an explicit shellHint to the matching shell, even over config.shell', () => {
@@ -255,14 +273,14 @@ test('shell resolution honors an explicit config.shell override on Windows', () 
     resolveShell({ platform: 'win32', configuredShell: 'cmd.exe', resolveExecutable: () => 'C:\\Tools\\pwsh.exe' }),
     { bin: 'cmd.exe', flag: ['/d', '/s', '/c'] },
   );
-  assert.deepEqual(
-    resolveShell({ platform: 'win32', configuredShell: 'powershell.exe' }),
-    { bin: 'powershell.exe', flag: '-Command' },
-  );
-  assert.deepEqual(
-    resolveShell({ platform: 'win32', configuredShell: 'C:\\Tools\\pwsh.exe' }),
-    { bin: 'C:\\Tools\\pwsh.exe', flag: '-Command' },
-  );
+  assert.deepEqual(resolveShell({ platform: 'win32', configuredShell: 'powershell.exe' }), {
+    bin: 'powershell.exe',
+    flag: '-Command',
+  });
+  assert.deepEqual(resolveShell({ platform: 'win32', configuredShell: 'C:\\Tools\\pwsh.exe' }), {
+    bin: 'C:\\Tools\\pwsh.exe',
+    flag: '-Command',
+  });
 });
 
 test('Windows terminal input prefers a TTY and otherwise opens CONIN$', async () => {

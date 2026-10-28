@@ -45,25 +45,27 @@ aloop watch --initial --repo .
 
 - Positional run names limit events to matching run slugs.
 - `--repo` can be repeated and defaults to the current directory. `--config` applies to each repository.
-- `--only status` hides phase-only events.
+- `--only status` hides phase-only and `decision` events.
 - `--initial` writes a `snapshot` event for every run found on the first poll. Snapshots don't end `--once` or reset its idle timeout.
 
 Every line has a `type` and a UTC `at` timestamp:
 
-| Type | Meaning | `from` / `to` |
-| --- | --- | --- |
-| `snapshot` | An existing run, included by `--initial` | `null` |
-| `appeared` | A run first seen after startup | `null` |
-| `removed` | A previously seen run disappeared | `null` |
-| `status` | Derived status changed. Carries the latest phase. | Previous / current status |
-| `phase` | A new phase or sub-phase started with no status change | Previous / current phase |
-| `timeout` | The idle timeout elapsed | Not applicable |
+| Type       | Meaning                                                | `from` / `to`             |
+| ---------- | ------------------------------------------------------ | ------------------------- |
+| `snapshot` | An existing run, included by `--initial`               | `null`                    |
+| `appeared` | A run first seen after startup                         | `null`                    |
+| `removed`  | A previously seen run disappeared                      | `null`                    |
+| `status`   | Derived status changed. Carries the latest phase.      | Previous / current status |
+| `phase`    | A new phase or sub-phase started with no status change | Previous / current phase  |
+| `decision` | A repeated-blocker judge decision or review override   | `null`                    |
+| `timeout`  | The idle timeout elapsed                               | Not applicable            |
 
 Run events include `repo`, `name`, `status`, `currentPhase`, `phaseStartedAt`, `verdict`, `gateStatus`, `branch`, `prUrl`, and `runDir`. A stalled run includes only its phase and a reason cut to 300 characters. A timeout line includes `idleMs`.
 
 Details worth knowing:
 
 - If status and phase both change in one poll, you get a single `status` event.
+- A `decision` event adds `decision` with `phase`, `round`, `outcome` (`repeated`, `not-repeated`, `skipped`, `failed-closed`, or `review-override`), and `message`, the same one-line summary the run log prints. Each recorded decision is reported once, after any `status` or `phase` event from the same poll. See [Repeated-blocker judge](judge.md#observability).
 - Reviewers and repair phases appear under their own names, including moves back to review or gate on later attempts.
 - A phase that starts and finishes between polls may be missed. A change to `phaseStartedAt` alone emits nothing.
 - Runs created before phase entries were recorded report the last non-skipped manifest phase (completed or stalled), with a null `phaseStartedAt`.
@@ -108,6 +110,8 @@ aloop clean --older-than 14 --dry-run --json
 Without `--yes`, it previews the candidates and changes nothing. `--dry-run` asks for the same preview explicitly. With `--yes`, it removes each candidate's run directory. If the run has an external worktree, that's removed through Git first. `clean` never touches active, interrupted, stalled, cancelled, or unknown runs.
 
 ## Diagnosing local prerequisites
+
+Doctor also checks every configured named agent, including specialized reviewers: whether it is resolvable, committed where worktrees can see it, and able to write artifacts. See [Named agents](agents.md#doctor). Agent warnings render as `⚠`, with an indented `→` hint and docs link. They keep `ok: true` and exit zero; the summary becomes `Doctor: OK (N warnings)`. JSON checks expose `warn`, `hint`, `docs`, and the diagnostic `code`.
 
 ```sh
 aloop doctor

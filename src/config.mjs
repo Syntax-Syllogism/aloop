@@ -1,4 +1,5 @@
 /** @typedef {import('./types.js').Config} Config */
+/** @typedef {import('./types.js').Engine} Engine */
 /** @typedef {import('./types.js').PhaseDescriptor} PhaseDescriptor */
 
 import { access } from 'node:fs/promises';
@@ -22,6 +23,8 @@ const defaults = {
   // not something the run can undo for you.
   remote: null,
   adapters: {},
+  judge: null,
+  judges: {},
   engines: { default: { name: 'claude' } },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   reviewRoles: [],
@@ -183,8 +186,11 @@ export function normalizeCommandEntry(entry, { label, index, platform = process.
     throw new Error(`${where} must be a command string, { argv: [...] }, or a per-platform command object.`);
   }
   if (entry.argv !== undefined) {
-    if (!Array.isArray(entry.argv) || entry.argv.length === 0
-      || entry.argv.some((part) => typeof part !== 'string' || !part)) {
+    if (
+      !Array.isArray(entry.argv) ||
+      entry.argv.length === 0 ||
+      entry.argv.some((part) => typeof part !== 'string' || !part)
+    ) {
       throw new Error(`${where}.argv must be a non-empty array of non-empty strings.`);
     }
     return { kind: 'argv', argv: entry.argv, display: entry.argv.join(' ') };
@@ -200,22 +206,29 @@ export function normalizeCommandEntry(entry, { label, index, platform = process.
   }
   const isWindows = platform === 'win32';
   const selectedKey = isWindows
-    ? (entry.windows !== undefined ? 'windows' : entry.pwsh !== undefined ? 'pwsh' : entry.cmd !== undefined ? 'cmd' : undefined)
-    : (entry.posix !== undefined ? 'posix' : undefined);
+    ? entry.windows !== undefined
+      ? 'windows'
+      : entry.pwsh !== undefined
+        ? 'pwsh'
+        : entry.cmd !== undefined
+          ? 'cmd'
+          : undefined
+    : entry.posix !== undefined
+      ? 'posix'
+      : undefined;
   const selected = selectedKey ? entry[selectedKey] : undefined;
   if (selected === undefined) {
     const need = isWindows ? '`windows` (or `pwsh`/`cmd`)' : '`posix`';
     throw new Error(
-      `${where} has no ${need} variant for this platform (only ${present.join(', ')} defined). `
-      + 'Add the missing variant, or use { argv: [...] } for a command that runs unchanged on every platform.',
+      `${where} has no ${need} variant for this platform (only ${present.join(', ')} defined). ` +
+        'Add the missing variant, or use { argv: [...] } for a command that runs unchanged on every platform.',
     );
   }
   // `pwsh`/`cmd` are narrower than the generic `windows` key: they name a
   // specific shell dialect, so the resolved shell must match the key chosen
   // here rather than being re-auto-detected at invocation time.
-  const shellHint = selectedKey === 'pwsh' || selectedKey === 'cmd'
-    ? { shellHint: /** @type {'pwsh' | 'cmd'} */ (selectedKey) }
-    : {};
+  const shellHint =
+    selectedKey === 'pwsh' || selectedKey === 'cmd' ? { shellHint: /** @type {'pwsh' | 'cmd'} */ (selectedKey) } : {};
   return { kind: 'shell', shellString: selected, display: selected, ...shellHint };
 }
 
@@ -252,7 +265,9 @@ function toPhase(entry, index) {
     }
   }
   if (phase.permissions.some((permission) => !Object.values(PERMISSIONS).includes(permission))) {
-    throw new Error(`Phase "${phase.name}" has invalid permissions; expected ${Object.values(PERMISSIONS).join(', ')}.`);
+    throw new Error(
+      `Phase "${phase.name}" has invalid permissions; expected ${Object.values(PERMISSIONS).join(', ')}.`,
+    );
   }
   if (phase.permissions.length === 0) {
     phase.permissions = [phase.kind === 'publish' ? PERMISSIONS.PUBLISH : PERMISSIONS.READ_ONLY];
@@ -289,15 +304,15 @@ export function normalizePhases(entries, { maxRounds }) {
     const referenceName = typeof reference === 'string' ? reference : reference?.name;
     const sourceIndex = referenceName ? phaseIndexes.get(referenceName) : undefined;
     if (sourceIndex === undefined && allowMissing) return null;
-    const source = sourceIndex === undefined
-      ? (referenceName ? builtinPhases[referenceName] : null)
-      : list[sourceIndex];
+    const source =
+      sourceIndex === undefined ? (referenceName ? builtinPhases[referenceName] : null) : list[sourceIndex];
     if (sourceIndex === undefined && !source && typeof reference === 'string') {
       throw new Error(`Phase "${parentName}" references unknown repair phase "${referenceName}".`);
     }
-    const descriptor = typeof reference === 'string'
-      ? { name: referenceName, ...source }
-      : { name: referenceName, ...source, ...reference };
+    const descriptor =
+      typeof reference === 'string'
+        ? { name: referenceName, ...source }
+        : { name: referenceName, ...source, ...reference };
     const repair = toPhase(descriptor, index);
     if (sourceIndex !== undefined && list[sourceIndex].role === 'repair') consumedRepairs.add(sourceIndex);
     if (repair.verdict) {
@@ -326,7 +341,9 @@ export function normalizePhases(entries, { maxRounds }) {
   for (let index = 0; index < list.length; index += 1) {
     const phase = list[index];
     if (phase.role === 'repair' && !consumedRepairs.has(index)) {
-      throw new Error(`Phase "${phase.name}" is a repair phase and must be declared by a phase that emits a verdict or gate repair transition.`);
+      throw new Error(
+        `Phase "${phase.name}" is a repair phase and must be declared by a phase that emits a verdict or gate repair transition.`,
+      );
     }
     if (!consumedRepairs.has(index)) result.push(phase);
   }
@@ -334,17 +351,19 @@ export function normalizePhases(entries, { maxRounds }) {
 }
 
 function assertPublishablePhaseOrder(resolvedPhases) {
-  const isPublishingPhase = (phase) => phase.kind === 'publish'
-    || phase.requiresCleanTree === true
-    || phase.outputs.includes('pull-request')
-    || phase.outputs.includes('pull-request-description');
+  const isPublishingPhase = (phase) =>
+    phase.kind === 'publish' ||
+    phase.requiresCleanTree === true ||
+    phase.outputs.includes('pull-request') ||
+    phase.outputs.includes('pull-request-description');
   let violation;
 
   for (let publishingIndex = 0; publishingIndex < resolvedPhases.length; publishingIndex += 1) {
     if (!isPublishingPhase(resolvedPhases[publishingIndex])) continue;
 
-    const verdictIndex = resolvedPhases.findLastIndex((phase, index) => index < publishingIndex
-      && (phase.role === 'verdict' || phase.verdict === true));
+    const verdictIndex = resolvedPhases.findLastIndex(
+      (phase, index) => index < publishingIndex && (phase.role === 'verdict' || phase.verdict === true),
+    );
     if (verdictIndex === -1) continue;
 
     const offenders = resolvedPhases
@@ -359,24 +378,35 @@ function assertPublishablePhaseOrder(resolvedPhases) {
   if (violation) {
     const { verdictIndex, publishingIndex, offenders } = violation;
     throw new Error(
-      `Phase order publishes an unreviewed tree: ${offenders.join(', ')} `
-      + `commit${offenders.length > 1 ? 's' : ''} after the `
-      + `"${resolvedPhases[verdictIndex].name}" verdict but before `
-      + `"${resolvedPhases[publishingIndex].name}" publishes. A commit after `
-      + `approval advances HEAD off the approved SHA and stalls publishing. Move `
-      + `${offenders.join(', ')} before the gate/review loop `
-      + `(e.g. ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish']).`,
+      `Phase order publishes an unreviewed tree: ${offenders.join(', ')} ` +
+        `commit${offenders.length > 1 ? 's' : ''} after the ` +
+        `"${resolvedPhases[verdictIndex].name}" verdict but before ` +
+        `"${resolvedPhases[publishingIndex].name}" publishes. A commit after ` +
+        `approval advances HEAD off the approved SHA and stalls publishing. Move ` +
+        `${offenders.join(', ')} before the gate/review loop ` +
+        `(e.g. ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish']).`,
     );
   }
 }
 
-function normalizeAgent(entry, phaseName, customAdapters) {
+function normalizeEngineEntry(entry, phaseName, { requireName }) {
   const agent = typeof entry === 'string' ? { name: entry } : entry;
   if (!agent || typeof agent !== 'object' || Array.isArray(agent)) {
     throw new Error(`Engine "${phaseName}" must be a name string or descriptor object.`);
   }
-  if (typeof agent.name !== 'string' || !agent.name) {
+  for (const field of Object.keys(agent)) {
+    if (!['name', 'model', 'effort', 'agent'].includes(field)) {
+      throw new Error(`Engine "${phaseName}" has unknown field "${field}"; expected name, model, effort, agent.`);
+    }
+  }
+  if (requireName && (typeof agent.name !== 'string' || !agent.name)) {
     throw new Error(`Engine "${phaseName}" is missing a non-empty name.`);
+  }
+  if (agent.name !== undefined && (typeof agent.name !== 'string' || !agent.name)) {
+    throw new Error(`Engine "${phaseName}" is missing a non-empty name.`);
+  }
+  if (agent.agent !== undefined && (typeof agent.agent !== 'string' || !agent.agent.trim())) {
+    throw new Error(`Engine "${phaseName}" has an invalid agent; expected a non-empty string.`);
   }
   if (agent.model !== undefined && (typeof agent.model !== 'string' || !agent.model)) {
     throw new Error(`Engine "${phaseName}" has an invalid model; expected a non-empty string.`);
@@ -384,10 +414,12 @@ function normalizeAgent(entry, phaseName, customAdapters) {
   if (agent.effort !== undefined && (typeof agent.effort !== 'string' || !agent.effort)) {
     throw new Error(`Engine "${phaseName}" has an invalid effort; expected a non-empty string.`);
   }
-  return validateAgent(
-    { name: agent.name, ...(agent.model ? { model: agent.model } : {}), ...(agent.effort ? { effort: agent.effort } : {}) },
-    customAdapters,
-  );
+  return {
+    ...(agent.name ? { name: agent.name } : {}),
+    ...(agent.model ? { model: agent.model } : {}),
+    ...(agent.effort ? { effort: agent.effort } : {}),
+    ...(agent.agent ? { agent: agent.agent } : {}),
+  };
 }
 
 function normalizeEngines(engines, customAdapters) {
@@ -395,10 +427,46 @@ function normalizeEngines(engines, customAdapters) {
     throw new Error('`engines` must be an object with a `default` entry.');
   }
   const normalized = Object.fromEntries(
-    Object.entries(engines).map(([phaseName, entry]) => [phaseName, normalizeAgent(entry, phaseName, customAdapters)]),
+    Object.entries(engines).map(([phaseName, entry]) => [
+      phaseName,
+      normalizeEngineEntry(entry, phaseName, { requireName: phaseName === 'default' }),
+    ]),
   );
   if (!normalized.default) throw new Error('`engines` must define a `default` entry.');
+  normalized.default = validateAgent(/** @type {Engine} */ (normalized.default), customAdapters);
   return normalized;
+}
+
+function configuredAgentPhaseNames(phases, maxRounds) {
+  return normalizePhases(phases, { maxRounds })
+    .flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])])
+    .filter((phase) => phase.kind === 'agent')
+    .map((phase) => phase.name);
+}
+
+function validateEngineKeys(engines, resolvedPhases, configuredPhases, maxRounds) {
+  const allActive = resolvedPhases.flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])]);
+  const active = new Set(allActive.filter((phase) => phase.kind === 'agent').map((phase) => phase.name));
+  const known = new Set([
+    ...Object.entries(builtinPhases)
+      .filter(([, phase]) => phase.kind === 'agent')
+      .map(([name]) => name),
+    ...configuredAgentPhaseNames(configuredPhases, maxRounds),
+    ...Object.keys(specializedReviewPrompts).map((role) => `review-${role}`),
+  ]);
+
+  for (const key of Object.keys(engines)) {
+    if (key === 'default' || active.has(key)) continue;
+    if (builtinPhases[key] && builtinPhases[key].kind !== 'agent') {
+      throw new Error(`engines.${key} has no effect: "${key}" is not an agent phase.`);
+    }
+    if (known.has(key)) {
+      console.error(`engines.${key} is set but "${key}" is not in this run's phases; ignoring it.`);
+      continue;
+    }
+    const valid = ['default', ...[...active].sort()];
+    throw new Error(`Unknown engines key "${key}". Valid keys: ${valid.join(', ')}.`);
+  }
 }
 
 function normalizeBudget(budget) {
@@ -409,8 +477,11 @@ function normalizeBudget(budget) {
   for (const field of ['tokens', 'usd', 'wallClockMs']) {
     const value = budget[field];
     if (value === undefined) continue;
-    const valid = typeof value === 'number' && Number.isFinite(value) && value >= 0
-      && (field !== 'tokens' || Number.isInteger(value));
+    const valid =
+      typeof value === 'number' &&
+      Number.isFinite(value) &&
+      value >= 0 &&
+      (field !== 'tokens' || Number.isInteger(value));
     if (!valid) {
       const kind = field === 'tokens' ? 'a nonnegative integer' : 'a nonnegative finite number';
       throw new Error(`\`budget.${field}\` must be ${kind}.`);
@@ -418,6 +489,82 @@ function normalizeBudget(budget) {
     normalized[field] = value;
   }
   return normalized;
+}
+
+function nonEmptyArgv(value, label) {
+  if (!Array.isArray(value) || !value.length || value.some((part) => typeof part !== 'string' || !part)) {
+    throw new Error(`${label} must be a non-empty array of non-empty strings.`);
+  }
+  return [...value];
+}
+
+function normalizeJudgeEntry(entry, label, { requireName = false } = {}) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`${label} must be an object.`);
+  const allowed = [
+    'name',
+    'kind',
+    'baseUrl',
+    'command',
+    'apiKeyEnv',
+    'judge',
+    'onRepeat',
+    'minProbability',
+    'timeoutMs',
+  ];
+  for (const key of Object.keys(entry))
+    if (!allowed.includes(key)) throw new Error(`${label} has unknown key "${key}".`);
+  if (requireName && (typeof entry.name !== 'string' || !entry.name))
+    throw new Error(`${label}.name must name a configured judge.`);
+  if (entry.name !== undefined && (typeof entry.name !== 'string' || !entry.name))
+    throw new Error(`${label}.name must be a non-empty string.`);
+  const kind = entry.kind ?? (typeof entry.judge === 'function' ? 'command' : undefined);
+  if (!['systemone', 'command'].includes(kind)) throw new Error(`${label}.kind must be "systemone" or "command".`);
+  if (kind === 'systemone') {
+    const hasUrl = entry.baseUrl !== undefined;
+    const hasCommand = entry.command !== undefined;
+    if (hasUrl === hasCommand) throw new Error(`${label} systemone judge requires exactly one of baseUrl or command.`);
+    if (hasUrl) {
+      try {
+        const url = new URL(entry.baseUrl);
+        if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
+      } catch {
+        throw new Error(`${label}.baseUrl must be an http(s) URL.`);
+      }
+      if (entry.apiKeyEnv !== undefined && (typeof entry.apiKeyEnv !== 'string' || !entry.apiKeyEnv))
+        throw new Error(`${label}.apiKeyEnv must be a non-empty string.`);
+    } else nonEmptyArgv(entry.command, `${label}.command`);
+  } else {
+    if ((entry.command === undefined) === (entry.judge === undefined))
+      throw new Error(`${label} command judge requires exactly one of command or judge.`);
+    if (entry.command !== undefined) nonEmptyArgv(entry.command, `${label}.command`);
+    if (entry.judge !== undefined && typeof entry.judge !== 'function')
+      throw new Error(`${label}.judge must be a function.`);
+    if (entry.baseUrl !== undefined || entry.apiKeyEnv !== undefined)
+      throw new Error(`${label} command judge does not support baseUrl or apiKeyEnv.`);
+  }
+  if (entry.onRepeat !== undefined && !['stall', 'continue'].includes(entry.onRepeat))
+    throw new Error(`${label}.onRepeat must be "stall" or "continue".`);
+  if (
+    entry.minProbability !== undefined &&
+    (typeof entry.minProbability !== 'number' ||
+      !Number.isFinite(entry.minProbability) ||
+      entry.minProbability <= 0 ||
+      entry.minProbability > 1)
+  )
+    throw new Error(`${label}.minProbability must be a number in (0, 1].`);
+  if (entry.timeoutMs !== undefined && (!Number.isInteger(entry.timeoutMs) || entry.timeoutMs <= 0))
+    throw new Error(`${label}.timeoutMs must be a positive integer.`);
+  return { ...entry, kind, ...(entry.command ? { command: [...entry.command] } : {}) };
+}
+
+function normalizeJudge(judge, judges) {
+  if (judge === null) return null;
+  if (!judge || typeof judge !== 'object' || Array.isArray(judge))
+    throw new Error('`judge` must be null or an object.');
+  const named = judge.name ? judges[judge.name] : null;
+  if (judge.name && !named) throw new Error(`judge.name "${judge.name}" is not a key in judges.`);
+  const resolved = normalizeJudgeEntry({ ...(named ?? {}), ...judge }, 'judge', { requireName: Boolean(judge.name) });
+  return { onRepeat: 'stall', minProbability: 0.9, timeoutMs: 180_000, ...resolved };
 }
 
 async function importConfigFile(cwd, configPath) {
@@ -452,22 +599,47 @@ export async function loadRunsDir(cwd, configPath) {
 /** @returns {Promise<Config>} */
 export async function loadConfig(cwd, overrides = {}, configPath) {
   const configured = await importConfigFile(cwd, configPath);
+  if (
+    configured.judge == null &&
+    overrides.judge &&
+    Object.keys(overrides.judge).length === 1 &&
+    Object.hasOwn(overrides.judge, 'onRepeat')
+  ) {
+    throw new Error('--on-repeat needs a configured judge; set `judge` in loop.config.mjs (see docs/judge.md).');
+  }
   const merged = {
     ...defaults,
     ...configured,
     ...overrides,
+    // CLI judge options are partial overrides of the configured judge.  In
+    // particular, --on-repeat must retain a named judge's transport.
+    judge:
+      overrides.judge === undefined
+        ? (configured.judge ?? defaults.judge)
+        : overrides.judge === null
+          ? null
+          : { ...(configured.judge ?? {}), ...overrides.judge },
     adapters: { ...defaults.adapters, ...configured.adapters, ...overrides.adapters },
     engines: { ...defaults.engines, ...configured.engines, ...overrides.engines },
+    judges: { ...defaults.judges, ...configured.judges, ...overrides.judges },
   };
+  if (!merged.judges || typeof merged.judges !== 'object' || Array.isArray(merged.judges))
+    throw new Error('`judges` must be an object.');
+  merged.judges = Object.fromEntries(
+    Object.entries(merged.judges).map(([name, entry]) => [name, normalizeJudgeEntry(entry, `judges.${name}`)]),
+  );
+  merged.judge = normalizeJudge(merged.judge, merged.judges);
   merged.engines = normalizeEngines(merged.engines, merged.adapters);
   merged.budget = normalizeBudget(merged.budget);
   merged.hermetic = normalizeHermeticConfig(merged.hermetic);
   if (!merged.publish || typeof merged.publish !== 'object' || Array.isArray(merged.publish)) {
     throw new Error('`publish` must be an object with backend and draft settings.');
   }
-  if (merged.publish.backend !== undefined
-    && typeof merged.publish.backend !== 'string'
-    && (typeof merged.publish.backend !== 'object' || merged.publish.backend === null)) {
+  if (
+    merged.publish.backend !== undefined &&
+    typeof merged.publish.backend !== 'string' &&
+    (typeof merged.publish.backend !== 'object' || merged.publish.backend === null)
+  ) {
     throw new Error('`publish.backend` must be "github" or a backend object.');
   }
   if (merged.publish.draft !== undefined && typeof merged.publish.draft !== 'boolean') {
@@ -484,32 +656,47 @@ export async function loadConfig(cwd, overrides = {}, configPath) {
   if (typeof merged.quiet !== 'boolean') {
     throw new Error('`quiet` must be a boolean.');
   }
-  if (typeof merged.heartbeatMinutes !== 'number' || !Number.isFinite(merged.heartbeatMinutes) || merged.heartbeatMinutes < 0) {
+  if (
+    typeof merged.heartbeatMinutes !== 'number' ||
+    !Number.isFinite(merged.heartbeatMinutes) ||
+    merged.heartbeatMinutes < 0
+  ) {
     throw new Error('`heartbeatMinutes` must be a nonnegative number of minutes.');
   }
   merged.resolvedPhases = normalizePhases(merged.phases, { maxRounds: merged.maxRounds });
-  if (!Array.isArray(merged.reviewRoles)
-    || new Set(merged.reviewRoles).size !== merged.reviewRoles.length
-    || merged.reviewRoles.some((role) => !Object.hasOwn(specializedReviewPrompts, role))) {
+  if (
+    !Array.isArray(merged.reviewRoles) ||
+    new Set(merged.reviewRoles).size !== merged.reviewRoles.length ||
+    merged.reviewRoles.some((role) => !Object.hasOwn(specializedReviewPrompts, role))
+  ) {
     throw new Error('`reviewRoles` must be an array of unique roles: security, api-compat, test-quality.');
   }
   if (merged.reviewRoles.length) {
     const review = merged.resolvedPhases.find((phase) => phase.name === 'review' && phase.verdict);
     if (!review) throw new Error('`reviewRoles` requires the built-in review phase.');
-    review.reviewers = merged.reviewRoles.map((role) => toPhase({
-      name: `review-${role}`,
-      kind: 'agent',
-      prompt: specializedReviewPrompts[role],
-      verdict: true,
-      reviewGroup: 'review',
-      hermetic: review.hermetic,
-      inputs: ['commit', 'gate-result'],
-      outputs: ['verdict'],
-      postconditions: ['verdict-recorded'],
-      permissions: [PERMISSIONS.READ_ONLY],
-    }, 0));
+    review.reviewers = merged.reviewRoles.map((role) =>
+      toPhase(
+        {
+          name: `review-${role}`,
+          kind: 'agent',
+          prompt: specializedReviewPrompts[role],
+          verdict: true,
+          reviewGroup: 'review',
+          hermetic: review.hermetic,
+          inputs: ['commit', 'gate-result'],
+          outputs: ['verdict'],
+          postconditions: ['verdict-recorded'],
+          permissions: [PERMISSIONS.READ_ONLY],
+        },
+        0,
+      ),
+    );
   }
-  for (const phase of merged.resolvedPhases.flatMap((entry) => [entry, ...(entry.reviewers ?? []), ...(entry.repair ?? [])])) {
+  for (const phase of merged.resolvedPhases.flatMap((entry) => [
+    entry,
+    ...(entry.reviewers ?? []),
+    ...(entry.repair ?? []),
+  ])) {
     phase.hermetic = resolvePhaseHermetic(phase.hermetic, merged.hermetic, phase.kind);
   }
   assertPublishablePhaseOrder(merged.resolvedPhases);
@@ -520,6 +707,7 @@ export async function loadConfig(cwd, overrides = {}, configPath) {
   if (allResolvedPhases.some((phase) => phase.kind === 'gate' && !(phase.commands ?? merged.gate).length)) {
     throw new Error('The pipeline has a gate phase but no gate commands; set `gate: [...]` in loop.config.mjs.');
   }
+  validateEngineKeys(merged.engines, merged.resolvedPhases, configured.phases ?? defaults.phases, merged.maxRounds);
   return merged;
 }
 

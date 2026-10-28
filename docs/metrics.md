@@ -31,16 +31,17 @@ Pass `--config` to point at a non-default `runsDir`. These commands read only th
 
 Per-run JSON contains `total`, `phases`, `convergence`, `reviewer`, and `stalled`. `phaseMetrics` is an alias of `phases`. Each phase summary has entry and attempt counts, completed and stalled counts, `stallRate`, `durationMs`, `tokens`, and `cost`.
 
-- `total.durationMs`: the sum of all non-skipped phase actions, gates included.
-- `total.tokens` and `total.cost`: the sum of reported model usage from non-gate phase actions. Gates report no model usage, so they're excluded.
+- `total.durationMs`: the sum of all non-skipped phase actions, gates included. Judge and `review-override` entries are excluded.
+- `total.tokens` and `total.cost`: the sum of reported model usage from non-gate phase actions. Gates report no model usage, so they're excluded. Judge and `review-override` entries are excluded too (see below).
 - `total.usageCoverage`: how many entries could report usage, and how many reported tokens and cost, as counts and fractions.
 - `convergence.roundsToApproval` (also `roundsToConverge`): the first review round with an `APPROVED` verdict. The object also says whether the run converged, how many review rounds were observed, and the distribution of approval rounds.
 - `reviewer.catchRate`: the fraction of review rounds with `CHANGES_REQUESTED`. `findingsCleared` is the drop in blocking findings between adjacent review rounds. `findingsClearedPerRound` divides that by the number of repair rounds.
 - `stalled`: the phases with at least one stalled entry.
+- `judge`: activity from the [repeated-blocker judge](judge.md). `decisions` counts judge manifest entries. `repeatedBlockerStalls` and `failedClosedStalls` count judge entries that stalled the review because the blockers repeated or because the judge failed (it fails closed). `reviewOverrides` counts `review-override` entries, where a repeat was continued with unresolved findings instead of stalling. The human-readable `status` and `metrics` output prints these on a `stalls` line once a run has at least one judge stall or review override.
 
-The cross-run `metrics` output adds `runs`, aggregate phase summaries, `convergenceRate`, average rounds to convergence, distributions, reviewer totals, and `runMetrics` (each run's metrics).
+The cross-run `metrics` output adds `runs`, aggregate phase summaries, `convergenceRate`, average rounds to convergence, distributions, reviewer and judge totals, and `runMetrics` (each run's metrics).
 
-Budget-stall bookkeeping entries don't count as usage-applicable. Otherwise a recorded budget stop would turn an otherwise complete token or cost total into `null`.
+Bookkeeping entries don't count as usage-applicable: budget stalls, judge decisions (including skipped ones), and review overrides. None of them carry model usage, so counting them would turn an otherwise complete token or cost total into `null`. Judge and review-override entries are excluded from phase entries, attempts, completed, stalled, skipped, stall rates, and durations, and from total duration. Their activity remains in the separate judge metrics.
 
 ## Unknown usage
 

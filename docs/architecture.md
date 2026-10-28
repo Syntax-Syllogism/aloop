@@ -27,7 +27,7 @@ Because this control flow doesn't depend on the concrete operations, you can cha
 
 - whether a configured phase can be skipped interactively;
 - agent-phase postconditions: a clean tree, `HEAD` advanced or unchanged as required, and a repair rebuttal when one is required;
-- the publication attestation, which ties the current `HEAD` to a passing gate and an approved review.
+- the publication attestation, which ties the current `HEAD` to a passing gate and an approved review, or to a recorded repeated-blockers override.
 
 The user-facing rules and failure behavior live in the [loop guide](loop.md#phases) and [Publishing](publishing.md). Treat those as the source of truth when you change a workflow contract.
 
@@ -58,15 +58,18 @@ These modules support the orchestration layer:
 
 - `src/config.mjs`: configuration normalization
 - `src/hermetic.mjs`: hermetic runtime policy
-- `src/adapters.mjs`: agent adapters
+- `src/adapters.mjs`: agent adapters, including each adapter's named-agent support (`agentSupport`)
+- `src/agents.mjs`: named-agent definitions (lookup, frontmatter parsing, inline prompt wrapping) and the setup diagnostics shared by `doctor` and runs. See [Named agents](agents.md).
 - `src/git.mjs`: Git operations
 - `src/prompts.mjs`: prompts
 - `src/state.mjs`: durable state
 - `src/verdict.mjs`: review verdicts
+- `src/judge.mjs`: repeated-blocker judge transports, request building, and answer validation. `runner.mjs` decides when to call it. It also classifies recorded judge entries (`judgeOutcome`) and formats their one-line summary (`describeJudgeEntry`). The run log, `aloop watch`, and metrics share these, so their wording and outcome labels match.
 
 Before you change a contract that users can see, read the matching guide:
 
 - [Agentic loop runner](loop.md): configuration, phase descriptors, prompts, manifest.
+- [Repeated-blocker judge](judge.md): judge configuration, the System One and generic protocols, and the stall and override contract.
 - [Hermetic phase execution](hermetic.md): runtime wrapping, mounts, network policy, environment forwarding, snapshots.
 - [Run state and recovery](run-state.md): state, locking, resuming.
 - [Publishing](publishing.md): PR description and publish guarantees.

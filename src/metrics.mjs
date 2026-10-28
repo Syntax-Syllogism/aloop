@@ -1,5 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { judgeOutcome } from './judge.mjs';
 
 function entriesFrom(manifest) {
   if (Array.isArray(manifest)) return manifest;
@@ -16,8 +17,14 @@ function sumKnown(entries, field) {
   return entries.reduce((total, entry) => total + entry[field], 0);
 }
 
+// Judge decisions and review overrides are bookkeeping for the review phase:
+// exclude them from phase activity and usage; report them in judge metrics.
+function isJudgeBookkeeping(entry) {
+  return entry.role === 'judge' || entry.role === 'review-override';
+}
+
 function isUsageApplicable(entry) {
-  return !entry.budgetStall && entry.kind !== 'gate' && entry.role !== 'gate';
+  return !entry.budgetStall && entry.kind !== 'gate' && entry.role !== 'gate' && !isJudgeBookkeeping(entry);
 }
 
 function usageCoverage(entries) {
@@ -41,6 +48,7 @@ function roundFor(entry) {
 }
 
 function phaseSummary(name, entries) {
+  entries = entries.filter((entry) => !isJudgeBookkeeping(entry));
   const attempts = entries.filter((entry) => entry.status !== 'skipped');
   const stalled = attempts.filter((entry) => entry.status === 'stalled').length;
   return {
@@ -72,8 +80,9 @@ function reviewVerdicts(entries) {
 }
 
 function reviewerMetrics(entries) {
-  const rounds = reviewVerdicts(entries)
-    .sort((a, b) => (roundFor(a) ?? Number.MAX_SAFE_INTEGER) - (roundFor(b) ?? Number.MAX_SAFE_INTEGER));
+  const rounds = reviewVerdicts(entries).sort(
+    (a, b) => (roundFor(a) ?? Number.MAX_SAFE_INTEGER) - (roundFor(b) ?? Number.MAX_SAFE_INTEGER),
+  );
   const approvals = rounds.filter((entry) => entry.verdict.verdict === 'APPROVED').length;
   const caught = rounds.filter((entry) => entry.verdict.verdict === 'CHANGES_REQUESTED').length;
   let findingsCleared = 0;
@@ -99,14 +108,13 @@ function reviewerMetrics(entries) {
 
 function convergenceMetrics(entries, reviewer) {
   const reviews = reviewVerdicts(entries);
-  const reviewRounds = reviews
-    .map(roundFor)
-    .filter((round) => round !== null);
-  const approval = reviews
-    .filter((entry) => entry.verdict?.verdict === 'APPROVED')
-    .map(roundFor)
-    .filter((round) => round !== null)
-    .sort((a, b) => a - b)[0] ?? null;
+  const reviewRounds = reviews.map(roundFor).filter((round) => round !== null);
+  const approval =
+    reviews
+      .filter((entry) => entry.verdict?.verdict === 'APPROVED')
+      .map(roundFor)
+      .filter((round) => round !== null)
+      .sort((a, b) => a - b)[0] ?? null;
   const distribution = {};
   if (approval !== null) distribution[approval] = 1;
   return {
@@ -118,16 +126,35 @@ function convergenceMetrics(entries, reviewer) {
   };
 }
 
+// Stall reasons the repeated-blocker judge owns, derived from its manifest
+// entries: the runner marks a judge entry `stalled` when its decision (or its
+// failure, which fails closed) stops the review loop.
+function judgeMetrics(entries) {
+  const decisions = entries.filter((entry) => entry.role === 'judge');
+  const stalls = decisions.filter((entry) => entry.status === 'stalled').map(judgeOutcome);
+  return {
+    decisions: decisions.length,
+    repeatedBlockerStalls: stalls.filter((outcome) => outcome === 'repeated').length,
+    failedClosedStalls: stalls.filter((outcome) => outcome === 'failed-closed').length,
+    reviewOverrides: entries.filter((entry) => entry.role === 'review-override' && entry.status === 'completed').length,
+  };
+}
+
 /** Compute run-level cost, convergence, and reviewer metrics from one manifest. */
 export function computeRunMetrics(manifest) {
   const entries = entriesFrom(manifest);
   const activity = entries.filter((entry) => !entry.aggregate);
   const names = [...new Set(activity.map((entry) => entry.phase).filter(Boolean))];
-  const phases = Object.fromEntries(names.map((name) => [
-    name,
-    phaseSummary(name, activity.filter((entry) => entry.phase === name)),
-  ]));
-  const totalEntries = activity.filter((entry) => entry.status !== 'skipped');
+  const phases = Object.fromEntries(
+    names.map((name) => [
+      name,
+      phaseSummary(
+        name,
+        activity.filter((entry) => entry.phase === name),
+      ),
+    ]),
+  );
+  const totalEntries = activity.filter((entry) => entry.status !== 'skipped' && !isJudgeBookkeeping(entry));
   const total = usageTotals(totalEntries);
   const reviewer = reviewerMetrics(entries);
   return {
@@ -136,6 +163,7 @@ export function computeRunMetrics(manifest) {
     phaseMetrics: phases,
     convergence: convergenceMetrics(entries, reviewer),
     reviewer,
+    judge: judgeMetrics(entries),
     stalled: names.filter((name) => phases[name].stalled > 0),
   };
 }
@@ -162,11 +190,14 @@ function aggregatePhase(name, summaries) {
 }
 
 function aggregateUsageCoverage(runMetrics) {
-  const coverage = runMetrics.reduce((totals, metrics) => ({
-    applicableEntries: totals.applicableEntries + metrics.total.usageCoverage.applicableEntries,
-    tokensReported: totals.tokensReported + metrics.total.usageCoverage.tokensReported,
-    costReported: totals.costReported + metrics.total.usageCoverage.costReported,
-  }), { applicableEntries: 0, tokensReported: 0, costReported: 0 });
+  const coverage = runMetrics.reduce(
+    (totals, metrics) => ({
+      applicableEntries: totals.applicableEntries + metrics.total.usageCoverage.applicableEntries,
+      tokensReported: totals.tokensReported + metrics.total.usageCoverage.tokensReported,
+      costReported: totals.costReported + metrics.total.usageCoverage.costReported,
+    }),
+    { applicableEntries: 0, tokensReported: 0, costReported: 0 },
+  );
   return {
     ...coverage,
     tokenCoverage: coverage.applicableEntries ? coverage.tokensReported / coverage.applicableEntries : null,
@@ -178,10 +209,12 @@ function aggregateUsageCoverage(runMetrics) {
 export function computeAggregateMetrics(manifests) {
   const runMetrics = manifests.map((manifest) => computeRunMetrics(manifest));
   const phaseNames = [...new Set(runMetrics.flatMap((metrics) => Object.keys(metrics.phases)))];
-  const phases = Object.fromEntries(phaseNames.map((name) => [
-    name,
-    aggregatePhase(name, runMetrics.map((metrics) => metrics.phases[name]).filter(Boolean)),
-  ]));
+  const phases = Object.fromEntries(
+    phaseNames.map((name) => [
+      name,
+      aggregatePhase(name, runMetrics.map((metrics) => metrics.phases[name]).filter(Boolean)),
+    ]),
+  );
   const converged = runMetrics.filter((metrics) => metrics.convergence.roundsToConverge !== null);
   const distribution = {};
   for (const metrics of converged) {
@@ -196,9 +229,13 @@ export function computeAggregateMetrics(manifests) {
     repairRounds: runMetrics.reduce((total, metrics) => total + metrics.reviewer.repairRounds, 0),
   };
   reviewer.catchRate = reviewer.rounds ? reviewer.changesRequested / reviewer.rounds : null;
-  reviewer.findingsClearedPerRound = reviewer.repairRounds
-    ? reviewer.findingsCleared / reviewer.repairRounds
-    : null;
+  reviewer.findingsClearedPerRound = reviewer.repairRounds ? reviewer.findingsCleared / reviewer.repairRounds : null;
+  const judge = Object.fromEntries(
+    ['decisions', 'repeatedBlockerStalls', 'failedClosedStalls', 'reviewOverrides'].map((field) => [
+      field,
+      runMetrics.reduce((total, metrics) => total + metrics.judge[field], 0),
+    ]),
+  );
   return {
     runs: runMetrics.length,
     total: {
@@ -225,6 +262,7 @@ export function computeAggregateMetrics(manifests) {
         : null,
     },
     reviewer,
+    judge,
     runMetrics,
   };
 }
@@ -247,7 +285,9 @@ export async function readRunManifests(runsDir) {
     throw error;
   }
   const runs = [];
-  for (const directory of directories.filter((entry) => entry.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const directory of directories
+    .filter((entry) => entry.isDirectory())
+    .sort((a, b) => a.name.localeCompare(b.name))) {
     const manifest = await readRunManifest(join(runsDir, directory.name));
     if (manifest) runs.push({ name: directory.name, manifest });
   }

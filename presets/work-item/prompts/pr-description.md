@@ -14,6 +14,10 @@ The PR body should cover what changed and why, a summary of the task, the
 review outcome (how many rounds, plus any recorded disagreements from the task file's
 `## Code Review` section if present), and anything deliberately left out of scope.
 
+If `{{UNRESOLVED_FINDINGS}}` is not `(none)`, include an **Unresolved review findings**
+section listing it verbatim and explain that the review loop stopped because the
+blockers repeated. Record the same findings in the task file's `## Code Review` section.
+
 ## Boundaries
 
 - If the worktree is **not** clean — `git status --porcelain` reports anything —

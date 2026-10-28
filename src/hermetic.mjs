@@ -7,7 +7,7 @@ const DEFAULTS = {
 };
 
 function normalizeNames(value, field) {
-  const names = value === undefined ? [] : (Array.isArray(value) ? value : [value]);
+  const names = value === undefined ? [] : Array.isArray(value) ? value : [value];
   if (names.some((name) => typeof name !== 'string' || !name)) {
     throw new Error(`Hermetic ${field} must contain non-empty strings.`);
   }
@@ -90,14 +90,7 @@ function uniqueMounts(mounts) {
  * stay absolute: each host path is bind-mounted at the same path in the
  * container, so BYO adapters need no container-specific contract.
  */
-export function hermeticInvocation({
-  settings,
-  command,
-  args,
-  cwd,
-  mounts = [],
-  env = process.env,
-}) {
+export function hermeticInvocation({ settings, command, args, cwd, mounts = [], env = process.env }) {
   const runtimeArgs = ['run', '--rm', '--workdir', cwd];
   const networks = settings.networks.length ? settings.networks : ['none'];
   for (const network of networks) runtimeArgs.push('--network', network);
@@ -144,13 +137,15 @@ export function hermeticSnapshot(config) {
     .map((phase) => ({
       name: phase.name,
       enabled: Boolean(phase.hermetic),
-      ...(phase.hermetic ? {
-        runtime: phase.hermetic.runtime,
-        image: phase.hermetic.image,
-        networks: [...phase.hermetic.networks],
-        env: [...phase.hermetic.env],
-        secrets: [...phase.hermetic.secrets],
-      } : {}),
+      ...(phase.hermetic
+        ? {
+            runtime: phase.hermetic.runtime,
+            image: phase.hermetic.image,
+            networks: [...phase.hermetic.networks],
+            env: [...phase.hermetic.env],
+            secrets: [...phase.hermetic.secrets],
+          }
+        : {}),
     }));
   return {
     runtime: config.hermetic.runtime,

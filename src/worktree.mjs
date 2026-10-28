@@ -2,7 +2,11 @@ import { mkdir, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 async function directoryExists(path) {
-  try { return (await stat(path)).isDirectory(); } catch { return false; }
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 export async function resumedWorktree(git, repoRoot, branch, savedPath) {
@@ -11,14 +15,18 @@ export async function resumedWorktree(git, repoRoot, branch, savedPath) {
     if (await directoryExists(savedPath)) return savedPath;
   } else {
     const registeredPath = await git.worktreePath(branch);
-    if (registeredPath && await directoryExists(registeredPath)) return registeredPath;
+    if (registeredPath && (await directoryExists(registeredPath))) return registeredPath;
   }
-  throw new Error(`Saved worktree "${savedPath}" for branch "${branch}" is unavailable. Restore it or re-register it with git worktree before resuming.`);
+  throw new Error(
+    `Saved worktree "${savedPath}" for branch "${branch}" is unavailable. Restore it or re-register it with git worktree before resuming.`,
+  );
 }
 
 export async function planWorktree(git, config, slug, branch, repoRoot) {
   if (!config.worktrees) return { worktree: repoRoot, willCreate: false };
-  const root = config.worktreeRoot ? resolve(repoRoot, config.worktreeRoot) : join(dirname(repoRoot), '.loop-worktrees');
+  const root = config.worktreeRoot
+    ? resolve(repoRoot, config.worktreeRoot)
+    : join(dirname(repoRoot), '.loop-worktrees');
   const existing = await git.worktreePath(branch);
   if (existing) return { worktree: existing, willCreate: false };
   return { worktree: join(root, slug), willCreate: true };

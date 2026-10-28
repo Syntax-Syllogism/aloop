@@ -23,7 +23,19 @@ import { runLoop } from '../src/pipeline.mjs';
 /** @typedef {import('../src/types.js').OperationalOutput} OperationalOutput */
 /** @typedef {import('../src/types.js').OperationalResult} OperationalResult */
 
-const commands = new Set(['run', 'list', 'status', 'inspect', 'replay', 'cancel', 'clean', 'doctor', 'metrics', 'init', 'watch']);
+const commands = new Set([
+  'run',
+  'list',
+  'status',
+  'inspect',
+  'replay',
+  'cancel',
+  'clean',
+  'doctor',
+  'metrics',
+  'init',
+  'watch',
+]);
 
 function parseDuration(text) {
   const match = /^(\d+(?:\.\d+)?)(s|m|h)?$/.exec(text);
@@ -61,6 +73,8 @@ export function parseLoopArgs(argv) {
       initial: { type: 'boolean' },
       phases: { type: 'string' },
       'max-rounds': { type: 'string' },
+      'no-judge': { type: 'boolean' },
+      'on-repeat': { type: 'string' },
       from: { type: 'string' },
       resume: { type: 'boolean' },
       note: { type: 'string' },
@@ -89,19 +103,30 @@ export function parseLoopArgs(argv) {
   if (maxRounds !== undefined && (!Number.isInteger(maxRounds) || maxRounds < 1)) {
     throw new Error('--max-rounds must be a positive integer');
   }
+  if (values['on-repeat'] !== undefined && !['stall', 'continue'].includes(values['on-repeat'])) {
+    throw new Error('--on-repeat must be stall or continue');
+  }
   const olderThanDays = values['older-than'] === undefined ? undefined : Number(values['older-than']);
   if (olderThanDays !== undefined && (!Number.isFinite(olderThanDays) || olderThanDays < 0)) {
     throw new Error('--older-than must be a non-negative number of days');
   }
   const heartbeatMinutes = values.heartbeat === undefined ? undefined : Number(values.heartbeat);
-  if (heartbeatMinutes !== undefined && (values.heartbeat.trim() === '' || !Number.isFinite(heartbeatMinutes) || heartbeatMinutes < 0)) {
+  if (
+    heartbeatMinutes !== undefined &&
+    (values.heartbeat.trim() === '' || !Number.isFinite(heartbeatMinutes) || heartbeatMinutes < 0)
+  ) {
     throw new Error('--heartbeat must be a non-negative number of minutes');
   }
   if (values.quiet && values['no-quiet']) {
     throw new Error('--quiet and --no-quiet are mutually exclusive');
   }
-  const watchOptionsUsed = values.repo !== undefined || values.interval !== undefined || values.once
-    || values.timeout !== undefined || values.only !== undefined || values.initial;
+  const watchOptionsUsed =
+    values.repo !== undefined ||
+    values.interval !== undefined ||
+    values.once ||
+    values.timeout !== undefined ||
+    values.only !== undefined ||
+    values.initial;
   if (command !== 'watch' && watchOptionsUsed) {
     throw new Error('--repo, --interval, --once, --timeout, --only, and --initial are only valid with watch');
   }
@@ -114,10 +139,18 @@ export function parseLoopArgs(argv) {
     throw new Error('--only must be status');
   }
   const [runName] = positionals;
-  if ((command !== 'watch' && positionals.length > 1) || (['status', 'inspect', 'replay', 'cancel'].includes(command) && !runName)) {
+  if (
+    (command !== 'watch' && positionals.length > 1) ||
+    (['status', 'inspect', 'replay', 'cancel'].includes(command) && !runName)
+  ) {
     throw new Error(`${command} requires exactly one run name`);
   }
-  if (command !== 'run' && command !== 'watch' && !['status', 'inspect', 'replay', 'cancel'].includes(command) && positionals.length) {
+  if (
+    command !== 'run' &&
+    command !== 'watch' &&
+    !['status', 'inspect', 'replay', 'cancel'].includes(command) &&
+    positionals.length
+  ) {
     throw new Error(`${command} does not accept positional arguments`);
   }
   return {
@@ -134,8 +167,15 @@ export function parseLoopArgs(argv) {
     effort: values.effort,
     overrideEngine: values['override-engine'],
     config: values.config,
-    phases: values.phases ? values.phases.split(',').map((phase) => phase.trim()).filter(Boolean) : undefined,
+    phases: values.phases
+      ? values.phases
+          .split(',')
+          .map((phase) => phase.trim())
+          .filter(Boolean)
+      : undefined,
     maxRounds,
+    noJudge: values['no-judge'],
+    onRepeat: values['on-repeat'],
     from: values.from,
     resume: values.resume,
     note: values.note,
@@ -174,7 +214,7 @@ export function usage() {
     '  cancel <name>           Stop a run and release its lock',
     '  clean                   Preview/remove completed runs older than 30 days',
     '  doctor                  Check configuration and local tooling',
-    '  watch [names...]        Stream run status/phase changes as NDJSON',
+    '  watch [names...]        Stream run status/phase/judge-decision changes as NDJSON',
     '  init                    Scaffold loop.config.mjs and .loop/prompts',
     '  run                     Start or resume a run (the default)',
     '',
@@ -194,7 +234,7 @@ export function usage() {
     '      --interval <secs>   Poll interval, at least 1 second (default: 15)',
     '      --once              Exit after the first non-snapshot event',
     '      --timeout <duration> Exit with code 2 after an idle timeout (e.g. 10m)',
-    '      --only status       Suppress phase-only events',
+    '      --only status       Suppress phase-only and judge decision events',
     '      --initial           Emit a snapshot of existing runs',
     '',
     'Init options:',
@@ -214,6 +254,8 @@ export function usage() {
     '      --config <path>     Load loop configuration from this file (also overrides saved config on resume)',
     '      --phases a,b,c      Override the configured phase list',
     '      --max-rounds <n>    Cap on review/repair rounds',
+    '      --no-judge          Disable a configured repeated-blocker judge for this run',
+    '      --on-repeat <action> Judge action: stall or continue',
     '      --from <phase>      Start at this phase (with --resume, re-run it even if complete)',
     '      --preset <name|path> Activate a bundled preset or external preset directory',
     '      --resume            Skip phases already recorded complete',
@@ -233,7 +275,7 @@ function writeWatchLine(output, event) {
   return new Promise((resolveWrite, rejectWrite) => {
     const line = `${JSON.stringify(event)}\n`;
     try {
-      output.write(line, (error) => error ? rejectWrite(error) : resolveWrite());
+      output.write(line, (error) => (error ? rejectWrite(error) : resolveWrite()));
       if (output.write.length < 2) resolveWrite();
     } catch (error) {
       rejectWrite(error);
@@ -300,7 +342,7 @@ export async function watchCommand(args, { cwd = process.cwd(), output = process
       }
       if (result.done) return 0;
       const event = result.value;
-      if (args.only === 'status' && event.type === 'phase') {
+      if (args.only === 'status' && (event.type === 'phase' || event.type === 'decision')) {
         next = iterator.next();
         continue;
       }
@@ -351,12 +393,29 @@ function printList(runs, output = console, includeMetrics = false) {
   if (includeMetrics) header.push('DURATION', 'TOKENS', 'COST');
   output.log(header.join('\t'));
   for (const run of runs) {
-    const row = [run.name, run.status, run.currentPhase ?? '-', run.branch ?? '-', run.updatedAt ?? run.startedAt ?? '-', run.prUrl ?? '-'];
+    const row = [
+      run.name,
+      run.status,
+      run.currentPhase ?? '-',
+      run.branch ?? '-',
+      run.updatedAt ?? run.startedAt ?? '-',
+      run.prUrl ?? '-',
+    ];
     if (includeMetrics && run.metrics) {
-      row.push(`${run.metrics.total.durationMs}ms`, formatMetric(run.metrics.total.tokens), formatMetric(run.metrics.total.cost));
+      row.push(
+        `${run.metrics.total.durationMs}ms`,
+        formatMetric(run.metrics.total.tokens),
+        formatMetric(run.metrics.total.cost),
+      );
     }
     output.log(row.join('\t'));
   }
+}
+
+// Judge stall reasons and review overrides; omitted when none occurred.
+function formatJudgeMetrics(judge) {
+  if (!judge?.repeatedBlockerStalls && !judge?.failedClosedStalls && !judge?.reviewOverrides) return null;
+  return `${judge.repeatedBlockerStalls} repeated-blocker stall(s), ${judge.failedClosedStalls} failed-closed stall(s), ${judge.reviewOverrides} review override(s)`;
 }
 
 /** @param {OperationalOutput} [output] */
@@ -365,6 +424,8 @@ function printMetricsLines(metrics, output = console) {
   output.log(`tokens   : ${formatMetric(metrics.total.tokens)}`);
   output.log(`cost     : ${formatMetric(metrics.total.cost)}`);
   output.log(`catch    : ${formatMetric(metrics.reviewer.catchRate)}`);
+  const judge = formatJudgeMetrics(metrics.judge);
+  if (judge) output.log(`stalls   : ${judge}`);
 }
 
 /** @param {OperationalOutput} [output] */
@@ -375,6 +436,17 @@ function printStatus(run, output = console, metrics = null) {
   output.log(`started  : ${run.phaseStartedAt ?? '-'}`);
   output.log(`verdict  : ${run.verdict ?? '-'}`);
   output.log(`gate     : ${run.gateStatus ?? '-'}`);
+  if (run.judge) {
+    const outcome = run.judge.failure
+      ? `failed: ${run.judge.failure}`
+      : run.judge.skipped
+        ? `skipped (${run.judge.skipped})`
+        : run.judge.repeated
+          ? `repeated${run.judge.action ? ` (${run.judge.action})` : ''}`
+          : 'not repeated';
+    output.log(`judge    : round ${run.judge.round ?? '-'} ${outcome}`);
+    if (run.judge.matchSummary) output.log(`matches  : ${run.judge.matchSummary}`);
+  }
   output.log(`branch   : ${run.branch ?? '-'}`);
   output.log(`updated  : ${run.updatedAt ?? run.startedAt ?? '-'}`);
   output.log(`PR       : ${run.prUrl ?? '-'}`);
@@ -389,6 +461,8 @@ function printAggregate(metrics, output = console) {
   output.log(`cost        : ${formatMetric(metrics.total.cost)}`);
   output.log(`convergence : ${formatMetric(metrics.convergence.convergenceRate)}`);
   output.log(`catch       : ${formatMetric(metrics.reviewer.catchRate)}`);
+  const judge = formatJudgeMetrics(metrics.judge);
+  if (judge) output.log(`stalls      : ${judge}`);
 }
 
 /** @param {OperationalOutput} [output] */
@@ -407,9 +481,31 @@ function printReplay(result, output = console) {
 function printInspect(run, output = console, metrics = null) {
   printStatus(run, output, metrics);
   output.log(`run dir  : ${run.runDir}`);
+  const settings = Object.entries(run.agentSettings ?? {});
+  if (settings.length) {
+    const width = Math.max(...settings.map(([phaseName]) => phaseName.length));
+    settings.forEach(([phaseName, agent], index) => {
+      const details = `${agent.name}${agent.agent ? ` agent: ${agent.agent}` : ''}${agent.model ? ` model=${agent.model}` : ''}${agent.effort ? ` effort=${agent.effort}` : ''}`;
+      output.log(`${index === 0 ? 'engines  :' : '          '} ${phaseName.padEnd(width)}  ${details}`);
+    });
+  }
   for (const phase of run.phases) {
     output.log(`\n[${phase.phase}] ${phase.status}`);
-    for (const field of ['inputSha', 'outputSha', 'promptHash', 'configHash', 'engine', 'verdict', 'gateReceipts', 'artifacts']) {
+    for (const field of [
+      'inputSha',
+      'outputSha',
+      'promptHash',
+      'configHash',
+      'engine',
+      'agentStatus',
+      'agentSource',
+      'verdict',
+      'gateReceipts',
+      'matchSummary',
+      'decision',
+      'failure',
+      'artifacts',
+    ]) {
       if (phase[field] !== undefined && phase[field] !== null) output.log(`${field} : ${JSON.stringify(phase[field])}`);
     }
   }
@@ -448,7 +544,8 @@ export async function runOperationalCommand(args, { cwd = process.cwd(), output 
   }
   if (args.command === 'replay') {
     const result = await replayRun(args.runName, options);
-    if (args.json) output.log(JSON.stringify(result, null, 2)); else printReplay(result, output);
+    if (args.json) output.log(JSON.stringify(result, null, 2));
+    else printReplay(result, output);
     return result;
   }
   if (args.command === 'metrics') {
@@ -473,9 +570,13 @@ export async function runOperationalCommand(args, { cwd = process.cwd(), output 
     });
     if (args.json) output.log(JSON.stringify(result, null, 2));
     else {
-      output.log(`${result.dryRun ? 'Would remove' : 'Removed'} ${result.dryRun ? result.candidates.length : result.removed.length} run(s).`);
-      for (const run of result.candidates) output.log(`  ${run.name} (${run.updatedAt ?? run.startedAt ?? 'unknown date'})`);
-      if (!args.yes && !args.dryRun && result.candidates.length) output.log('Preview only: rerun with --yes to remove these runs.');
+      output.log(
+        `${result.dryRun ? 'Would remove' : 'Removed'} ${result.dryRun ? result.candidates.length : result.removed.length} run(s).`,
+      );
+      for (const run of result.candidates)
+        output.log(`  ${run.name} (${run.updatedAt ?? run.startedAt ?? 'unknown date'})`);
+      if (!args.yes && !args.dryRun && result.candidates.length)
+        output.log('Preview only: rerun with --yes to remove these runs.');
       for (const error of result.errors) output.error?.(`  ${error.name}: ${error.error}`);
     }
     return result;
@@ -484,8 +585,12 @@ export async function runOperationalCommand(args, { cwd = process.cwd(), output 
     const result = await doctor(options);
     if (args.json) output.log(JSON.stringify(result, null, 2));
     else {
-      for (const check of result.checks) output.log(`${check.ok ? '✓' : '✗'} ${check.name}: ${check.detail}`);
-      output.log(result.ok ? 'Doctor: OK' : 'Doctor: problems found');
+      for (const check of result.checks) {
+        output.log(`${check.warn ? '⚠' : check.ok ? '✓' : '✗'} ${check.name}: ${check.detail}`);
+        if (check.hint) output.log(`  → ${check.hint}${check.docs ? ` (${check.docs})` : ''}`);
+      }
+      const warnings = result.checks.filter((check) => check.warn).length;
+      output.log(result.ok ? `Doctor: OK${warnings ? ` (${warnings} warnings)` : ''}` : 'Doctor: problems found');
     }
     return result;
   }
@@ -518,14 +623,18 @@ if (isMainEntrypoint(import.meta.url)) {
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
       try {
-        process.exitCode = await watchCommand(args, { cwd: process.cwd(), output: process.stdout, signal: controller.signal });
+        process.exitCode = await watchCommand(args, {
+          cwd: process.cwd(),
+          output: process.stdout,
+          signal: controller.signal,
+        });
       } finally {
         process.removeListener('SIGINT', stop);
         process.removeListener('SIGTERM', stop);
       }
     } else {
       const result = await runOperationalCommand(args);
-      if (args.command === 'doctor' && !(/** @type {any} */ (result)).ok) process.exitCode = 1;
+      if (args.command === 'doctor' && !(/** @type {any} */ (result).ok)) process.exitCode = 1;
     }
   } catch (error) {
     console.error(error.message);

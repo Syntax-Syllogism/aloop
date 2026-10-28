@@ -55,12 +55,8 @@ prose or your stdout.
 {
   "verdict": "APPROVED | CHANGES_REQUESTED",
   "summary": "one line",
-  "blocking": [
-    { "file": "src/x.ts", "line": 42, "issue": "what is wrong and what to do" }
-  ],
-  "nits": [
-    { "file": "src/y.ts", "line": 7, "issue": "..." }
-  ]
+  "blocking": [{ "file": "src/x.ts", "line": 42, "issue": "what is wrong and what to do" }],
+  "nits": [{ "file": "src/y.ts", "line": 7, "issue": "..." }]
 }
 ```
 

@@ -13,6 +13,8 @@ Every real run saves durable artefacts in `.loop/runs/<slug>/` in the source rep
 
 - the run identity and completed phases;
 - review-loop progress;
+- cached repeated-blocker `judgements` keyed by verdict phase and round, including the reviewed SHA and decision;
+- `unresolvedFindings` when an operator selected the recorded repeated-blockers override;
 - the resolved branch and worktree;
 - the chosen prompt preset and the directory its paths were resolved from;
 - anything else needed to resume the same run.
@@ -21,7 +23,11 @@ A saved preset is reused on `--resume`, and a conflicting `--preset` is rejected
 
 `currentPhase` and `phaseStartedAt` record the phase or sub-phase most recently entered and its UTC start time. The runner updates them before each top-level phase, review agent, repair agent, or gate attempt starts. They stay in state after completion, a stall, or a crash, so the last active phase remains visible. Older runs without these fields fall back to the last non-skipped manifest entry. That entry is the last phase completed or stalled, which may not be the one running now, and its `phaseStartedAt` is `null`.
 
+Named-agent settings round-trip through saved `agentSettings`. Agent manifest entries include `engine.agent` and `agentStatus` (`native`, `confirmed`, `unconfirmed`, `inline`, `unresolved`, `unsupported`). Inline entries record `agentSource: { path, hash }`; their prompt hashes and replay inputs include the role prefix. See [Named agents](agents.md).
+
 **`manifest.json`** records the resolved task, branch, repository, and worktree once planning is done, then one entry per phase invocation. Logs, verdicts, and repair responses are stored beside it. The `pr-description` phase writes `pr.md` in the run directory. A successful `publish` phase records the verified PR URL and metadata in the manifest and state. The manifest points to `snapshot.json`.
+
+Judge decisions, including skipped ones, are manifest entries with role `judge`. An invoked judge's entry includes the transport, decision, duration, and any failure. See [Repeated-blocker judge](judge.md#observability). A `review-override` entry records the exceptional `repeated-blockers` continuation and the exact unresolved findings. Cached judgements let an unchanged resume re-stall without invoking a decision model again.
 
 **`snapshot.json`** is the immutable record of how the run started. It stores the base revision, resolved configuration, gate definitions, environment, and engine versions. Its `promptHashes` field points to `manifest.json` with the selector `phases[*].promptHash`. That ties the snapshot to the hash of every prompt actually rendered, including repairs and later review rounds. New agent entries also keep the prompt template body, interpolation variables, and any operator note next to their hash. This lets `aloop replay` re-render and verify a recorded prompt without calling an engine. Older entries stay inspectable, but their prompts are unverifiable.
 

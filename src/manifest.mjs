@@ -42,9 +42,10 @@ export function hashText(text) {
 const DISPLAY_ONLY_KEYS = ['quiet', 'heartbeatMinutes'];
 
 export function hashConfig(config) {
-  const hashed = config && typeof config === 'object' && !Array.isArray(config)
-    ? Object.fromEntries(Object.entries(config).filter(([key]) => !DISPLAY_ONLY_KEYS.includes(key)))
-    : config;
+  const hashed =
+    config && typeof config === 'object' && !Array.isArray(config)
+      ? Object.fromEntries(Object.entries(config).filter(([key]) => !DISPLAY_ONLY_KEYS.includes(key)))
+      : config;
   return sha256(JSON.stringify(canonicalize(hashed)));
 }
 

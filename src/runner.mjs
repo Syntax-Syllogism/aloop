@@ -5,6 +5,7 @@
 
 import { stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { describeJudgeEntry, judgeBlockers, readResponse } from './judge.mjs';
 import { codePhasePostcondition, hasPostcondition, phaseIsSkippable, publishingAttestation } from './policy.mjs';
 import { banner, confirm, log } from './reporter.mjs';
 import { APPROVED, CHANGES_REQUESTED, formatFindings, readVerdict } from './verdict.mjs';
@@ -57,6 +58,51 @@ async function clearPendingRepair(phase, state) {
   await state.record({ pendingRepairs });
 }
 
+function previousBlocking(state, phase, round) {
+  const entry = state.manifest.entries.findLast(
+    (candidate) =>
+      candidate.phase === phase.name &&
+      candidate.round === round &&
+      candidate.verdict?.blocking &&
+      (!candidate.reviewGroup || candidate.aggregate),
+  );
+  return entry?.verdict?.blocking ?? null;
+}
+
+function formatJudgeMatches(decision, current, previous) {
+  if (!decision.matches?.length) return '(none)';
+  return decision.matches
+    .map((match) => {
+      const currentFinding = current[Number(String(match.current).replace(/^c/, ''))];
+      const previousFinding = previous[Number(String(match.previous).replace(/^p/, ''))];
+      return `${formatFindings([currentFinding]).replace(/^1\. /, '')} ↔ ${formatFindings([previousFinding]).replace(/^1\. /, '')}${match.probability === undefined ? '' : ` (${match.probability})`}`;
+    })
+    .join('\n');
+}
+
+async function judgeVerdict(phase, ctx, { round, reviewedSha, previous, current }) {
+  const cached = ctx.state.data.judgements?.[phase.name]?.[round];
+  if (cached?.reviewedSha === reviewedSha) return cached;
+  const response = await readResponse(join(ctx.state.dir, `response-round-${round - 1}.md`));
+  const decision = await judgeBlockers(ctx.config.judge, { phase: phase.name, round, previous, current, response });
+  if (decision.skipped) return decision;
+  const judgement = { reviewedSha, ...decision };
+  await ctx.state.record({
+    judgements: {
+      ...ctx.state.data.judgements,
+      [phase.name]: { ...(ctx.state.data.judgements?.[phase.name] ?? {}), [round]: judgement },
+    },
+  });
+  return judgement;
+}
+
+// Judge decisions and review overrides are both persisted (so `aloop watch`
+// and metrics can derive them) and logged as one structured line.
+async function recordJudgeEntry(recordManifest, ctx, entry) {
+  await recordManifest(ctx, entry);
+  log(`  ${describeJudgeEntry(entry)}`);
+}
+
 function requiresCommitBaseline(phase) {
   return hasPostcondition(phase, 'head-advanced') || hasPostcondition(phase, 'head-advanced-or-rebuttal');
 }
@@ -71,9 +117,9 @@ async function phaseHeadBefore(phase, ctx) {
 }
 
 async function invalidateGateCompletion(state, reviewedSha) {
-  const gate = state.manifest.entries.findLast((entry) => entry.role === 'gate'
-    && entry.status === 'completed'
-    && entry.outputSha === reviewedSha);
+  const gate = state.manifest.entries.findLast(
+    (entry) => entry.role === 'gate' && entry.status === 'completed' && entry.outputSha === reviewedSha,
+  );
   if (!gate || !state.data.completed.includes(gate.phase)) return;
   await state.record({ completed: state.data.completed.filter((name) => name !== gate.phase) });
 }
@@ -107,9 +153,7 @@ async function invalidateFollowingPhaseState(state, phases, phaseName) {
 }
 
 async function runRepairs(phase, ctx, baseVariables, pending, operations, { retainCheckpoint = false } = {}) {
-  const {
-    budgetStatus, manifestEntry, recordBudgetStall, recordManifest, runAgent, runGate, withRetries,
-  } = operations;
+  const { budgetStatus, manifestEntry, recordBudgetStall, recordManifest, runAgent, runGate, withRetries } = operations;
   let gateOk = pending.gateOk ?? true;
   let gateFailure = pending.gateFailure ?? null;
   for (let index = pending.nextRepair; index < phase.repair.length; index += 1) {
@@ -138,18 +182,21 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations, { reta
         const result = await withRetries(repair, () => runGate(repair, ctx), { failed: (attempt) => !attempt.ok });
         gateOk = result.ok;
         gateFailure = result.ok ? null : `${result.command}\n${result.output}`;
-        await recordManifest(ctx, manifestEntry(repair, ctx, {
-          inputSha,
-          outputSha: await ctx.git.revParse(),
-          round: pending.round,
-          artifacts: [`${repair.name}.log`],
-          gateReceipts: result.gateReceipts,
-          execution: result.execution,
-          startedAt,
-          completedAt: new Date().toISOString(),
-          durationMs: result.durationMs,
-          status: result.ok ? 'completed' : 'stalled',
-        }));
+        await recordManifest(
+          ctx,
+          manifestEntry(repair, ctx, {
+            inputSha,
+            outputSha: await ctx.git.revParse(),
+            round: pending.round,
+            artifacts: [`${repair.name}.log`],
+            gateReceipts: result.gateReceipts,
+            execution: result.execution,
+            startedAt,
+            completedAt: new Date().toISOString(),
+            durationMs: result.durationMs,
+            status: result.ok ? 'completed' : 'stalled',
+          }),
+        );
       }
     } else {
       const headBefore = await phaseHeadBefore(repair, ctx);
@@ -168,15 +215,16 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations, { reta
           const outputSha = await ctx.git.revParse();
           const responsePath = join(ctx.state.dir, `response-round-${pending.round}.md`);
           await ctx.state.clearBaseline(repair.name);
-          await recordManifest(ctx, manifestEntry(repair, ctx, {
-            inputSha: resumeBaseline,
-            outputSha,
-            round: pending.round,
-            artifacts: [
-              ...(await fileExists(responsePath) ? [`response-round-${pending.round}.md`] : []),
-            ],
-            status: 'completed',
-          }));
+          await recordManifest(
+            ctx,
+            manifestEntry(repair, ctx, {
+              inputSha: resumeBaseline,
+              outputSha,
+              round: pending.round,
+              artifacts: [...((await fileExists(responsePath)) ? [`response-round-${pending.round}.md`] : [])],
+              status: 'completed',
+            }),
+          );
           await ctx.state.record({
             pendingRepairs: {
               ...ctx.state.data.pendingRepairs,
@@ -186,18 +234,19 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations, { reta
           continue;
         }
       }
-      const repairCtx = ctx.note?.targetPhase === phase.name
-        ? { ...ctx, note: { ...ctx.note, repairPhase: repair.name } }
-        : ctx;
-      const result = await withRetries(repair, () => runAgent(repair, repairCtx, {
-        ...baseVariables,
-        ROUND: pending.round,
-        MAX_ROUNDS: phase.maxRounds,
-        VERDICT_FILE: ctx.state.verdictPath(pending.round),
-        FINDINGS: formatFindings(pending.verdict?.blocking ?? []),
-        SINCE_SHA: pending.reviewedSha,
-        GATE_STATUS: gateOk ? 'passing' : `FAILING\n${gateFailure}`,
-      }));
+      const repairCtx =
+        ctx.note?.targetPhase === phase.name ? { ...ctx, note: { ...ctx.note, repairPhase: repair.name } } : ctx;
+      const result = await withRetries(repair, () =>
+        runAgent(repair, repairCtx, {
+          ...baseVariables,
+          ROUND: pending.round,
+          MAX_ROUNDS: phase.maxRounds,
+          VERDICT_FILE: ctx.state.verdictPath(pending.round),
+          FINDINGS: formatFindings(pending.verdict?.blocking ?? []),
+          SINCE_SHA: pending.reviewedSha,
+          GATE_STATUS: gateOk ? 'passing' : `FAILING\n${gateFailure}`,
+        }),
+      );
       const stalledReason = await codePhasePostcondition(repair, ctx, {
         hasFindings: pending.verdict?.blocking?.length > 0,
         headBefore,
@@ -207,7 +256,7 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations, { reta
         const responsePath = join(ctx.state.dir, `response-round-${pending.round}.md`);
         const artifacts = [
           ...result.manifest.artifacts,
-          ...(await fileExists(responsePath) ? [`response-round-${pending.round}.md`] : []),
+          ...((await fileExists(responsePath)) ? [`response-round-${pending.round}.md`] : []),
         ];
         await recordManifest(ctx, {
           ...result.manifest,
@@ -238,18 +287,21 @@ async function runGateAttempt(phase, ctx, operations, options = {}) {
   const startedAt = new Date().toISOString();
   const inputSha = await ctx.git.revParse();
   const result = await withRetries(phase, () => runGate(phase, ctx), { failed: (attempt) => !attempt.ok });
-  await recordManifest(ctx, manifestEntry(phase, ctx, {
-    inputSha,
-    outputSha: await ctx.git.revParse(),
-    artifacts: [`${phase.name}.log`],
-    gateReceipts: result.gateReceipts,
-    execution: result.execution,
-    startedAt,
-    completedAt: new Date().toISOString(),
-    durationMs: result.durationMs,
-    status: result.ok ? 'completed' : 'stalled',
-    ...(round === undefined ? {} : { round }),
-  }));
+  await recordManifest(
+    ctx,
+    manifestEntry(phase, ctx, {
+      inputSha,
+      outputSha: await ctx.git.revParse(),
+      artifacts: [`${phase.name}.log`],
+      gateReceipts: result.gateReceipts,
+      execution: result.execution,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      durationMs: result.durationMs,
+      status: result.ok ? 'completed' : 'stalled',
+      ...(round === undefined ? {} : { round }),
+    }),
+  );
   return result;
 }
 
@@ -267,7 +319,12 @@ async function runGateRepairLoop(phase, ctx, variables, operations) {
       };
       const repairResult = await runRepairs(phase, ctx, variables, pending, operations, { retainCheckpoint: true });
       if (repairResult.stalled) {
-        return { result, stalled: repairResult.stalled, stalledPhase: repairResult.stalledPhase, budgetStall: repairResult.budgetStall };
+        return {
+          result,
+          stalled: repairResult.stalled,
+          stalledPhase: repairResult.stalledPhase,
+          budgetStall: repairResult.budgetStall,
+        };
       }
       // The checkpoint's repairs have completed, so re-gate deliberately before
       // deciding whether another repair round is needed.
@@ -309,6 +366,39 @@ async function runGateRepairLoop(phase, ctx, variables, operations) {
 async function runVerdictLoop(phase, ctx, baseVariables, operations) {
   const { budgetStatus, recordBudgetStall, recordManifest, runAgent, withRetries } = operations;
   const resumePoint = reviewResumePoint(ctx.state, phase, ctx.resume);
+  const pending = resumePoint.pending;
+  const cached = pending && ctx.state.data.judgements?.[phase.name]?.[pending.round];
+  if (
+    pending &&
+    ctx.config.judge?.onRepeat === 'continue' &&
+    cached?.reviewedSha === pending.reviewedSha &&
+    cached.repeated === true
+  ) {
+    const output = formatJudgeMatches(
+      cached,
+      pending.verdict.blocking,
+      previousBlocking(ctx.state, phase, pending.round - 1) ?? [],
+    );
+    await recordJudgeEntry(recordManifest, ctx, {
+      ...operations.manifestEntry(phase, ctx, { inputSha: pending.reviewedSha, outputSha: pending.reviewedSha }),
+      role: 'judge',
+      round: pending.round,
+      status: 'completed',
+      judge: cached.judge,
+      decision: cached,
+      action: 'continue',
+      matchSummary: output,
+    });
+    await clearPendingRepair(phase, ctx.state);
+    return {
+      verdict: CHANGES_REQUESTED,
+      rounds: pending.round,
+      override: 'repeated-blockers',
+      unresolved: pending.verdict.blocking,
+      sha: pending.reviewedSha,
+      output,
+    };
+  }
   if (resumePoint.atCap) {
     return { verdict: CHANGES_REQUESTED, rounds: phase.maxRounds, stalled: 'round cap reached' };
   }
@@ -335,12 +425,18 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
   } else if (resumePoint.resumed) {
     const legacyGate = phase.repair.find((repair) => repair.kind === 'gate' && repair.recheck);
     if (legacyGate) {
-      const result = await runRepairs(phase, ctx, baseVariables, {
-        round: round - 1,
-        reviewedSha: sinceSha,
-        verdict: { blocking: [] },
-        nextRepair: phase.repair.indexOf(legacyGate),
-      }, operations);
+      const result = await runRepairs(
+        phase,
+        ctx,
+        baseVariables,
+        {
+          round: round - 1,
+          reviewedSha: sinceSha,
+          verdict: { blocking: [] },
+          nextRepair: phase.repair.indexOf(legacyGate),
+        },
+        operations,
+      );
       gateOk = result.gateOk;
       gateFailure = result.gateFailure;
       if (result.stalled) {
@@ -375,9 +471,8 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
     for (const reviewer of reviewers) {
       await ctx.state.enterPhase(reviewer.name);
       const suffix = reviewer === phase ? '' : `-${reviewer.name}`;
-      const verdictPath = reviewer === phase
-        ? ctx.state.verdictPath(round)
-        : join(ctx.state.dir, `verdict${suffix}-round-${round}.json`);
+      const verdictPath =
+        reviewer === phase ? ctx.state.verdictPath(round) : join(ctx.state.dir, `verdict${suffix}-round-${round}.json`);
       const reviewFile = `review${suffix}-round-${round}.md`;
       const attempt = await withRetries(reviewer, async () => {
         if (!ctx.dryRun) await clearVerdict(verdictPath);
@@ -399,13 +494,18 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
       const reviewedSha = agentResult.manifest.outputSha;
       const reviewStatusAfter = await ctx.git.status();
       if (reviewInputSha !== reviewedSha || reviewStatusBefore !== reviewStatusAfter) {
-        const reason = reviewInputSha !== reviewedSha
-          ? `review phase advanced HEAD from ${reviewInputSha} to ${reviewedSha}; review changes must be gated and reviewed in a later round`
-          : 'review phase changed files in the worktree; review must leave the worktree unchanged';
+        const reason =
+          reviewInputSha !== reviewedSha
+            ? `review phase advanced HEAD from ${reviewInputSha} to ${reviewedSha}; review changes must be gated and reviewed in a later round`
+            : 'review phase changed files in the worktree; review must leave the worktree unchanged';
         if (reviewInputSha !== reviewedSha) await invalidateGateCompletion(ctx.state, reviewInputSha);
         await recordManifest(ctx, { ...agentResult.manifest, status: 'stalled', failure: { reason } });
-        return { verdict: CHANGES_REQUESTED, rounds: round, stalled: reason,
-          output: `review input SHA: ${reviewInputSha}\nreview output SHA: ${reviewedSha}` };
+        return {
+          verdict: CHANGES_REQUESTED,
+          rounds: round,
+          stalled: reason,
+          output: `review input SHA: ${reviewInputSha}\nreview output SHA: ${reviewedSha}`,
+        };
       }
       await recordManifest(ctx, {
         ...agentResult.manifest,
@@ -413,7 +513,7 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
         ...(reviewers.length > 1 ? { reviewGroup: phase.name } : {}),
         artifacts: [
           ...agentResult.manifest.artifacts,
-          ...(await fileExists(join(ctx.state.dir, reviewFile)) ? [reviewFile] : []),
+          ...((await fileExists(join(ctx.state.dir, reviewFile))) ? [reviewFile] : []),
           reviewer === phase ? `verdict-round-${round}.json` : `verdict${suffix}-round-${round}.json`,
         ],
         verdict: { ...roleVerdict, sha: reviewedSha },
@@ -422,15 +522,23 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
     }
     if (ctx.dryRun) return { verdict: APPROVED, rounds: round, dryRun: true };
     const reviewedSha = results[0].sha;
-    const blocking = results.flatMap(({ reviewer, verdict: roleVerdict }) => roleVerdict.blocking.map((finding) => ({
-      ...finding, issue: `[${reviewer}] ${finding.issue ?? finding.summary}`,
-    })));
-    const verdict = results.length === 1 ? results[0].verdict : {
-      verdict: blocking.length ? CHANGES_REQUESTED : APPROVED,
-      blocking,
-      nits: results.flatMap(({ verdict: roleVerdict }) => roleVerdict.nits ?? []),
-      summary: results.map(({ reviewer, verdict: roleVerdict }) => `${reviewer}: ${roleVerdict.verdict}`).join('; '),
-    };
+    const blocking = results.flatMap(({ reviewer, verdict: roleVerdict }) =>
+      roleVerdict.blocking.map((finding) => ({
+        ...finding,
+        issue: `[${reviewer}] ${finding.issue ?? finding.summary}`,
+      })),
+    );
+    const verdict =
+      results.length === 1
+        ? results[0].verdict
+        : {
+            verdict: blocking.length ? CHANGES_REQUESTED : APPROVED,
+            blocking,
+            nits: results.flatMap(({ verdict: roleVerdict }) => roleVerdict.nits ?? []),
+            summary: results
+              .map(({ reviewer, verdict: roleVerdict }) => `${reviewer}: ${roleVerdict.verdict}`)
+              .join('; '),
+          };
     if (results.length > 1) {
       await recordManifest(ctx, {
         ...operations.manifestEntry(phase, ctx, { inputSha: reviewedSha, outputSha: reviewedSha }),
@@ -466,6 +574,76 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
     await ctx.state.record(reviewState);
     sinceSha = reviewedSha;
     log(`\n  verdict: ${verdict.verdict}${verdict.summary ? ` — ${verdict.summary}` : ''}`);
+
+    if (verdict.verdict === CHANGES_REQUESTED && round >= 2 && ctx.config.judge && phase.repair.length) {
+      const judgeEntry = (details) => ({
+        ...operations.manifestEntry(phase, ctx, { inputSha: reviewedSha, outputSha: reviewedSha }),
+        role: 'judge',
+        round,
+        ...details,
+      });
+      const previous = previousBlocking(ctx.state, phase, round - 1);
+      if (!previous?.length) {
+        await recordJudgeEntry(
+          recordManifest,
+          ctx,
+          judgeEntry({ status: 'completed', decision: { skipped: 'no previous blocking findings' } }),
+        );
+      } else {
+        try {
+          const decision = await judgeVerdict(phase, ctx, { round, reviewedSha, previous, current: verdict.blocking });
+          if (decision.skipped) {
+            await recordJudgeEntry(
+              recordManifest,
+              ctx,
+              judgeEntry({ status: 'completed', decision: { skipped: decision.skipped } }),
+            );
+          } else {
+            await recordJudgeEntry(
+              recordManifest,
+              ctx,
+              judgeEntry({
+                status: 'completed',
+                judge: decision.judge,
+                decision,
+                action: decision.repeated ? ctx.config.judge.onRepeat : 'keep going',
+                matchSummary: formatJudgeMatches(decision, verdict.blocking, previous),
+              }),
+            );
+            if (decision.repeated) {
+              const output = formatJudgeMatches(decision, verdict.blocking, previous);
+              if (ctx.config.judge.onRepeat === 'continue') {
+                await clearPendingRepair(phase, ctx.state);
+                return {
+                  verdict: CHANGES_REQUESTED,
+                  rounds: round,
+                  override: 'repeated-blockers',
+                  unresolved: verdict.blocking,
+                  sha: reviewedSha,
+                  output,
+                };
+              }
+              return {
+                verdict: CHANGES_REQUESTED,
+                rounds: round,
+                stalled: 'repeated blockers',
+                findings: verdict.blocking,
+                output,
+              };
+            }
+          }
+        } catch (error) {
+          const reason = error.message ?? String(error);
+          await recordJudgeEntry(recordManifest, ctx, judgeEntry({ status: 'stalled', failure: { reason } }));
+          return {
+            verdict: CHANGES_REQUESTED,
+            rounds: round,
+            stalled: `judge failed: ${reason}. Start the judge (see docs/loop.md#repeated-blocker-judge) or resume with --no-judge.`,
+            findings: verdict.blocking,
+          };
+        }
+      }
+    }
 
     if (verdict.verdict === APPROVED && gateOk) return { verdict: APPROVED, rounds: round };
     if (verdict.verdict === APPROVED && !gateOk) {
@@ -511,12 +689,30 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
  * }} input
  */
 export async function runPhases({
-  args, config, state, ctx, variables, summary, remote, branch, baseBranch,
-  confirmInput, terminalOpener, operations,
+  args,
+  config,
+  state,
+  ctx,
+  variables,
+  summary,
+  remote,
+  branch,
+  baseBranch,
+  confirmInput,
+  terminalOpener,
+  operations,
 }) {
   const {
-    budgetStatus, markBudgetExhaustedComplete, manifestEntry, markStalledManifest,
-    recordBudgetStall, recordManifest, runAgent, runGate, runPublish, withRetries,
+    budgetStatus,
+    markBudgetExhaustedComplete,
+    manifestEntry,
+    markStalledManifest,
+    recordBudgetStall,
+    recordManifest,
+    runAgent,
+    runGate,
+    runPublish,
+    withRetries,
   } = operations;
   let startIndex = 0;
   if (args.from) {
@@ -525,9 +721,9 @@ export async function runPhases({
   }
 
   const phasesToRun = config.resolvedPhases.slice(startIndex);
-  const noteTarget = args.from ?? (args.resume
-    ? phasesToRun.find((phase) => !state.isComplete(phase.name))?.name
-    : phasesToRun[0]?.name);
+  const noteTarget =
+    args.from ??
+    (args.resume ? phasesToRun.find((phase) => !state.isComplete(phase.name))?.name : phasesToRun[0]?.name);
   if (ctx.note) {
     const target = config.resolvedPhases.find((phase) => phase.name === noteTarget);
     if (!target) throw new Error('--note needs a phase to run; use --from to target a completed phase.');
@@ -571,7 +767,10 @@ export async function runPhases({
         if (answer === 'yes') break;
         if (answer === 'quit') {
           await recordManifest(ctx, manifestEntry(phase, ctx, { status: 'stalled' }));
-          summary.stalled = { phase: phase.name, reason: refusedRequiredSkip ? 'required phase not run (skipped by user)' : 'stopped by user' };
+          summary.stalled = {
+            phase: phase.name,
+            reason: refusedRequiredSkip ? 'required phase not run (skipped by user)' : 'stopped by user',
+          };
           break;
         }
         if (phaseIsSkippable(phase)) {
@@ -599,30 +798,56 @@ export async function runPhases({
         log('  worktree is not clean; refusing to run this phase over uncommitted changes.');
         const sha = await ctx.git.revParse();
         await recordManifest(ctx, manifestEntry(phase, ctx, { inputSha: sha, outputSha: sha, status: 'stalled' }));
-        summary.stalled = { phase: phase.name, reason: 'worktree has uncommitted changes; a publishing phase must run on a clean tree', output: pending };
+        summary.stalled = {
+          phase: phase.name,
+          reason: 'worktree has uncommitted changes; a publishing phase must run on a clean tree',
+          output: pending,
+        };
         break;
       }
       if (phase.kind === 'publish') {
         const currentSha = await ctx.git.revParse();
         const attestation = publishingAttestation(state, currentSha);
-        if (attestation) {
+        if (attestation && !attestation.overridden) {
           log(`  ${attestation.reason}; refusing to publish.`);
-          await recordManifest(ctx, manifestEntry(phase, ctx, { inputSha: currentSha, outputSha: currentSha, approvedSha: attestation.approvedSha, status: 'stalled' }));
-          summary.stalled = { phase: phase.name, reason: attestation.reason, output: `approved SHA: ${attestation.approvedSha ?? '(none)'}\ncurrent HEAD: ${attestation.currentSha}` };
+          await recordManifest(
+            ctx,
+            manifestEntry(phase, ctx, {
+              inputSha: currentSha,
+              outputSha: currentSha,
+              approvedSha: attestation.approvedSha,
+              status: 'stalled',
+            }),
+          );
+          summary.stalled = {
+            phase: phase.name,
+            reason: attestation.reason,
+            output: `approved SHA: ${attestation.approvedSha ?? '(none)'}\ncurrent HEAD: ${attestation.currentSha}`,
+          };
           break;
         }
+        if (attestation?.overridden) log('  publishing with unresolved review findings (override: repeated-blockers)');
       }
     }
     if (phase.kind === 'publish') {
       if (ctx.dryRun) {
-        log(`  would push ${remote}/${branch} and create a ${ctx.config.publish.draft ? 'draft ' : ''}PR to ${baseBranch}`);
+        log(
+          `  would push ${remote}/${branch} and create a ${ctx.config.publish.draft ? 'draft ' : ''}PR to ${baseBranch}`,
+        );
         continue;
       }
       const approvedSha = await ctx.git.revParse();
-      const result = await withRetries(phase, () => runPublish(phase, ctx, { remote, branch, base: baseBranch, approvedSha }), { failed: (attempt) => !attempt.ok });
+      const result = await withRetries(
+        phase,
+        () => runPublish(phase, ctx, { remote, branch, base: baseBranch, approvedSha }),
+        { failed: (attempt) => !attempt.ok },
+      );
       await recordManifest(ctx, result.manifest);
       if (!result.ok) {
-        summary.stalled = { phase: phase.name, reason: `publish failed: ${result.failure?.message ?? 'unverified publish result'}` };
+        summary.stalled = {
+          phase: phase.name,
+          reason: `publish failed: ${result.failure?.message ?? 'unverified publish result'}`,
+        };
         break;
       }
       summary.prUrl = result.result.pullRequest.url;
@@ -652,7 +877,11 @@ export async function runPhases({
           break;
         }
         if (!repaired.result.ok) {
-          summary.stalled = { phase: phase.name, reason: `gate failed: ${repaired.result.command}`, output: repaired.result.output };
+          summary.stalled = {
+            phase: phase.name,
+            reason: `gate failed: ${repaired.result.command}`,
+            output: repaired.result.output,
+          };
           break;
         }
       } else {
@@ -680,8 +909,26 @@ export async function runPhases({
       summary.phases.push({ name: phase.name, rounds: result.rounds, verdict: result.verdict });
       if (result.stalled) {
         if (!result.budgetStall) await markStalledManifest(ctx, phase, result, manifestStart);
-        summary.stalled = { phase: result.stalledPhase ?? phase.name, reason: result.stalled, findings: result.findings, rounds: result.rounds, output: result.output };
+        summary.stalled = {
+          phase: result.stalledPhase ?? phase.name,
+          reason: result.stalled,
+          findings: result.findings,
+          rounds: result.rounds,
+          output: result.output,
+        };
         break;
+      }
+      if (result.override === 'repeated-blockers') {
+        await recordJudgeEntry(recordManifest, ctx, {
+          ...manifestEntry(phase, ctx, { inputSha: result.sha, outputSha: result.sha }),
+          role: 'review-override',
+          round: result.rounds,
+          status: 'completed',
+          reason: result.override,
+          findings: result.unresolved,
+        });
+        await state.record({ unresolvedFindings: result.unresolved });
+        variables.UNRESOLVED_FINDINGS = formatFindings(result.unresolved);
       }
       if (isFinalPhase) {
         const budget = budgetStatus(ctx);
@@ -700,11 +947,14 @@ export async function runPhases({
       if (!stalledReason) {
         const outputSha = await ctx.git.revParse();
         log(`  ${phase.name} already satisfies its commit postcondition; skipping agent on resume`);
-        await recordManifest(ctx, manifestEntry(phase, ctx, {
-          inputSha: headBefore,
-          outputSha,
-          status: 'completed',
-        }));
+        await recordManifest(
+          ctx,
+          manifestEntry(phase, ctx, {
+            inputSha: headBefore,
+            outputSha,
+            status: 'completed',
+          }),
+        );
         await state.markComplete(phase.name);
         summary.phases.push({ name: phase.name, ok: true });
         continue;

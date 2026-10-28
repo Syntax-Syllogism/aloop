@@ -1,6 +1,7 @@
 /** @typedef {import('./types.js').Adapter} Adapter */
 /** @typedef {import('./types.js').Config} Config */
 /** @typedef {import('./types.js').Engine} Engine */
+/** @typedef {import('./types.js').PhaseDescriptor} PhaseDescriptor */
 
 /**
  * Engine adapters.
@@ -275,7 +276,11 @@ export function createJsonlRenderer(renderEvent) {
       .find((value) => Number.isFinite(value));
     if (tokenValues.length || cost !== undefined) {
       usage = {
-        ...(tokenValues.length ? { tokens: tokenValues.at(-1) } : usage?.tokens !== undefined ? { tokens: usage.tokens } : {}),
+        ...(tokenValues.length
+          ? { tokens: tokenValues.at(-1) }
+          : usage?.tokens !== undefined
+            ? { tokens: usage.tokens }
+            : {}),
         ...(cost !== undefined ? { cost } : usage?.cost !== undefined ? { cost: usage.cost } : {}),
       };
     }
@@ -317,9 +322,16 @@ export function passthroughRenderer() {
 /** @type {Adapter} */
 const claudeAdapter = {
   name: 'claude',
+  agentSupport: 'native',
   version: cliVersion('claude'),
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-  command({ prompt, addDirs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
+  command({
+    prompt,
+    addDirs,
+    permissions,
+    artifactOnly = false,
+    agent = /** @type {import('./types.js').Agent} */ ({}),
+  }) {
     // `auto`, not `acceptEdits`, is used for worktree-writing and
     // artifact-only phases: under acceptEdits a non-interactive `-p` run
     // auto-denies every Bash call, because there is no one to answer the
@@ -332,6 +344,7 @@ const claudeAdapter = {
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const permissionMode = canWrite ? 'auto' : 'plan';
     const args = ['-p', prompt, '--permission-mode', permissionMode, '--output-format', 'stream-json', '--verbose'];
+    if (agent.agent) args.push('--agent', agent.agent);
     if (agent.model) args.push('--model', agent.model);
     if (agent.effort) args.push('--effort', agent.effort);
     for (const dir of addDirs) args.push('--add-dir', dir);
@@ -343,9 +356,17 @@ const claudeAdapter = {
 /** @type {Adapter} */
 const codexAdapter = {
   name: 'codex',
+  agentSupport: 'inline',
   version: cliVersion('codex'),
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-  command({ prompt, cwd, addDirs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
+  command({
+    prompt,
+    cwd,
+    addDirs,
+    permissions,
+    artifactOnly = false,
+    agent = /** @type {import('./types.js').Agent} */ ({}),
+  }) {
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const sandbox = canWrite ? 'workspace-write' : 'read-only';
     const args = ['exec', prompt, '--sandbox', sandbox, '--cd', cwd];
@@ -359,9 +380,17 @@ const codexAdapter = {
 /** @type {Adapter} */
 const agyAdapter = {
   name: 'agy',
+  agentSupport: 'native',
   version: cliVersion('agy'),
   efforts: ['low', 'medium', 'high'],
-  command({ prompt, addDirs, timeoutMs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
+  command({
+    prompt,
+    addDirs,
+    timeoutMs,
+    permissions,
+    artifactOnly = false,
+    agent = /** @type {import('./types.js').Agent} */ ({}),
+  }) {
     // `--dangerously-skip-permissions`, not bare `accept-edits`: in headless
     // `--print` mode agy cannot prompt for the `command` permission its Bash-
     // style tools need, so it auto-denies the first one and exits 0 having done
@@ -375,12 +404,9 @@ const agyAdapter = {
     // event per step, which `createRenderer` turns back into readable lines —
     // same reasoning as the claude adapter above.
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
-    const args = [
-      '--print', prompt,
-      '--mode', canWrite ? 'accept-edits' : 'plan',
-      '--output-format', 'stream-json',
-    ];
+    const args = ['--print', prompt, '--mode', canWrite ? 'accept-edits' : 'plan', '--output-format', 'stream-json'];
     if (canWrite) args.splice(4, 0, '--dangerously-skip-permissions');
+    if (agent.agent) args.push('--agent', agent.agent);
     if (agent.model) args.push('--model', agent.model);
     if (agent.effort) args.push('--effort', agent.effort);
     if (timeoutMs) args.push('--print-timeout', `${Math.ceil(timeoutMs / 1000)}s`);
@@ -393,10 +419,19 @@ const agyAdapter = {
 /** @type {Adapter} */
 const geminiAdapter = {
   name: 'gemini',
+  agentSupport: 'delegate',
+  delegatePrompt: (prompt, agentName) =>
+    `@${agentName} Delegate the task below to the ${agentName} subagent first. Do not perform its analysis yourself. After it returns, write every required artifact yourself, preserving its findings.\n\n${prompt}`,
   version: cliVersion('gemini'),
   // Gemini CLI exposes no reasoning-effort flag, so this adapter declares no
   // `efforts`: a configured effort is simply not passed through (see docs).
-  command({ prompt, addDirs, permissions, artifactOnly = false, agent = /** @type {import('./types.js').Agent} */ ({}) }) {
+  command({
+    prompt,
+    addDirs,
+    permissions,
+    artifactOnly = false,
+    agent = /** @type {import('./types.js').Agent} */ ({}),
+  }) {
     // `yolo`, not `plan`/`auto_edit`: in headless `--prompt` mode Gemini cannot
     // interactively approve the shell tools a worktree-writing phase needs to
     // build, test, and commit. `plan` is read-only and `auto_edit` auto-approves
@@ -425,16 +460,31 @@ const geminiAdapter = {
     // leaves the stdin prompt as the whole prompt.
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const args = [
-      '--prompt', '',
-      '--approval-mode', canWrite ? 'yolo' : 'plan',
+      '--prompt',
+      '',
+      '--approval-mode',
+      canWrite ? 'yolo' : 'plan',
       '--skip-trust',
-      '--output-format', 'stream-json',
+      '--output-format',
+      'stream-json',
     ];
     if (agent.model) args.push('--model', agent.model);
     for (const dir of addDirs) args.push('--include-directories', dir);
-    return { command: 'gemini', args, input: prompt };
+    return { command: 'gemini', args, input: agent.agent ? geminiAdapter.delegatePrompt(prompt, agent.agent) : prompt };
   },
-  createRenderer: () => createJsonlRenderer(renderGeminiEvent),
+  createRenderer: () => {
+    const invoked = new Set();
+    const renderer = createJsonlRenderer((event) => {
+      if (event.type === 'tool_use') {
+        invoked.add(event.tool_name);
+        if (event.tool_name === 'invoke_agent' && typeof event.parameters?.agent_name === 'string') {
+          invoked.add(event.parameters.agent_name);
+        }
+      }
+      return renderGeminiEvent(event);
+    });
+    return { ...renderer, agentInvoked: (agentName) => invoked.has(agentName) };
+  },
 };
 
 const adapters = { claude: claudeAdapter, codex: codexAdapter, agy: agyAdapter, gemini: geminiAdapter };
@@ -443,11 +493,20 @@ function validateConfiguredAdapter(name, adapter) {
   if (!adapter || typeof adapter !== 'object' || Array.isArray(adapter) || typeof adapter.command !== 'function') {
     throw new Error(`Invalid adapter "${name}": expected an object with a command function.`);
   }
-  if (adapter.efforts !== undefined && (!Array.isArray(adapter.efforts) || adapter.efforts.some((effort) => typeof effort !== 'string'))) {
+  if (
+    adapter.efforts !== undefined &&
+    (!Array.isArray(adapter.efforts) || adapter.efforts.some((effort) => typeof effort !== 'string'))
+  ) {
     throw new Error(`Invalid adapter "${name}": efforts must be an array of strings.`);
   }
   if (adapter.createRenderer !== undefined && typeof adapter.createRenderer !== 'function') {
     throw new Error(`Invalid adapter "${name}": createRenderer must be a function.`);
+  }
+  if (adapter.agentSupport !== undefined && !['native', 'delegate', 'inline'].includes(adapter.agentSupport)) {
+    throw new Error(`Invalid adapter "${name}": agentSupport must be native, delegate, or inline.`);
+  }
+  if (adapter.delegatePrompt !== undefined && typeof adapter.delegatePrompt !== 'function') {
+    throw new Error(`Invalid adapter "${name}": delegatePrompt must be a function.`);
   }
   if (adapter.version !== undefined && typeof adapter.version !== 'function') {
     throw new Error(`Invalid adapter "${name}": version must be a function.`);
@@ -458,8 +517,8 @@ function validateConfiguredAdapter(name, adapter) {
 /** @returns {Adapter} */
 export function adapterFor(engine, customAdapters = {}) {
   const configuredNames = customAdapters && typeof customAdapters === 'object' ? Object.keys(customAdapters) : [];
-  const hasConfiguredAdapter = customAdapters && typeof customAdapters === 'object'
-    && Object.hasOwn(customAdapters, engine);
+  const hasConfiguredAdapter =
+    customAdapters && typeof customAdapters === 'object' && Object.hasOwn(customAdapters, engine);
   const adapter = hasConfiguredAdapter ? validateConfiguredAdapter(engine, customAdapters[engine]) : adapters[engine];
   if (!adapter) {
     const available = [...new Set([...Object.keys(adapters), ...configuredNames])];
@@ -472,15 +531,46 @@ export function adapterFor(engine, customAdapters = {}) {
 export function validateAgent(agent, customAdapters = {}) {
   const adapter = adapterFor(agent.name, customAdapters);
   if (agent.effort && adapter.efforts && !adapter.efforts.includes(agent.effort)) {
-    throw new Error(`Engine "${agent.name}" does not support effort "${agent.effort}"; expected one of ${adapter.efforts.join(', ')}.`);
+    throw new Error(
+      `Engine "${agent.name}" does not support effort "${agent.effort}"; expected one of ${adapter.efforts.join(', ')}.`,
+    );
   }
   return agent;
+}
+
+/**
+ * Resolve a partial phase entry against its base engine and validate the final
+ * descriptor. A different engine deliberately starts clean because model and
+ * effort values are vendor-specific.
+ *
+ * @param {Partial<Engine> | string | undefined} entry
+ * @param {Engine} base
+ * @param {Record<string, Adapter>} [customAdapters]
+ * @returns {Engine}
+ */
+export function resolveEngine(entry, base, customAdapters = {}) {
+  const override = typeof entry === 'string' ? { name: entry } : (entry ?? {});
+  const resolved = !override.name || override.name === base.name ? { ...base, ...override } : override;
+  const support = adapterFor(resolved.name, customAdapters).agentSupport;
+  if (resolved.agent && (support === 'native' || support === 'delegate')) {
+    if (override.model === undefined) delete resolved.model;
+    if (override.effort === undefined) delete resolved.effort;
+  }
+  return validateAgent(/** @type {Engine} */ (resolved), customAdapters);
 }
 
 /** Resolve an agent descriptor: per-phase override, else the default. */
 /** @param {Config} config @returns {Engine} */
 export function agentForPhase(config, phaseName) {
-  return config.engines[phaseName] ?? config.engines.default;
+  return resolveEngine(config.engines[phaseName], config.engines.default, config.adapters);
+}
+
+/** Resolve an agent descriptor for a phase, including specialized reviewer bases. */
+/** @param {Config} config @param {PhaseDescriptor} phase @returns {Engine} */
+export function resolvePhaseAgent(config, phase) {
+  const base = phase.reviewGroup ? { ...agentForPhase(config, phase.reviewGroup) } : config.engines.default;
+  if (phase.reviewGroup) delete base.agent;
+  return resolveEngine(config.engines[phase.name], base, config.adapters);
 }
 
 /** Resolve which executable runs a phase. Retained for string-based callers. */

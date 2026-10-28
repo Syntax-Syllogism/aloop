@@ -48,7 +48,14 @@ test('createTuiRenderer reflects phase transitions, findings, and cost from the 
   const output = fakeOutput();
   const state = fakeState(
     [
-      { phase: 'implement', status: 'completed', durationMs: 1000, tokens: 500, cost: 0.5, artifacts: ['implement.md'] },
+      {
+        phase: 'implement',
+        status: 'completed',
+        durationMs: 1000,
+        tokens: 500,
+        cost: 0.5,
+        artifacts: ['implement.md'],
+      },
       {
         phase: 'review',
         status: 'completed',
@@ -57,7 +64,11 @@ test('createTuiRenderer reflects phase transitions, findings, and cost from the 
         tokens: 300,
         cost: 0.3,
         artifacts: ['verdict-round-1.json'],
-        verdict: { verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'missing null check', file: 'a.mjs', line: 12 }], nits: [] },
+        verdict: {
+          verdict: 'CHANGES_REQUESTED',
+          blocking: [{ issue: 'missing null check', file: 'a.mjs', line: 12 }],
+          nits: [],
+        },
       },
     ],
     ['implement'],
@@ -161,7 +172,13 @@ test('writeOutput falls back to process.stdout when no renderer is active', () =
 
 test('createTuiRenderer.stop repaints once more and restores the cursor', () => {
   const output = fakeOutput();
-  const renderer = createTuiRenderer({ config, state: fakeState(), summary: { task: 't', branch: 'b', worktree: null }, output, diffStat: () => '' });
+  const renderer = createTuiRenderer({
+    config,
+    state: fakeState(),
+    summary: { task: 't', branch: 'b', worktree: null },
+    output,
+    diffStat: () => '',
+  });
   renderer.banner('implement');
   const writesBeforeStop = output.chunks.length;
   renderer.stop();
@@ -176,7 +193,10 @@ test('reporter.mjs dispatches banner/log to the active renderer and resets clean
   try {
     banner('phase-one');
     log('hello');
-    assert.deepEqual(calls, [['banner', 'phase-one'], ['log', 'hello']]);
+    assert.deepEqual(calls, [
+      ['banner', 'phase-one'],
+      ['log', 'hello'],
+    ]);
   } finally {
     resetRenderer();
   }

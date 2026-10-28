@@ -15,9 +15,7 @@ export interface RetryPolicy {
  * time; a bare string is the legacy shell-string form.
  */
 export type CommandEntry =
-  | string
-  | { argv: string[] }
-  | { posix?: string; windows?: string; pwsh?: string; cmd?: string };
+  string | { argv: string[] } | { posix?: string; windows?: string; pwsh?: string; cmd?: string };
 
 export interface HermeticConfig {
   runtime?: string;
@@ -64,6 +62,8 @@ export interface PublishPhase extends PhaseBase {
 export type PhaseDescriptor = AgentPhase | GatePhase | PublishPhase;
 
 export interface Agent {
+  /** Named persona; distinct from the adapter option named agent (the whole descriptor). */
+  agent?: string;
   name: string;
   model?: string;
   effort?: string;
@@ -92,6 +92,8 @@ export interface AdapterCommand {
 }
 
 export interface Adapter {
+  agentSupport?: 'native' | 'delegate' | 'inline';
+  delegatePrompt?: (prompt: string, agent: string) => string;
   name?: string;
   efforts?: string[];
   command(options: AdapterCommandOptions): AdapterCommand;
@@ -101,6 +103,7 @@ export interface Adapter {
 }
 
 export interface Renderer {
+  agentInvoked?: (agent: string) => boolean | undefined;
   write(text: string): string;
   end(): string;
   usage?: () => Usage | undefined;
@@ -108,10 +111,41 @@ export interface Renderer {
 
 export interface Engine extends Agent {}
 
+/** A configured phase entry can inherit any omitted fields from its base. */
+export type EngineEntry = string | Partial<Engine>;
+
 export interface Budget {
   tokens?: number;
   usd?: number;
   wallClockMs?: number;
+}
+
+export interface JudgeConfig {
+  name?: string;
+  kind: 'systemone' | 'command';
+  baseUrl?: string;
+  command?: string[];
+  apiKeyEnv?: string;
+  judge?: (request: JudgeRequest) => Promise<unknown> | unknown;
+  onRepeat?: 'stall' | 'continue';
+  minProbability?: number;
+  timeoutMs?: number;
+}
+
+export interface JudgeRequest {
+  version?: number;
+  phase: string;
+  round: number;
+  previous: Finding[];
+  current: Finding[];
+  response: string | null;
+}
+export interface JudgeDecision {
+  repeated: boolean;
+  matches: Array<Record<string, unknown>>;
+  unmatched: Array<string | number>;
+  durationMs: number;
+  judge: Record<string, unknown>;
 }
 
 export interface Config {
@@ -119,7 +153,9 @@ export interface Config {
   branchPrefix: string;
   remote: string | null;
   adapters: Record<string, Adapter>;
-  engines: Record<string, Engine>;
+  judge: JudgeConfig | null;
+  judges: Record<string, JudgeConfig>;
+  engines: Record<string, EngineEntry> & { default: Engine };
   phases: Array<string | Partial<PhaseDescriptor>>;
   resolvedPhases: PhaseDescriptor[];
   publish: { backend?: string | object; draft?: boolean };
@@ -165,6 +201,8 @@ export interface Usage {
 }
 
 export interface ManifestEntry {
+  agentStatus?: 'native' | 'confirmed' | 'unconfirmed' | 'inline' | 'unresolved' | 'unsupported';
+  agentSource?: { path: string; hash: string };
   phase: string;
   status?: 'completed' | 'failed' | 'skipped' | 'stalled';
   startedAt?: string;
@@ -174,6 +212,8 @@ export interface ManifestEntry {
   approvedSha?: string;
   usage?: Usage;
   promptInput?: {
+    agentPrefix?: string;
+    wrappedPrompt?: string;
     template?: string;
     templateBody?: string;
     variables?: Record<string, unknown>;
@@ -241,7 +281,11 @@ export interface OperationalResult {
 
 export interface Operations {
   budgetStatus(ctx: unknown): any;
-  markBudgetExhaustedComplete(state: RunState, phase: PhaseDescriptor, details?: Record<string, unknown>): Promise<void>;
+  markBudgetExhaustedComplete(
+    state: RunState,
+    phase: PhaseDescriptor,
+    details?: Record<string, unknown>,
+  ): Promise<void>;
   manifestEntry(phase: PhaseDescriptor, ctx: unknown, values?: Partial<ManifestEntry>): ManifestEntry;
   markStalledManifest(ctx: unknown, phase: PhaseDescriptor, result: unknown, startIndex: number): Promise<void>;
   recordBudgetStall(ctx: unknown, phase: PhaseDescriptor, budget: unknown): Promise<Summary['stalled']>;
@@ -276,6 +320,10 @@ declare module 'node:events' {
 }
 
 declare module 'node:stream' {
-  interface Readable { isTTY?: boolean; }
-  interface PassThrough { isTTY?: boolean; }
+  interface Readable {
+    isTTY?: boolean;
+  }
+  interface PassThrough {
+    isTTY?: boolean;
+  }
 }

@@ -32,6 +32,12 @@ const adapter = {
 /** @type {Partial<Config> & Pick<Config, 'adapters'>} */
 const config = { resolvedPhases: [phase], adapters: { local: adapter } };
 
+/** @type {Config['engines']} */
+const configuredEngines = {
+  default: { name: 'claude' },
+  docs: { model: 'claude-haiku-5-5' },
+};
+
 if (false) {
   // @ts-expect-error Verdicts must use the two supported outcomes.
   verdict.verdict = 'PENDING';
@@ -44,7 +50,14 @@ if (false) {
 test('shared type-contract fixtures retain valid runtime shapes', () => {
   assert.equal(phase.kind, 'agent');
   assert.equal(verdict.verdict, 'APPROVED');
-  assert.equal(config.adapters.local.command({
-    prompt: 'test', cwd: '.', addDirs: [], permissions: ['read-only'],
-  }).command, 'agent');
+  assert.equal(typeof configuredEngines.docs === 'string' ? null : configuredEngines.docs.model, 'claude-haiku-5-5');
+  assert.equal(
+    config.adapters.local.command({
+      prompt: 'test',
+      cwd: '.',
+      addDirs: [],
+      permissions: ['read-only'],
+    }).command,
+    'agent',
+  );
 });

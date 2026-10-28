@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## Unreleased
+
+### Fixed
+
+- Resuming a repeated-blocker stall with `--on-repeat continue` now overrides
+  the pending round without spending another repair or review round.
+- `--on-repeat` without a configured judge now reports how to configure one.
+- Judge and review-override bookkeeping no longer inflates review attempts,
+  stall rates, or phase and total durations; separate judge metrics remain.
+- Watching a run tolerates a lock owner disappearing during lock release.
+
+### Added
+
+- Named phase agents: native Claude/agy selection, best-effort Gemini delegation,
+  Codex/custom Markdown inlining, shared doctor/preflight diagnostics, and manifest evidence.
+
+- Optional BYO repeated-blocker judges using System One HTTP/command transports,
+  generic command and function protocols, fail-closed stalls, and a documented
+  Decider GGUF command shim. Repeated findings can be explicitly continued with
+  a gate-backed, auditable publish override.
+- Every judge decision (repeated, not repeated, skipped, failed closed) and
+  review override now logs one line, which quiet mode prints, and `aloop watch`
+  emits it as a `decision` event. Skipped decisions are recorded as judge
+  manifest entries. Run and aggregate metrics count repeated-blocker stalls,
+  failed-closed stalls, and review overrides separately.
+- Per-phase engine descriptors may now inherit omitted fields from `default` (or
+  `review` for specialized reviewers), with validation and resolved-engine
+  visibility in run headers and `aloop inspect`.
+
+### Changed
+
+- Same-engine phase entries now retain the base model and effort instead of
+  dropping them; entries that select another engine still do not inherit
+  vendor-specific values.
+- The default judge `minProbability` is now `0.9` (was `0.7`). Calling a new
+  finding a repeat hides a real bug, which is worse than missing a repeat. On a
+  labelled sample of aloop findings, Decider 4B at `0.9` cut false repeats from
+  8% to 4%, and recall dropped from 75% to 63%.
+- `aloop watch --once` without `--only status` now also exits on a judge
+  `decision` event, so a script waiting for a stall or completion may wake
+  earlier. Pass `--only status` to wait for status changes only.
+- The `stalls` line in `status` and `metrics` output is omitted when a run has
+  no judge stalls or review overrides, instead of printing all zeros.
+
+### Fixed
+
+- The Decider recipe now names the right package, `decider-ai[gguf]`.
+- Judge entries written before `action` was recorded no longer show `→ stall`
+  when the round cap, not the judge, stopped the loop on a not-repeated entry.
+- `--engine` no longer pairs a name-less phase entry's model and effort with
+  a different engine. When the switch moves the entry's base to another
+  engine, those settings are dropped and logged.
+
+## [0.12.0] - 2026-10-28
+
+### Added
+
+- Run phases as named CLI agents
+- Resolve engine settings for each phase individually
+- Detect repeated review blockers, with an optional bring-your-own judge to decide whether a blocker is a repeat
+- Log judge decisions and stall metrics, and emit judge events to watch output
+
+### Fixed
+
+- Default the judge `minProbability` to 0.9
+- Address follow-up issues in repeated-blocker judge handling
+- Drop a phase's stale model and effort settings when `--engine` switches vendor
+
+### Security
+
+- Resolve a high-severity Dependabot alert by updating nanoid in the docs site
+
 ## [0.11.0] - 2026-09-30
 
 ### Fixed
