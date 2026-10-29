@@ -16,7 +16,7 @@ aloop-eval ./eval/spec.mjs --json
 
 The spec is a module that exports a task `corpus` array and a config `matrix` array. Use either a default export (`export default { corpus, matrix }`) or named exports (`export const corpus = [...]; export const matrix = [...];`).
 
-By default the command prints a table with one row per cell, then a summary table with one row per config. With `--json` it prints `{ results, summaries }` instead.
+By default the command prints a table with one row per cell, then a summary table with one row per config. With `--json` it prints `{ results, summaries }` instead. `aloop-eval --help` lists the options, and `aloop-eval --version` prints the package version.
 
 ## Spec file
 

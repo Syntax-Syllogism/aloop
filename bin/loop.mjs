@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { isMainEntrypoint } from '../src/entrypoint.mjs';
+import { readPackageVersion } from '../src/version.mjs';
 import {
   cancelRun,
   cleanRuns,
@@ -19,6 +20,7 @@ import {
 } from '../src/operations.mjs';
 import { computeRunMetrics } from '../src/metrics.mjs';
 import { runLoop } from '../src/pipeline.mjs';
+import { COMMAND_MANUALS, listGuides, renderCommandManual, renderGuide, suggestHelpTopics } from '../src/help-topics.mjs';
 
 /** @typedef {import('../src/types.js').OperationalOutput} OperationalOutput */
 /** @typedef {import('../src/types.js').OperationalResult} OperationalResult */
@@ -35,7 +37,97 @@ const commands = new Set([
   'metrics',
   'init',
   'watch',
+  'help',
 ]);
+
+const OPTION_BLOCKS = {
+  general: [
+    '  -h, --help              Show this help',
+    '      --version           Print the package version',
+  ],
+  operational: [
+    '      --json              Emit machine-readable JSON',
+    '      --metrics           Include per-run metrics in list output',
+    '      --older-than <n>    Clean completed runs older than n days',
+    '  -y, --yes               Confirm destructive clean operations',
+    '      --dry-run           Preview clean operations without changing files',
+  ],
+  config: ['      --config <path>     Load loop configuration from this file'],
+  json: ['      --json              Emit machine-readable JSON'],
+  list: [
+    '      --json              Emit machine-readable JSON',
+    '      --metrics           Include per-run metrics in list output',
+  ],
+  clean: [
+    '      --json              Emit machine-readable JSON',
+    '      --older-than <n>    Clean completed runs older than n days',
+    '  -y, --yes               Confirm destructive clean operations',
+    '      --dry-run           Preview clean operations without changing files',
+  ],
+  doctor: [
+    '      --config <path>     Load loop configuration from this file',
+    '      --json              Emit machine-readable JSON',
+  ],
+  watch: [
+    '      --repo <path>       Repository to watch (repeatable; default: cwd)',
+    '      --interval <secs>   Poll interval, at least 1 second (default: 15)',
+    '      --once              Exit after the first non-snapshot event',
+    '      --timeout <duration> Exit with code 2 after an idle timeout (e.g. 10m)',
+    '      --only status       Suppress phase-only and judge decision events',
+    '      --initial           Emit a snapshot of existing runs',
+  ],
+  init: [
+    '      --preset <name>     Seed init from a bundled preset (e.g. work-item)',
+    '      --force             Overwrite existing scaffold files',
+  ],
+  help: [
+    '  -a, --all               List commands and guides',
+    '  -g, --guides            List guides only',
+  ],
+  run: [
+    '  -t, --task <text>       Inline task description',
+    '  -f, --task-file <path>  Path to a task/plan/spec file',
+    '  -n, --name <slug>       Explicit run identity/slug',
+    '  -b, --branch <name>     Branch to build on (default: <branchPrefix><name>)',
+    '      --base-branch <branch>  Base to branch from and PR against (default: baseBranch config)',
+    '  -e, --engine <name>     Default engine: claude | codex | agy | gemini',
+    '  -m, --model <name>      Model for the default engine (overrides config; switching engines without it uses the new engine default)',
+    '      --effort <level>    Reasoning effort for the default engine (overrides config; ignored by engines without effort)',
+    '      --override-engine   With --resume and --engine, replace saved agent executables',
+    '      --config <path>     Load loop configuration from this file (also overrides saved config on resume)',
+    '      --phases a,b,c      Override the configured phase list',
+    '      --max-rounds <n>    Cap on review/repair rounds',
+    '      --no-judge          Disable a configured repeated-blocker judge for this run',
+    '      --on-repeat <action> Judge action: stall or continue',
+    '      --from <phase>      Start at this phase (with --resume, re-run it even if complete)',
+    '      --preset <name|path> Activate a bundled preset or external preset directory',
+    '      --resume            Skip phases already recorded complete',
+    '      --note <text>       Give the resumed phase an authoritative instruction',
+    '      --note-file <path>  Read the instruction from a file (--note wins)',
+    '      --no-worktree       Work in the current checkout instead of a worktree',
+    '      --no-tui            Force plain streaming output (TUI is on by default on a TTY)',
+    '      --quiet             Print only phase transitions, status lines, and a periodic heartbeat (disables the TUI)',
+    '      --no-quiet          Override quiet: true from the config',
+    '      --heartbeat <min>   Heartbeat interval in minutes for quiet mode (default 10; 0 = transitions only; implies --quiet)',
+    '  -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)',
+    '      --dry-run           Print the plan and rendered prompts, run nothing',
+  ],
+};
+
+const COMMAND_HELP = {
+  list: { usage: 'list', summary: 'List persisted runs', optionGroups: ['config', 'list'] },
+  status: { usage: 'status <name>', summary: 'Show current phase, verdict, and metrics', optionGroups: ['config', 'json'] },
+  inspect: { usage: 'inspect <name>', summary: 'Show manifest, phase evidence, and metrics', optionGroups: ['config', 'json'] },
+  replay: { usage: 'replay <name>', summary: 'Verify recorded prompt inputs and show phase transitions', optionGroups: ['config', 'json'] },
+  metrics: { usage: 'metrics', summary: 'Show aggregate metrics across runs', optionGroups: ['config', 'json'] },
+  cancel: { usage: 'cancel <name>', summary: 'Stop a run and release its lock', optionGroups: ['config', 'json'] },
+  clean: { usage: 'clean', summary: 'Preview/remove completed runs older than 30 days', optionGroups: ['config', 'clean'] },
+  doctor: { usage: 'doctor', summary: 'Check configuration and local tooling', optionGroups: ['doctor'] },
+  watch: { usage: 'watch [names...]', summary: 'Stream run status/phase/judge-decision changes as NDJSON', optionGroups: ['config', 'watch'] },
+  init: { usage: 'init', summary: 'Scaffold loop.config.mjs and .loop/prompts', optionGroups: ['init', 'json'] },
+  help: { usage: 'help [command|guide]', summary: 'Show full command manuals and documentation guides', optionGroups: ['help'] },
+  run: { usage: 'run', summary: 'Start or resume a run (the default)', optionGroups: ['run'] },
+};
 
 function parseDuration(text) {
   const match = /^(\d+(?:\.\d+)?)(s|m|h)?$/.exec(text);
@@ -50,7 +142,9 @@ function parseDuration(text) {
 }
 
 export function parseLoopArgs(argv) {
-  const command = commands.has(argv[0]) ? argv[0] : 'run';
+  const explicitCommand = commands.has(argv[0]);
+  const command = explicitCommand ? argv[0] : 'run';
+  if (argv.includes('--version')) return { command, version: true };
   const commandArgv = command === 'run' && argv[0] !== 'run' ? argv : argv.slice(1);
   const { values, positionals } = parseArgs({
     args: commandArgv,
@@ -91,14 +185,21 @@ export function parseLoopArgs(argv) {
       'older-than': { type: 'string' },
       preset: { type: 'string' },
       force: { type: 'boolean' },
+      all: { type: 'boolean', short: 'a' },
+      guides: { type: 'boolean', short: 'g' },
       help: { type: 'boolean', short: 'h' },
       version: { type: 'boolean' },
     },
     allowPositionals: true,
     strict: true,
   });
-  if (values.help) return { command, help: true };
-  if (values.version) return { command, version: true };
+  if (values.help) return { command, help: true, explicitCommand };
+  if (command === 'help') {
+    if (positionals.length > 1) throw new Error('help accepts at most one command or guide');
+    if (values.all && values.guides) throw new Error('--all and --guides are mutually exclusive');
+    if ((values.all || values.guides) && positionals.length) throw new Error('--all and --guides do not accept a topic');
+    return { command, helpTopic: positionals[0], helpAll: values.all, helpGuides: values.guides };
+  }
   const maxRounds = values['max-rounds'] ? Number(values['max-rounds']) : undefined;
   if (maxRounds !== undefined && (!Number.isInteger(maxRounds) || maxRounds < 1)) {
     throw new Error('--max-rounds must be a positive integer');
@@ -146,7 +247,7 @@ export function parseLoopArgs(argv) {
     throw new Error(`${command} requires exactly one run name`);
   }
   if (
-    command !== 'run' &&
+    command !== 'run' && command !== 'help' &&
     command !== 'watch' &&
     !['status', 'inspect', 'replay', 'cancel'].includes(command) &&
     positionals.length
@@ -201,74 +302,92 @@ export function parseLoopArgs(argv) {
   };
 }
 
+function renderOptions(blocks) {
+  return blocks.flatMap((name) => OPTION_BLOCKS[name]);
+}
+
+export function commandUsage(command) {
+  const help = COMMAND_HELP[command];
+  if (!help) throw new Error(`Unknown command: ${command}`);
+  return [
+    `Usage: aloop ${help.usage} [options]`,
+    '',
+    help.summary,
+    '',
+    'Options:',
+    ...renderOptions(['general', ...help.optionGroups]),
+    '',
+    "Run 'aloop --help' for all commands.",
+    "Run 'aloop help <command|guide>' for full documentation.",
+  ].join('\n');
+}
+
 export function usage() {
   return [
     'Usage: aloop [command] [options]',
     '',
     'Commands:',
-    '  list                    List persisted runs',
-    '  status <name>           Show current phase, verdict, and metrics',
-    '  inspect <name>          Show manifest, phase evidence, and metrics',
-    '  replay <name>           Verify recorded prompt inputs and show phase transitions',
-    '  metrics                 Show aggregate metrics across runs',
-    '  cancel <name>           Stop a run and release its lock',
-    '  clean                   Preview/remove completed runs older than 30 days',
-    '  doctor                  Check configuration and local tooling',
-    '  watch [names...]        Stream run status/phase/judge-decision changes as NDJSON',
-    '  init                    Scaffold loop.config.mjs and .loop/prompts',
-    '  run                     Start or resume a run (the default)',
+    ...Object.values(COMMAND_HELP).map(({ usage: commandUsageText, summary }) =>
+      `  ${commandUsageText.padEnd(24)}${summary}`,
+    ),
     '',
     'General options:',
-    '  -h, --help              Show this help',
-    '      --version           Print the package version',
+    ...OPTION_BLOCKS.general,
     '',
     'Operational options:',
-    '      --json              Emit machine-readable JSON',
-    '      --metrics           Include per-run metrics in list output',
-    '      --older-than <n>    Clean completed runs older than n days',
-    '  -y, --yes               Confirm destructive clean operations',
-    '      --dry-run           Preview clean operations without changing files',
+    ...OPTION_BLOCKS.operational,
     '',
     'Watch options:',
-    '      --repo <path>       Repository to watch (repeatable; default: cwd)',
-    '      --interval <secs>   Poll interval, at least 1 second (default: 15)',
-    '      --once              Exit after the first non-snapshot event',
-    '      --timeout <duration> Exit with code 2 after an idle timeout (e.g. 10m)',
-    '      --only status       Suppress phase-only and judge decision events',
-    '      --initial           Emit a snapshot of existing runs',
+    ...OPTION_BLOCKS.watch,
     '',
     'Init options:',
-    '      --preset <name>     Seed init from a bundled preset (e.g. work-item)',
-    '      --force             Overwrite existing scaffold files',
+    ...OPTION_BLOCKS.init,
     '',
     'Run options:',
-    '  -t, --task <text>       Inline task description',
-    '  -f, --task-file <path>  Path to a task/plan/spec file',
-    '  -n, --name <slug>       Explicit run identity/slug',
-    '  -b, --branch <name>     Branch to build on (default: <branchPrefix><name>)',
-    '      --base-branch <branch>  Base to branch from and PR against (default: baseBranch config)',
-    '  -e, --engine <name>     Default engine: claude | codex | agy | gemini',
-    '  -m, --model <name>      Model for the default engine (overrides config; switching engines without it uses the new engine default)',
-    '      --effort <level>    Reasoning effort for the default engine (overrides config; ignored by engines without effort)',
-    '      --override-engine   With --resume and --engine, replace saved agent executables',
-    '      --config <path>     Load loop configuration from this file (also overrides saved config on resume)',
-    '      --phases a,b,c      Override the configured phase list',
-    '      --max-rounds <n>    Cap on review/repair rounds',
-    '      --no-judge          Disable a configured repeated-blocker judge for this run',
-    '      --on-repeat <action> Judge action: stall or continue',
-    '      --from <phase>      Start at this phase (with --resume, re-run it even if complete)',
-    '      --preset <name|path> Activate a bundled preset or external preset directory',
-    '      --resume            Skip phases already recorded complete',
-    '      --note <text>       Give the resumed phase an authoritative instruction',
-    '      --note-file <path>  Read the instruction from a file (--note wins)',
-    '      --no-worktree       Work in the current checkout instead of a worktree',
-    '      --no-tui            Force plain streaming output (TUI is on by default on a TTY)',
-    '      --quiet             Print only phase transitions, status lines, and a periodic heartbeat (disables the TUI)',
-    '      --no-quiet          Override quiet: true from the config',
-    '      --heartbeat <min>   Heartbeat interval in minutes for quiet mode (default 10; 0 = transitions only; implies --quiet)',
-    '  -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)',
-    '      --dry-run           Print the plan and rendered prompts, run nothing',
+    ...OPTION_BLOCKS.run,
+    '',
+    "Run 'aloop help <command|guide>' for full documentation.",
   ].join('\n');
+}
+
+async function runHelp(args, { output = console.log, error = console.error } = {}) {
+  const guides = await listGuides();
+  const guideByName = new Map(guides.map((guide) => [guide.name, guide]));
+  if (args.helpTopic) {
+    const topic = args.helpTopic;
+    if (topic === 'help') {
+      output(commandUsage('help'));
+      return 0;
+    }
+    if (COMMAND_MANUALS[topic]) {
+      output(await renderCommandManual(topic, commandUsage(topic)));
+      return 0;
+    }
+    if (guideByName.has(topic)) {
+      output(await renderGuide(topic));
+      return 0;
+    }
+    error(`aloop help: no command or guide named '${topic}'`);
+    const matches = suggestHelpTopics(topic, [...Object.keys(COMMAND_MANUALS), ...guideByName.keys()]);
+    if (matches.length) error(`Closest matches: ${matches.join(', ')}`);
+    error("Run 'aloop help -a' to see all commands and guides.");
+    return 1;
+  }
+
+  const showCommands = !args.helpGuides;
+  const showGuides = true;
+  const lines = [];
+  if (showCommands) {
+    lines.push('Commands:');
+    for (const [name, { summary }] of Object.entries(COMMAND_HELP)) lines.push(`  ${name.padEnd(12)}${summary}`);
+  }
+  if (showGuides) {
+    if (lines.length) lines.push('');
+    lines.push('Guides:');
+    for (const guide of guides) lines.push(`  ${guide.name.padEnd(16)}${guide.description}`);
+  }
+  output(lines.join('\n'));
+  return 0;
 }
 
 function writeWatchLine(output, event) {
@@ -611,10 +730,11 @@ if (isMainEntrypoint(import.meta.url)) {
   try {
     const args = parseLoopArgs(process.argv.slice(2));
     if (args.help) {
-      console.log(usage());
+      console.log(args.explicitCommand ? commandUsage(args.command) : usage());
     } else if (args.version) {
-      const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
-      console.log(version);
+      console.log(`aloop ${await readPackageVersion()}`);
+    } else if (args.command === 'help') {
+      process.exitCode = await runHelp(args);
     } else if (args.command === 'run') {
       await runLoop({ args });
     } else if (args.command === 'watch') {

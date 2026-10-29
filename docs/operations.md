@@ -7,7 +7,7 @@ description: Inspect, replay, cancel, clean up, diagnose aloop runs, and run loc
 
 These subcommands read the saved run state in the repository's `runsDir` (default `.loop/runs`). Run them from the repository or any subdirectory. If the run uses a config file outside the repository, pass `--config path/to/loop.config.mjs`. The path is resolved from the current directory.
 
-Every operational command supports `--json`. If you don't pass a config file and there's no `loop.config.mjs`, the package defaults apply. A config file that exists but can't be imported is an error, not a silent fallback to defaults.
+Every operational command supports `--json`, and `aloop <command> --help` prints its usage and options. If you don't pass a config file and there's no `loop.config.mjs`, the package defaults apply. A config file that exists but can't be imported is an error, not a silent fallback to defaults.
 
 Commands find runs from the repository root and the configured `runsDir`, so running from a different subdirectory doesn't create a second run inventory.
 

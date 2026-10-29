@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isMainEntrypoint } from '../src/entrypoint.mjs';
+import { readPackageVersion } from '../src/version.mjs';
 import { formatEvalSummaryTable, formatEvalTable, runEval, summarizeEval } from '../src/eval.mjs';
 
 export function usage() {
@@ -16,13 +17,23 @@ export function usage() {
     '',
     'Options:',
     '      --json    Emit machine-readable JSON instead of tables',
+    '      --version Print the package version',
+    '  -h, --help   Show this help',
   ].join('\n');
 }
 
 export async function runEvalCli(argv, { cwd = process.cwd(), output = console } = {}) {
+  if (argv.includes('--version')) {
+    output.log(`aloop-eval ${await readPackageVersion()}`);
+    return null;
+  }
   const { values, positionals } = parseArgs({
     args: argv,
-    options: { json: { type: 'boolean' }, help: { type: 'boolean', short: 'h' } },
+    options: {
+      json: { type: 'boolean' },
+      help: { type: 'boolean', short: 'h' },
+      version: { type: 'boolean' },
+    },
     allowPositionals: true,
     strict: true,
   });

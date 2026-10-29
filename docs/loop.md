@@ -21,7 +21,11 @@ The runner is deliberately not an agent. A simple, deterministic driver owns con
 aloop --task-file ./work-items/afmt-clippy-cleanup.md
 ```
 
-Run `aloop --version` to print the installed version.
+Run `aloop --version` to print the installed version, for example `aloop 0.12.0`. Run `aloop --help` for every command, or `aloop <command> --help` for one command's usage and options. The block below is the `aloop run --help` option list.
+
+### In-CLI documentation
+
+Use `aloop help` to list commands and documentation guides. `aloop help <command>` prints a command manual assembled from the relevant sections of these guides, while `aloop help <guide>` prints a full guide. Use `aloop help -g` to list guides or `aloop help -a` to list both commands and guides. Output is Markdown on stdout; no pager is started.
 
 By default, the runner asks before each phase. At the prompt, Enter or `y` runs the phase and `q` stops the run. Any other answer is a request to skip. Only optional phases can be skipped. If you decline a required phase, aloop explains that it must run and asks again whether to run it or quit. Add `-y` once a pipeline has earned it.
 
@@ -35,7 +39,7 @@ By default, the runner asks before each phase. At the prompt, Enter or `y` runs 
   -m, --model <name>      Model for the default engine (overrides config; switching engines without it uses the new engine default)
       --effort <level>    Reasoning effort for the default engine (overrides config; ignored by engines without effort)
       --override-engine   With --resume and --engine, replace saved agent executables
-      --config <path>     Load loop configuration from this file
+      --config <path>     Load loop configuration from this file (also overrides saved config on resume)
       --phases a,b,c      Override the configured phase list
       --max-rounds <n>    Cap on review/repair rounds
       --no-judge          Disable a configured repeated-blocker judge for this run
@@ -43,14 +47,14 @@ By default, the runner asks before each phase. At the prompt, Enter or `y` runs 
       --from <phase>      Start at this phase (with --resume, re-run it even if complete)
       --preset <name|path> Activate a bundled preset or external preset directory
       --resume            Skip phases already recorded complete
-      --note <text>       Give the target agent an authoritative instruction
-      --note-file <path>  Read that instruction from a file (--note wins)
-  -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)
+      --note <text>       Give the resumed phase an authoritative instruction
+      --note-file <path>  Read the instruction from a file (--note wins)
       --no-worktree       Work in the current checkout instead of a worktree
       --no-tui            Force plain streaming output (TUI is on by default on a TTY)
       --quiet             Print only phase transitions, status lines, and a periodic heartbeat (disables the TUI)
       --no-quiet          Override quiet: true from the config
       --heartbeat <min>   Heartbeat interval in minutes for quiet mode (default 10; 0 = transitions only; implies --quiet)
+  -y, --yes               Run unattended (no per-phase confirmation; required without a terminal)
       --dry-run           Print the plan and rendered prompts, run nothing
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "@syntax-syllogism/aloop",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Syntax & Syllogism agentic loop runner.",
   "type": "module",
   "exports": {
@@ -19,6 +19,7 @@
   "files": [
     "bin",
     "src",
+    "docs",
     "prompts",
     "examples",
     "presets",

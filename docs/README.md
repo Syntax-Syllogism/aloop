@@ -5,6 +5,8 @@ description: Guides for running implementation and review work through aloop's d
 
 `@syntax-syllogism/aloop` runs a task through implementation, review, documentation, and publishing phases, so nobody has to copy prompts between agents. A deterministic CLI controls the flow, and the agents do the work.
 
+Installed CLI users can browse these guides with `aloop help -g` or print a guide with `aloop help <guide>`. The metrics guide is listed as `metrics-guide` so it does not shadow the `metrics` command manual.
+
 ## Guides
 
 - [Agentic loop runner](loop.md): install and configure aloop, run a task, resume a stalled run, and learn the phases and safeguards.

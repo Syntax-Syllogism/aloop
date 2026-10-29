@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a different engine. When the switch moves the entry's base to another
   engine, those settings are dropped and logged.
 
+## [0.12.1] - 2026-10-29
+
+### Added
+
+- Git-style `aloop help` for viewing command manuals and guides
+- Named versions
+- Per-command help for `aloop` commands
+
 ## [0.12.0] - 2026-10-28
 
 ### Added
