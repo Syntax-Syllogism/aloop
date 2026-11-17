@@ -58,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a different engine. When the switch moves the entry's base to another
   engine, those settings are dropped and logged.
 
+## [0.12.2] - 2026-11-17
+
+### Changed
+
+- Internal maintenance and tooling updates
+
 ## [0.12.1] - 2026-10-29
 
 ### Added
