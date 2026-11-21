@@ -219,11 +219,15 @@ function commandInvocation(normalized, ctx) {
   return { command: shell.bin, args: [...flag, normalized.shellString] };
 }
 
-function gitMetadataMount(ctx, mode) {
+function gitMetadataDirs(ctx) {
   if (!ctx.gitCommonDir) return [];
   const relativePath = relative(ctx.worktree, ctx.gitCommonDir);
   const isInsideWorktree = relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
-  return isInsideWorktree ? [] : [{ path: ctx.gitCommonDir, mode }];
+  return isInsideWorktree ? [] : [ctx.gitCommonDir];
+}
+
+function gitMetadataMount(ctx, mode) {
+  return gitMetadataDirs(ctx).map((path) => ({ path, mode }));
 }
 
 function manifestRole(phase) {
@@ -242,6 +246,14 @@ function engineRecord(agent) {
     ...(agent.effort ? { effort: agent.effort } : {}),
     ...(agent.agent ? { agent: agent.agent } : {}),
   };
+}
+
+function commitMessageForRunner(phase) {
+  return `chore(${phase.name}): commit successful agent changes`;
+}
+
+function isCommitProducingPhase(phase) {
+  return phase.postconditions?.includes('head-advanced') || phase.postconditions?.includes('head-advanced-or-rebuttal');
 }
 
 /** @returns {import('./types.js').ManifestEntry} */
@@ -658,7 +670,7 @@ async function runAgent(phase, ctx, variables) {
           ? ctx.addDirs.filter((path) => path !== ctx.worktree).map((path) => ({ path, mode: 'rw' }))
           : artifactOnlyDirs.map((path) => ({ path, mode: 'rw' }))),
         ...(sourceSnapshot ? [{ path: sourceSnapshot.path, mode: 'ro' }] : []),
-        ...gitMetadataMount(ctx, worktreeWrite ? 'rw' : 'ro'),
+        ...(worktreeWrite ? [] : gitMetadataMount(ctx, 'ro')),
       ],
     });
     if (ctx.dryRun) {
@@ -705,9 +717,8 @@ async function runAgent(phase, ctx, variables) {
         env: execution.env,
         timeoutMs: ctx.config.timeoutMs,
         activeProcessPath: ctx.activeProcessPath,
-        // Adapters that carry the prompt on stdin (gemini, to dodge the cmd.exe
-        // command-line limit on Windows) return it as `input`; a hermetic wrapper
-        // forwards stdin to the sandboxed process unchanged.
+        // Built-in adapters carry prompts on stdin to dodge Windows command shims;
+        // a hermetic wrapper forwards stdin to the sandboxed process unchanged.
         input,
         onOutput: (text, stream) => emit(stream === 'stderr' ? text : renderer.write(text)),
       });
@@ -724,6 +735,25 @@ async function runAgent(phase, ctx, variables) {
         await warn(agentDiagnostic('agent-unconfirmed', phase.name, agent.name, agent.agent));
     }
     const usage = renderer.usage?.() ?? adapter.usage?.() ?? null;
+
+    // Codex's Windows sandbox may prevent an otherwise successful writer from
+    // creating the linked worktree's index.lock. For adapters that declare
+    // `runnerCommits`, the runner completes that narrow fallback only after the
+    // agent exits successfully; failed agents must leave their work untouched
+    // for diagnosis, and every other engine still stalls on a dirty tree.
+    let runnerCommit = null;
+    if (
+      adapter.runnerCommits === true &&
+      !commandError &&
+      worktreeWrite &&
+      isCommitProducingPhase(phase) &&
+      (await ctx.git.isDirty())
+    ) {
+      const message = commitMessageForRunner(phase);
+      await ctx.git.run(['add', '--all']);
+      await ctx.git.run(['commit', '-m', message]);
+      runnerCommit = { message, sha: await ctx.git.revParse() };
+    }
 
     const manifest = manifestEntry(phase, ctx, {
       inputSha,
@@ -746,6 +776,7 @@ async function runAgent(phase, ctx, variables) {
       durationMs: Math.round(performance.now() - started),
       ...(usage?.tokens !== undefined ? { tokens: usage.tokens } : {}),
       ...(usage?.cost !== undefined ? { cost: usage.cost } : {}),
+      ...(runnerCommit ? { runnerCommit } : {}),
       ...(commandError
         ? {
             status: 'stalled',
@@ -995,10 +1026,7 @@ export async function runLoop(options = {}) {
         ? { ...(await planWorktree(rootGit, config, slug, branch, repoRoot)), created: false, worktreeCreated: false }
         : await setupWorktree(rootGit, config, slug, branch, repoRoot, baseBranch);
     const worktreeGit = new GitFacade(worktree);
-    const hermeticPhaseExists = config.resolvedPhases
-      .flatMap((phase) => [phase, ...(phase.repair ?? [])])
-      .some((phase) => phase.hermetic);
-    const gitCommonDir = args.dryRun || !hermeticPhaseExists ? null : resolve(worktree, await worktreeGit.commonDir());
+    const gitCommonDir = args.dryRun ? null : resolve(worktree, await worktreeGit.commonDir());
     await state.record({ worktree, branch, baseBranch });
     await state.saveManifest({
       runId: state.data.runId,
@@ -1034,7 +1062,7 @@ export async function runLoop(options = {}) {
       config,
       worktree,
       gitCommonDir,
-      addDirs: [worktree, ...artifactDirs],
+      addDirs: [worktree, ...artifactDirs, ...gitMetadataDirs({ worktree, gitCommonDir })],
       artifactDirs,
       state,
       git: worktreeGit,

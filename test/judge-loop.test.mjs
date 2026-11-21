@@ -53,7 +53,7 @@ process.stdout.write(JSON.stringify({ matches }));
   await writeFile(
     join(bin, 'claude'),
     `#!/bin/sh
-prompt="$2"
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *"Machine-readable verdict"*)
     verdict_path=$(printf '%s\\n' "$prompt" | sed -n 's/^.*write this JSON to \`\\([^\`]*\\)\`.*/\\1/p')

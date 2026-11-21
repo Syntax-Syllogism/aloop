@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
 import { promisify } from 'node:util';
@@ -1499,7 +1499,7 @@ exec "$REAL_GIT" "$@"
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt=$2
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *'Take on the role of a senior developer'*)
     printf '%s\\n' '{"verdict":"APPROVED","blocking":[]}' > "$FIXTURE_VERDICT_PATH"
@@ -1767,7 +1767,7 @@ test('formatFindings renders file:line citations', () => {
   assert.equal(formatFindings([]), '(none)');
 });
 
-test('adapters place the prompt and every extra directory on the command line', () => {
+test('adapters carry prompts and every extra directory without exposing built-in prompts in argv', () => {
   const request = {
     prompt: 'do it',
     cwd: '/w',
@@ -1778,12 +1778,65 @@ test('adapters place the prompt and every extra directory on the command line', 
   for (const engine of ['claude', 'codex', 'agy', 'gemini']) {
     const { command, args, input } = adapterFor(engine).command(request);
     assert.equal(command, engine);
-    // gemini carries the prompt on stdin (`input`) to dodge the cmd.exe
-    // command-line limit on Windows; the others place it on the command line.
+    // Built-in adapters carry prompts on stdin to dodge Windows command shims.
     assert.ok(args.includes('do it') || input === 'do it', `${engine} passes the prompt`);
     assert.ok(args.includes('/runs') && args.includes('/wiki'), `${engine} passes add-dirs`);
   }
   assert.throws(() => adapterFor('gpt'), /Unsupported engine "gpt".*claude, codex, agy, gemini/);
+});
+
+test('only codex on Windows asks the runner to commit for it', () => {
+  assert.equal(adapterFor('codex').runnerCommits, process.platform === 'win32');
+  for (const engine of ['claude', 'gemini', 'agy']) assert.notEqual(adapterFor(engine).runnerCommits, true);
+  assert.throws(
+    () => adapterFor('writer', { writer: { runnerCommits: 'yes', command: () => ({ command: 'x', args: [] }) } }),
+    /runnerCommits must be a boolean/,
+  );
+});
+
+test('the codex adapter carries a complete prompt on stdin and preserves writer flags', () => {
+  const prompt = 'line one\nline two';
+  const result = adapterFor('codex').command({
+    prompt,
+    cwd: '/worktree',
+    addDirs: ['/worktree', '/git-common'],
+    permissions: ['write-worktree'],
+    agent: { model: 'gpt-6.2', effort: 'high' },
+  });
+
+  assert.equal(result.input, prompt);
+  assert.equal(
+    result.args.some((arg) => arg.includes(prompt)),
+    false,
+  );
+  assert.deepEqual(result.args.slice(0, 6), ['exec', '-', '--sandbox', 'workspace-write', '--cd', '/worktree']);
+  assert.ok(result.args.includes('--model') && result.args.includes('gpt-6.2'));
+  assert.ok(result.args.includes('model_reasoning_effort="high"'));
+  assert.ok(result.args.includes('/worktree') && result.args.includes('/git-common'));
+});
+
+test('the claude adapter carries a complete prompt on stdin and preserves writer flags', () => {
+  const prompt = 'line one\nline two';
+  const result = adapterFor('claude').command({
+    prompt,
+    cwd: '/worktree',
+    addDirs: ['/worktree', '/git-common'],
+    permissions: ['write-worktree'],
+    agent: { model: 'claude-sonnet', effort: 'high' },
+  });
+
+  assert.equal(result.input, prompt);
+  assert.equal(
+    result.args.some((arg) => arg.includes(prompt)),
+    false,
+  );
+  assert.equal(result.args[0], '-p');
+  assert.equal(result.args[result.args.indexOf('--permission-mode') + 1], 'auto');
+  assert.equal(result.args[result.args.indexOf('--output-format') + 1], 'stream-json');
+  assert.ok(result.args.includes('--verbose'));
+  assert.ok(result.args.includes('--model') && result.args.includes('claude-sonnet'));
+  assert.ok(result.args.includes('--effort') && result.args.includes('high'));
+  assert.ok(result.args.includes('/worktree') && result.args.includes('/git-common'));
 });
 
 test('configured adapters override built-ins and unknown errors list configured names', () => {
@@ -1911,7 +1964,7 @@ import { dirname, join } from 'node:path';
 
 const args = process.argv.slice(2);
 if (args[0] === '--version') process.exit(0);
-const prompt = args[args.indexOf('exec') + 1];
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
 const runDir = dirname(verdictPath);
 const taskDir = ${JSON.stringify(dirname(workItem))};
@@ -1981,12 +2034,12 @@ test('a native Codex pr-description phase does not receive the external task-fil
   await writeFile(
     join(binDir, 'codex'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const args = process.argv.slice(2);
 if (args[0] === '--version') process.exit(0);
-const prompt = args[args.indexOf('exec') + 1];
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 const prPath = prompt.slice(prompt.indexOf('Write ')).split(String.fromCharCode(96))[1];
 const taskDir = ${JSON.stringify(dirname(workItem))};
 const addDirs = args.flatMap((value, index) => value === '--add-dir' ? [args[index + 1]] : []);
@@ -2151,9 +2204,8 @@ test('the gemini adapter carries the prompt on stdin, not the command line', () 
     addDirs: [],
     permissions: ['write-worktree'],
   });
-  // The Windows launcher is a .cmd/.ps1 shim, so on Git Bash the prompt would
-  // ride through cmd.exe, which truncates past ~8191 chars and mangles newlines
-  // and metacharacters. stdin is a pipe cmd.exe never parses.
+  // Built-in adapters use stdin because Windows shims can corrupt a prompt that
+  // rides through cmd.exe; stdin is a pipe cmd.exe never parses.
   assert.equal(result.input, 'do it', 'prompt travels on stdin');
   assert.equal(result.args.includes('do it'), false, 'prompt is never an argv element');
   // `-p ""` still selects headless mode; Gemini appends --prompt to stdin, so an
@@ -3637,8 +3689,8 @@ test('a verdict manifest entry binds the verdict to its reviewed SHA', async () 
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-const prompt = process.argv[process.argv.indexOf('-p') + 1];
+import { writeFileSync, readFileSync } from 'node:fs';
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
 writeFileSync(verdictPath, JSON.stringify({ verdict: 'APPROVED', blocking: [], nits: [], summary: 'looks good' }));
 `,
@@ -3719,7 +3771,7 @@ exit 1
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt=$2
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *documentation-as-built*)
     printf '%s\\n' '# as built' > docs-as-built.md
@@ -3825,7 +3877,7 @@ test('an approved run can resume PR description after a clean-tree stall', async
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt=$2
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *documentation-as-built*)
     printf '%s\\n' '# as built' > docs-as-built.md
@@ -3916,7 +3968,7 @@ test('a missing or malformed PR description stalls and can resume', async () => 
     await writeFile(
       join(binDir, 'claude'),
       `#!/bin/sh
-prompt=$2
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *'Take on the role of a senior developer'*)
     printf '%s\\n' '{"verdict":"APPROVED","blocking":[]}' > "$FIXTURE_VERDICT_PATH"
@@ -3995,7 +4047,7 @@ test('a review that advances HEAD is rejected before its verdict is approved', a
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt=$2
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *'Take on the role of a senior developer'*)
     printf '%s\\n' mutated > "$FIXTURE_WORKTREE/review-mutation.txt"
@@ -4061,7 +4113,7 @@ test('a reviewer mutation forces the completed gate to run again before resume a
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt=$2
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *'Take on the role of a senior developer'*)
     if [ ! -f "$FIXTURE_WORKTREE/review-mutation.txt" ]; then
@@ -4547,6 +4599,75 @@ git commit -m 'feat: silent implementation' >/dev/null
   assert.equal(await git(summary.worktree, 'log', '-1', '--pretty=%s'), 'feat: silent implementation');
 });
 
+test('the runner commits successful dirty commit-producing writer phases', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  adapters: {
+    writer: {
+      runnerCommits: true,
+      command() {
+        return { command: process.execPath, args: ['-e', ${JSON.stringify("require('node:fs').writeFileSync('runner-commit.txt', 'written\\n');")} ] };
+      },
+    },
+  },
+  engines: { default: 'writer' },
+  phases: [{ name: 'implement', kind: 'agent', prompt: 'implement', permissions: ['write-worktree'], postconditions: ['clean-tree', 'head-advanced'] }],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+`,
+  });
+
+  const summary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+
+  assert.equal(summary.stalled, null);
+  assert.equal(await git(summary.worktree, 'status', '--porcelain'), '');
+  assert.equal(
+    await git(summary.worktree, 'log', '-1', '--format=%s'),
+    'chore(implement): commit successful agent changes',
+  );
+  const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.phases[0].runnerCommit.message, 'chore(implement): commit successful agent changes');
+  assert.match(manifest.phases[0].runnerCommit.sha, /^[0-9a-f]{40}$/);
+  assert.equal(manifest.phases[0].outputSha, manifest.phases[0].runnerCommit.sha);
+});
+
+test('the runner never commits dirty changes from a failing writer phase', async () => {
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  adapters: {
+    writer: {
+      runnerCommits: true,
+      command() {
+        return { command: process.execPath, args: ['-e', ${JSON.stringify("require('node:fs').writeFileSync('failed-writer.txt', 'written\\n'); process.exit(7);")} ] };
+      },
+    },
+  },
+  engines: { default: 'writer' },
+  phases: [{ name: 'implement', kind: 'agent', prompt: 'implement', permissions: ['write-worktree'], postconditions: ['clean-tree', 'head-advanced'] }],
+  worktreeRoot: ${JSON.stringify(worktreeRoot)},
+};
+`,
+  });
+
+  await assert.rejects(runLoop({ args: { taskFile: workItem, cwd: root, yes: true } }), /Command failed:/);
+
+  const worktrees = (await git(root, 'worktree', 'list', '--porcelain'))
+    .split('\n')
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => line.slice('worktree '.length));
+  const statuses = await Promise.all(
+    worktrees.map(async (worktree) => [worktree, await git(worktree, 'status', '--porcelain')]),
+  );
+  const failedWorktree = statuses.find(([, status]) => status.includes('failed-writer.txt'));
+  assert.ok(failedWorktree, 'the failed phase worktree remains available for diagnosis');
+  assert.match(failedWorktree[1], /failed-writer\.txt/);
+  const [runName] = await readdir(join(root, '.loop/runs'));
+  const manifest = JSON.parse(await readFile(join(root, '.loop/runs', runName, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.phases[0].runnerCommit, undefined);
+});
+
 test('an address phase that commits its fix completes normally', async () => {
   const worktreeRoot = await mkdtemp(join(tmpdir(), 'loop-trees-'));
   const { root, workItem } = await repoFixture({
@@ -4561,7 +4682,7 @@ test('an address phase that commits its fix completes normally', async () => {
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt="$2"
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *"Machine-readable verdict"*)
     verdict_path=$(printf '%s\\n' "$prompt" | sed -n 's/^.*write this JSON to \`\\([^\`]*\\)\`.*/\\1/p')
@@ -4627,8 +4748,8 @@ test('an address phase with a written rebuttal may complete without a commit', a
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-const prompt = process.argv[process.argv.indexOf('-p') + 1];
+import { writeFileSync, readFileSync } from 'node:fs';
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 if (prompt.includes('Machine-readable verdict')) {
   const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
   const approved = prompt.includes('round 2 of');
@@ -4672,8 +4793,8 @@ test('an address phase with findings but no fix or rebuttal stalls', async () =>
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-const prompt = process.argv[process.argv.indexOf('-p') + 1];
+import { writeFileSync, readFileSync } from 'node:fs';
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 if (prompt.includes('Machine-readable verdict')) {
   const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
   writeFileSync(verdictPath, JSON.stringify({
@@ -4728,8 +4849,8 @@ test('an inline repair with only head-advanced-or-rebuttal stalls without a fix 
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-const prompt = process.argv[process.argv.indexOf('-p') + 1];
+import { writeFileSync, readFileSync } from 'node:fs';
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 if (prompt.includes('Machine-readable verdict')) {
   const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
   writeFileSync(verdictPath, JSON.stringify({
@@ -5031,8 +5152,8 @@ test('a cap reached with outstanding findings checkpoints the owed repair', asyn
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-const prompt = process.argv[process.argv.indexOf('-p') + 1];
+import { writeFileSync, readFileSync } from 'node:fs';
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 if (prompt.includes('Machine-readable verdict')) {
   const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
   writeFileSync(verdictPath, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ file: 'src/x.mjs', line: 1, issue: 'fix it' }] }));
@@ -5077,10 +5198,9 @@ test('a resumed repair reruns the agent when HEAD is still the reviewed tree', a
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-const promptIndex = process.argv.indexOf('-p');
-const prompt = promptIndex < 0 ? null : process.argv[promptIndex + 1];
+const prompt = process.argv.includes('-p') ? readFileSync(0, 'utf8') : null;
 if (prompt?.includes('Machine-readable verdict')) {
   const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
   writeFileSync(verdictPath, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ file: 'src/x.mjs', line: 1, issue: 'fix it' }] }));
@@ -5824,10 +5944,10 @@ test('an approving reviewer after a failed repair gate stalls cleanly', async ()
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt="$2"
 if [ "$1" = '--version' ]; then
   exit 0
 fi
+prompt=$(cat)
 case "$prompt" in
   *"Machine-readable verdict"*)
     verdict_path=$(printf '%s\\n' "$prompt" | sed -n 's/^.*write this JSON to \`\\([^\`]*\\)\`.*/\\1/p')
@@ -5880,9 +6000,9 @@ test('a read-only reviewer stalls when it changes a worktree file', async () => 
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-const prompt = process.argv[process.argv.indexOf('-p') + 1];
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 if (process.argv[2] === '--version') process.exit(0);
 const verdictPath = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
 const worktree = process.env.FIXTURE_WORKTREE;
@@ -5934,8 +6054,8 @@ test('a reviewer cannot consume a stale approval from the same round', async () 
   await writeFile(
     join(binDir, 'claude'),
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-const prompt = process.argv[process.argv.indexOf('-p') + 1];
+import { writeFileSync, readFileSync } from 'node:fs';
+const prompt = process.argv.includes('--version') ? '' : readFileSync(0, 'utf8');
 const path = prompt.slice(prompt.indexOf('write this JSON to')).split(String.fromCharCode(96))[1];
 writeFileSync(path, JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [{ issue: 'fix it' }] }));
 `,
@@ -6631,7 +6751,7 @@ test('publishing stalls when the approved SHA has no gate receipt before its rev
   await writeFile(
     join(binDir, 'claude'),
     `#!/bin/sh
-prompt=$2
+prompt=$([ "$1" = --version ] || cat)
 case "$prompt" in
   *'Take on the role of a senior developer'*)
     printf '%s\\n' '{"verdict":"APPROVED","blocking":[],"nits":[]}' > "$FIXTURE_VERDICT_PATH"
@@ -6943,6 +7063,35 @@ process.stdout.write('adapter args captured\\n');
   assert.ok(
     addDirs.includes(dirname(taskFile)),
     `expected adapter command args to include task-file directory ${dirname(taskFile)}`,
+  );
+});
+
+test('a writer adapter receives linked-worktree Git metadata', async () => {
+  const capturedAddDirs = join(await mkdtemp(join(tmpdir(), 'loop-capture-')), 'add-dirs.json');
+  const captureScript = `require('node:fs').writeFileSync(${JSON.stringify(capturedAddDirs)}, process.argv[1]);`;
+  const { root, workItem } = await repoFixture({
+    config: `export default {
+  adapters: {
+    capture: {
+      command({ addDirs }) {
+        return { command: process.execPath, args: ['-e', ${JSON.stringify(captureScript)}, JSON.stringify(addDirs)] };
+      },
+    },
+  },
+  engines: { default: 'capture' },
+  phases: [{ name: 'capture', kind: 'agent', prompt: 'docs', permissions: ['write-worktree'], postconditions: [] }],
+};
+`,
+  });
+
+  const summary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+  const addDirs = JSON.parse(await readFile(capturedAddDirs, 'utf8'));
+  const gitCommonDir = resolve(summary.worktree, await git(summary.worktree, 'rev-parse', '--git-common-dir'));
+
+  assert.notEqual(summary.worktree, root, 'the writer runs in a linked worktree');
+  assert.ok(
+    addDirs.includes(gitCommonDir),
+    `expected writer adapter args to include linked-worktree Git metadata ${gitCommonDir}`,
   );
 });
 

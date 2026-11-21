@@ -319,6 +319,15 @@ export function passthroughRenderer() {
   return { write: (text) => text, end: () => '' };
 }
 
+/**
+ * npm commonly installs agent CLIs as Windows .cmd/.ps1 shims. Keep prompts
+ * off argv so cmd.exe never truncates or interprets their newlines and shell
+ * metacharacters. stdin bypasses the shim unchanged.
+ */
+function promptOverStdin(command, args, prompt) {
+  return { command, args, input: prompt };
+}
+
 /** @type {Adapter} */
 const claudeAdapter = {
   name: 'claude',
@@ -343,12 +352,12 @@ const claudeAdapter = {
     // `createRenderer` turns back into readable lines.
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const permissionMode = canWrite ? 'auto' : 'plan';
-    const args = ['-p', prompt, '--permission-mode', permissionMode, '--output-format', 'stream-json', '--verbose'];
+    const args = ['-p', '--permission-mode', permissionMode, '--output-format', 'stream-json', '--verbose'];
     if (agent.agent) args.push('--agent', agent.agent);
     if (agent.model) args.push('--model', agent.model);
     if (agent.effort) args.push('--effort', agent.effort);
     for (const dir of addDirs) args.push('--add-dir', dir);
-    return { command: 'claude', args };
+    return promptOverStdin('claude', args, prompt);
   },
   createRenderer: () => createJsonlRenderer(renderClaudeEvent),
 };
@@ -357,6 +366,10 @@ const claudeAdapter = {
 const codexAdapter = {
   name: 'codex',
   agentSupport: 'inline',
+  // Codex's Windows sandbox protects the linked worktree's git dir even when
+  // it is passed via --add-dir, so `git commit` fails there with index.lock
+  // denied. The runner commits a successful writer's changes instead.
+  runnerCommits: process.platform === 'win32',
   version: cliVersion('codex'),
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
   command({
@@ -369,11 +382,11 @@ const codexAdapter = {
   }) {
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const sandbox = canWrite ? 'workspace-write' : 'read-only';
-    const args = ['exec', prompt, '--sandbox', sandbox, '--cd', cwd];
+    const args = ['exec', '-', '--sandbox', sandbox, '--cd', cwd];
     if (agent.model) args.push('--model', agent.model);
     if (agent.effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(agent.effort)}`);
     for (const dir of addDirs) args.push('--add-dir', dir);
-    return { command: 'codex', args };
+    return promptOverStdin('codex', args, prompt);
   },
 };
 
@@ -449,15 +462,8 @@ const geminiAdapter = {
     // a hang. stream-json emits an event per step, which `createRenderer` turns
     // back into readable lines — same reasoning as the claude adapter above.
     //
-    // The prompt goes on stdin, not `--prompt`. Gemini's Windows launcher is a
-    // `.cmd`/`.ps1` shim, so on Git Bash aloop runs it through `cmd.exe /c`
-    // (see command.mjs windowsSpawnSpec). cmd.exe caps the whole command line at
-    // ~8191 chars and mangles newlines and metacharacters (`% ! & | < >`), so a
-    // real review prompt — work item plus instructions — arrives truncated or
-    // garbled and Gemini "ignores" it. stdin is a pipe cmd.exe never parses, so
-    // the prompt survives intact. `-p ""` still selects headless mode; Gemini
-    // documents `--prompt` as "appended to input on stdin", so an empty flag
-    // leaves the stdin prompt as the whole prompt.
+    // `--prompt ""` still selects headless mode; Gemini documents --prompt as
+    // appended to stdin, so the empty flag leaves stdin as the whole prompt.
     const canWrite = permissionLevel(permissions) === PERMISSIONS.WRITE_WORKTREE || artifactOnly;
     const args = [
       '--prompt',
@@ -470,7 +476,7 @@ const geminiAdapter = {
     ];
     if (agent.model) args.push('--model', agent.model);
     for (const dir of addDirs) args.push('--include-directories', dir);
-    return { command: 'gemini', args, input: agent.agent ? geminiAdapter.delegatePrompt(prompt, agent.agent) : prompt };
+    return promptOverStdin('gemini', args, agent.agent ? geminiAdapter.delegatePrompt(prompt, agent.agent) : prompt);
   },
   createRenderer: () => {
     const invoked = new Set();
@@ -507,6 +513,9 @@ function validateConfiguredAdapter(name, adapter) {
   }
   if (adapter.delegatePrompt !== undefined && typeof adapter.delegatePrompt !== 'function') {
     throw new Error(`Invalid adapter "${name}": delegatePrompt must be a function.`);
+  }
+  if (adapter.runnerCommits !== undefined && typeof adapter.runnerCommits !== 'boolean') {
+    throw new Error(`Invalid adapter "${name}": runnerCommits must be a boolean.`);
   }
   if (adapter.version !== undefined && typeof adapter.version !== 'function') {
     throw new Error(`Invalid adapter "${name}": version must be a function.`);

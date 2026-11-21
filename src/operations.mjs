@@ -1,11 +1,11 @@
 import { agentPhases, diagnoseAgents } from './agents.mjs';
 import { access, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, join, relative, resolve, win32 as windowsPath } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { adapterFor, resolvePhaseAgent } from './adapters.mjs';
-import { runCommand, signalProcessGroup } from './command.mjs';
+import { resolveWindowsExecutable, runCommand, signalProcessGroup } from './command.mjs';
 import { defaults, loadConfig, loadRunsDir } from './config.mjs';
 import { GitFacade } from './git.mjs';
 import { hashConfig, hashText } from './manifest.mjs';
@@ -1024,6 +1024,14 @@ async function checkCommand(command, args, cwd) {
   }
 }
 
+function describeWindowsEngine(command) {
+  const resolved = resolveWindowsExecutable(command);
+  if (!resolved) return 'Windows executable could not be resolved';
+  const extension = windowsPath.extname(resolved).toLowerCase();
+  const kind = extension === '.cmd' || extension === '.bat' ? 'cmd shim' : extension === '.ps1' ? 'ps1 shim' : 'exe';
+  return `${kind}: ${resolved}${kind === 'exe' ? '' : ' (prompts use stdin)'}`;
+}
+
 export async function doctor(options = {}) {
   const { cwd = process.cwd(), configPath } = /** @type {any} */ (options);
   const checks = [];
@@ -1058,10 +1066,9 @@ export async function doctor(options = {}) {
           addDirs: [],
           agent,
         }).command;
-        checks.push({
-          name: `engine ${name}`,
-          ...(await checkCommand(process.platform === 'win32' ? 'where' : 'which', [command], repoRoot)),
-        });
+        const check = await checkCommand(process.platform === 'win32' ? 'where' : 'which', [command], repoRoot);
+        if (process.platform === 'win32') check.detail = `${check.detail}; ${describeWindowsEngine(command)}`;
+        checks.push({ name: `engine ${name}`, ...check });
       } catch (error) {
         checks.push({ name: `engine ${name}`, ok: false, detail: error.message });
       }

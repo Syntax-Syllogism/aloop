@@ -46,6 +46,19 @@ The command runner finds extensionless commands through the Windows `PATH` and `
 - `.cmd` and `.bat` shims run through `ComSpec`.
 - `.ps1` scripts run through Windows PowerShell with a non-interactive profile and execution-policy bypass.
 
+A `.cmd`/`.bat` shim runs through `cmd.exe`, whose command line is capped at
+about 8191 characters and which mangles newlines and shell metacharacters
+(`% ! & | < >`). A large agent prompt passed as a command-line argument through
+such a shim therefore arrives truncated or garbled. The built-in Codex, Claude,
+and Gemini adapters send their prompts on stdin (an adapter may return an
+`input` string that the runner writes to the child's stdin) instead of on the
+command line. The command runner rejects `.cmd`/`.bat` and `.ps1` shim invocations whose
+resolved path or arguments contain a newline or shell metacharacter, or whose
+command line approaches 8,000 characters, so
+a future adapter cannot silently reintroduce this failure. `aloop doctor`
+reports whether each Windows engine resolves to an executable, a cmd shim, or a
+PowerShell shim; shim-backed engines continue to receive prompts over stdin.
+
 This lets agent CLIs and the default shell work when their Windows launchers are on `PATH`.
 
 A `.cmd` or `.bat` shim runs through `cmd.exe`. That limits the command line to about 8191 characters and mangles newlines and metacharacters (`% ! & | < >`). A large prompt passed as an argument through such a shim arrives truncated or garbled. The Gemini adapter avoids this by sending its prompt on stdin instead. An adapter can return an `input` string, and the runner writes it to the child's stdin. Gemini's Windows launcher is a shim, so a prompt on the command line would be corrupted.

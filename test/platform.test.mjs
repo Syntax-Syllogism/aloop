@@ -4,7 +4,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveShell, resolveWindowsExecutable, runCommand } from '../src/command.mjs';
+import { resolveShell, resolveWindowsExecutable, runCommand, WindowsCmdShimArgumentError } from '../src/command.mjs';
 import { openTerminalInput } from '../src/reporter.mjs';
 
 function fakeChild(pid = 1234) {
@@ -142,6 +142,125 @@ test(
     });
 
     assert.equal(result.stdout.trim(), 'platform-fixture alpha beta');
+  },
+);
+
+test('Windows command shims reject newline-bearing argv before cmd.exe can truncate it', async () => {
+  await assert.rejects(
+    runCommand('claude', ['-p', 'line one\nline two'], {
+      platform: 'win32',
+      resolveExecutable: () => 'C:\\Tools\\claude.cmd',
+      spawnImpl: () => assert.fail('unsafe command shim must not spawn'),
+    }),
+    (error) =>
+      error instanceof WindowsCmdShimArgumentError &&
+      error.code === 'ERR_WINDOWS_CMD_SHIM_ARGUMENT' &&
+      /send prompts via stdin/.test(error.message),
+  );
+});
+
+test('Windows command shims reject command-shell metacharacters before they can be interpreted', async () => {
+  for (const metacharacter of ['%', '!', '^', '&', '|', '<', '>', '(', ')']) {
+    await assert.rejects(
+      runCommand('claude', [`safe${metacharacter}unsafe`], {
+        platform: 'win32',
+        resolveExecutable: () => 'C:\\Tools\\claude.cmd',
+        spawnImpl: () => assert.fail('unsafe command shim must not spawn'),
+      }),
+      (error) =>
+        error instanceof WindowsCmdShimArgumentError &&
+        error.code === 'ERR_WINDOWS_CMD_SHIM_ARGUMENT' &&
+        /command-shell metacharacter/.test(error.message),
+      `expected ${JSON.stringify(metacharacter)} to be rejected`,
+    );
+  }
+});
+
+test('Windows command shims reject resolved paths with cmd.exe metacharacters', async () => {
+  for (const metacharacter of ['%', '!', '&']) {
+    await assert.rejects(
+      runCommand('claude', ['--version'], {
+        platform: 'win32',
+        resolveExecutable: () => `C:\\Users\\R${metacharacter}D\\claude.cmd`,
+        spawnImpl: () => assert.fail('unsafe command shim must not spawn'),
+      }),
+      (error) =>
+        error instanceof WindowsCmdShimArgumentError &&
+        error.code === 'ERR_WINDOWS_CMD_SHIM_ARGUMENT' &&
+        /shim path or argument.*command-shell metacharacter/.test(error.message),
+      `expected resolved path containing ${JSON.stringify(metacharacter)} to be rejected`,
+    );
+  }
+});
+
+test('Windows command shims reject command lines near cmd.exe length limit', async () => {
+  await assert.rejects(
+    runCommand('claude', ['x'.repeat(8000)], {
+      platform: 'win32',
+      resolveExecutable: () => 'C:\\Tools\\claude.cmd',
+      spawnImpl: () => assert.fail('over-length command shim must not spawn'),
+    }),
+    (error) => error instanceof WindowsCmdShimArgumentError && /8000 characters/.test(error.message),
+  );
+});
+
+test('Windows PowerShell shims apply the command-shim invocation guard', async () => {
+  const unsafeInvocations = [
+    { args: ['line one\nline two'], expectedMessage: /newline/ },
+    { args: ['safe&unsafe'], expectedMessage: /command-shell metacharacter/ },
+    { args: ['x'.repeat(8000)], expectedMessage: /8000 characters/ },
+  ];
+  for (const { args, expectedMessage } of unsafeInvocations) {
+    await assert.rejects(
+      runCommand('script', args, {
+        platform: 'win32',
+        resolveExecutable: () => 'C:\\Tools\\script.ps1',
+        spawnImpl: () => assert.fail('unsafe PowerShell shim must not spawn'),
+      }),
+      (error) =>
+        error instanceof WindowsCmdShimArgumentError &&
+        error.code === 'ERR_WINDOWS_CMD_SHIM_ARGUMENT' &&
+        expectedMessage.test(error.message),
+    );
+  }
+});
+
+test('Windows executable argv passes through untouched', async () => {
+  const child = fakeChild();
+  let call;
+  await runCommand('claude', ['line one\nline two'], {
+    platform: 'win32',
+    resolveExecutable: () => 'C:\\Tools\\claude.exe',
+    spawnImpl(command, args) {
+      call = { command, args };
+      setImmediate(() => child.emit('close', 0, null));
+      return child;
+    },
+  });
+  assert.deepEqual(call, { command: 'C:\\Tools\\claude.exe', args: ['line one\nline two'] });
+});
+
+test(
+  'Windows launches a PATH-resolved .cmd fixture through ComSpec',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), 'platform-fixtures');
+    const result = await runCommand('echo', ['alpha', 'beta'], {
+      platform: 'win32',
+      cwd: fixtureDir,
+      env: { ...process.env, PATH: `${fixtureDir};${process.env.PATH}` },
+    });
+
+    assert.equal(result.stdout.trim(), 'platform-fixture alpha beta');
+
+    await assert.rejects(
+      runCommand('echo', ['alpha&echo unsafe'], {
+        platform: 'win32',
+        cwd: fixtureDir,
+        env: { ...process.env, PATH: `${fixtureDir};${process.env.PATH}` },
+      }),
+      (error) => error instanceof WindowsCmdShimArgumentError && /command-shell metacharacter/.test(error.message),
+    );
   },
 );
 

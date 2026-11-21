@@ -83,9 +83,8 @@ export interface AdapterCommand {
   command: string;
   args: string[];
   /**
-   * Optional stdin for the command. Adapters use it to carry the prompt off the
-   * argument vector (gemini does, to dodge the cmd.exe command-line limit on
-   * Windows) rather than passing it as an argv element.
+   * Optional stdin for the command. Built-in adapters use it to carry prompts
+   * off the argument vector, avoiding Windows command-shim parsing.
    */
   input?: string;
   [key: string]: unknown;
@@ -100,6 +99,13 @@ export interface Adapter {
   version?: (options?: { agent?: Engine; cwd?: string }) => Promise<string | undefined>;
   usage?: () => Usage | undefined;
   createRenderer?: () => Renderer;
+  /**
+   * The agent cannot commit in a linked worktree (Codex's Windows sandbox
+   * denies writes to the worktree's git dir), so the runner commits a
+   * successful commit-producing phase's dirty tree on its behalf. Other
+   * engines that leave changes uncommitted still stall.
+   */
+  runnerCommits?: boolean;
 }
 
 export interface Renderer {
@@ -210,6 +216,10 @@ export interface ManifestEntry {
   inputSha?: string;
   outputSha?: string;
   approvedSha?: string;
+  runnerCommit?: {
+    message: string;
+    sha: string;
+  };
   usage?: Usage;
   promptInput?: {
     agentPrefix?: string;

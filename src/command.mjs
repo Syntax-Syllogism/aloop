@@ -55,6 +55,38 @@ export function signalProcessGroup(pid, signal, options = {}) {
 }
 
 const WINDOWS_EXECUTABLE_EXTENSIONS = ['.COM', '.EXE', '.BAT', '.CMD', '.PS1'];
+const WINDOWS_CMD_SAFE_LINE_LENGTH = 8000;
+const WINDOWS_CMD_METACHARACTERS = /[%!^&|<>()]/;
+
+export class WindowsCmdShimArgumentError extends Error {
+  constructor(executable, reason) {
+    super(
+      `Windows command shim ${JSON.stringify(executable)} cannot safely receive ${reason}; adapters must send prompts via stdin.`,
+    );
+    this.name = 'WindowsCmdShimArgumentError';
+    this.code = 'ERR_WINDOWS_CMD_SHIM_ARGUMENT';
+  }
+}
+
+function assertWindowsShimInvocationIsSafe(executable, args) {
+  const invocationParts = [executable, ...args];
+  if (invocationParts.some((part) => /[\r\n]/.test(part))) {
+    throw new WindowsCmdShimArgumentError(executable, 'a shim path or argument containing a newline');
+  }
+  if (invocationParts.some((part) => WINDOWS_CMD_METACHARACTERS.test(part))) {
+    throw new WindowsCmdShimArgumentError(
+      executable,
+      'a shim path or argument containing a command-shell metacharacter',
+    );
+  }
+  const commandLineLength = invocationParts.join(' ').length;
+  if (commandLineLength > WINDOWS_CMD_SAFE_LINE_LENGTH) {
+    throw new WindowsCmdShimArgumentError(
+      executable,
+      `a command line longer than ${WINDOWS_CMD_SAFE_LINE_LENGTH} characters`,
+    );
+  }
+}
 
 function environmentValue(env, name) {
   if (env[name] !== undefined) return env[name];
@@ -148,16 +180,18 @@ export function resolveShell(options = {}) {
     : { bin: 'powershell.exe', flag: '-Command' };
 }
 
-function windowsSpawnSpec(command, args, env, resolveExecutable) {
+export function windowsSpawnSpec(command, args, env, resolveExecutable = resolveWindowsExecutable) {
   const resolved = resolveExecutable(command, env) ?? command;
   const extension = windowsPath.extname(resolved).toLowerCase();
   if (extension === '.cmd' || extension === '.bat') {
+    assertWindowsShimInvocationIsSafe(resolved, args);
     return {
       command: environmentValue(env, 'ComSpec') ?? 'cmd.exe',
       args: ['/d', '/s', '/c', resolved, ...args],
     };
   }
   if (extension === '.ps1') {
+    assertWindowsShimInvocationIsSafe(resolved, args);
     return {
       command: environmentValue(env, 'SystemRoot')
         ? windowsPath.join(
