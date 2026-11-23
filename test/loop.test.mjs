@@ -5315,7 +5315,7 @@ test('a configured remote is used and validated before the run starts', async ()
   const { root, workItem } = await repoFixture({
     config: `export default {
   gate: ['true'],
-  remote: 'jprichter',
+  remote: 'upstream',
   worktreeRoot: ${JSON.stringify(trees)},
 };
 `,
@@ -5325,15 +5325,15 @@ test('a configured remote is used and validated before the run starts', async ()
   try {
     await assert.rejects(
       runLoop({ args: { taskFile: workItem, cwd: root, dryRun: true, yes: true } }),
-      /Configured remote "jprichter" does not exist/,
+      /Configured remote "upstream" does not exist/,
       'a misconfigured remote fails before any phase runs',
     );
-    await git(root, 'remote', 'add', 'jprichter', 'git@github.com:jprichter/fixture.git');
-    await git(root, 'remote', 'add', 'origin', 'git@github.com:elsewhere/fixture.git');
+    await git(root, 'remote', 'add', 'upstream', 'git@example.com:upstream/fixture.git');
+    await git(root, 'remote', 'add', 'origin', 'git@example.com:elsewhere/fixture.git');
     const lines = [];
     console.log = (message) => lines.push(String(message));
     await runLoop({ args: { taskFile: workItem, cwd: root, phases: ['publish'], dryRun: true, yes: true } });
-    assert.match(lines.join('\n'), /would push jprichter\/feat\//, 'the configured remote wins over origin');
+    assert.match(lines.join('\n'), /would push upstream\/feat\//, 'the configured remote wins over origin');
   } finally {
     console.log = original;
   }
