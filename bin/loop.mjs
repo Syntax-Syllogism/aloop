@@ -51,6 +51,8 @@ const OPTION_BLOCKS = {
     '      --older-than <n>    Clean completed runs older than n days',
     '  -y, --yes               Confirm destructive clean operations',
     '      --dry-run           Preview clean operations without changing files',
+    '      --force             Clean worktrees even with uncommitted changes',
+    "      --branches          Also delete each removed run's local branch once merged",
   ],
   config: ['      --config <path>     Load loop configuration from this file'],
   json: ['      --json              Emit machine-readable JSON'],
@@ -63,6 +65,8 @@ const OPTION_BLOCKS = {
     '      --older-than <n>    Clean completed runs older than n days',
     '  -y, --yes               Confirm destructive clean operations',
     '      --dry-run           Preview clean operations without changing files',
+    '      --force             Clean worktrees even with uncommitted changes',
+    "      --branches          Also delete each removed run's local branch once merged",
   ],
   doctor: [
     '      --config <path>     Load loop configuration from this file',
@@ -185,6 +189,7 @@ export function parseLoopArgs(argv) {
       'older-than': { type: 'string' },
       preset: { type: 'string' },
       force: { type: 'boolean' },
+      branches: { type: 'boolean' },
       all: { type: 'boolean', short: 'a' },
       guides: { type: 'boolean', short: 'g' },
       help: { type: 'boolean', short: 'h' },
@@ -293,6 +298,7 @@ export function parseLoopArgs(argv) {
     olderThanDays,
     preset: values.preset,
     force: values.force,
+    branches: values.branches,
     repo: values.repo,
     intervalMs: intervalSeconds === undefined ? undefined : intervalSeconds * 1000,
     once: values.once,
@@ -686,17 +692,43 @@ export async function runOperationalCommand(args, { cwd = process.cwd(), output 
       olderThanDays: args.olderThanDays ?? 30,
       dryRun: args.dryRun,
       yes: args.yes,
+      force: args.force,
+      branches: args.branches,
+      onWarning: (message) => output.error?.(message),
     });
     if (args.json) output.log(JSON.stringify(result, null, 2));
-    else {
-      output.log(
-        `${result.dryRun ? 'Would remove' : 'Removed'} ${result.dryRun ? result.candidates.length : result.removed.length} run(s).`,
-      );
+    else if (result.dryRun) {
+      output.log(`Would remove ${result.candidates.length} run(s).`);
       for (const run of result.candidates)
         output.log(`  ${run.name} (${run.updatedAt ?? run.startedAt ?? 'unknown date'})`);
-      if (!args.yes && !args.dryRun && result.candidates.length)
-        output.log('Preview only: rerun with --yes to remove these runs.');
-      for (const error of result.errors) output.error?.(`  ${error.name}: ${error.error}`);
+      if (!args.dryRun && result.candidates.length) output.log('Preview only: rerun with --yes to remove these runs.');
+    } else {
+      output.log(`Removed ${result.removed.length} run(s).`);
+      for (const detail of result.details) {
+        const notes = [];
+        if (detail.worktree === 'missing') notes.push('worktree already gone');
+        if (detail.worktree === 'unregistered-dir') notes.push('unregistered directory kept');
+        if (detail.branch === 'deleted') notes.push('branch deleted');
+        if (detail.branch === 'kept-missing') notes.push('local branch already gone');
+        if (detail.branch === 'kept-checked-out') notes.push('checked-out branch kept');
+        output.log(`  ${detail.name}${notes.length ? ` (${notes.join(', ')})` : ''}`);
+      }
+      const removed = new Set(result.removed);
+      const runErrors = result.errors.filter(({ name }) => !removed.has(name));
+      const branchErrors = result.errors.filter(({ name }) => removed.has(name));
+      if (runErrors.length) {
+        output.log(`Failed ${runErrors.length} run(s):`);
+        for (const error of runErrors) output.log(`  ${error.name}: ${error.error}`);
+      }
+      if (branchErrors.length) {
+        output.log(`Branch cleanup failed for ${branchErrors.length} removed run(s):`);
+        for (const error of branchErrors) output.log(`  ${error.name}: ${error.error}`);
+      }
+      const unmerged = result.details.filter((detail) => detail.branch === 'kept-unmerged');
+      if (unmerged.length) {
+        output.log(`Kept ${unmerged.length} branch(es) without merge confirmation:`);
+        for (const detail of unmerged) output.log(`  ${detail.name}`);
+      }
     }
     return result;
   }
@@ -755,6 +787,7 @@ if (isMainEntrypoint(import.meta.url)) {
     } else {
       const result = await runOperationalCommand(args);
       if (args.command === 'doctor' && !(/** @type {any} */ (result).ok)) process.exitCode = 1;
+      if (args.command === 'clean' && /** @type {any} */ (result).errors?.length) process.exitCode = 1;
     }
   } catch (error) {
     console.error(error.message);

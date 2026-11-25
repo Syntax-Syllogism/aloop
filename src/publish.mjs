@@ -5,6 +5,16 @@ import { GitFacade } from './git.mjs';
 import { gitlabBackend } from './backends/gitlab.mjs';
 
 const PR_FIELDS = 'url,baseRefName,headRefOid,isDraft,number';
+const MERGED_PULL_REQUESTS_QUERY = `
+  query($owner: String!, $repo: String!, $branch: String!, $base: String!, $endCursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequests(states: [MERGED], headRefName: $branch, baseRefName: $base, first: 100, after: $endCursor) {
+        nodes { state baseRefName headRefOid }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
 
 export class PublishError extends Error {
   constructor(message, options = {}) {
@@ -83,6 +93,28 @@ export function githubBackend(options = {}) {
         throw new PublishError(`Unable to inspect pull request for ${branch}: ${error.message}`, { cause: error });
       }
     },
+    async mergedRequests({ remote, branch, base }) {
+      const [owner, repo] = (await resolveRepository(remote)).split('/');
+      const { stdout } = await run([
+        'api',
+        'graphql',
+        '--hostname',
+        'github.com',
+        '--paginate',
+        '--slurp',
+        '-f',
+        `query=${MERGED_PULL_REQUESTS_QUERY}`,
+        '-f',
+        `owner=${owner}`,
+        '-f',
+        `repo=${repo}`,
+        '-f',
+        `branch=${branch}`,
+        '-f',
+        `base=${base}`,
+      ]);
+      return JSON.parse(stdout).flatMap((page) => page.data.repository.pullRequests.nodes);
+    },
     async create({ remote, base, branch, title, bodyFilePath, draft }) {
       const args = ['pr', 'create', '--base', base, '--head', branch, '--title', title, '--body-file', bodyFilePath];
       if (draft) args.push('--draft');
@@ -94,7 +126,7 @@ export function githubBackend(options = {}) {
   };
 }
 
-function resolveBackend(backend, cwd, git, env) {
+export function resolveBackend(backend, cwd, git, env = undefined) {
   if (backend === undefined || backend === null || backend === 'github') return githubBackend({ cwd, git, env });
   if (backend === 'gitlab') return gitlabBackend({ cwd, git, env });
   if (typeof backend === 'object' && backend !== null) {

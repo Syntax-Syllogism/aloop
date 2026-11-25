@@ -12,6 +12,7 @@ const NO_MERGE_REQUEST_RE =
  * @property {string} web_url
  * @property {string} target_branch
  * @property {string} sha - The merge request head commit SHA.
+ * @property {string} [state]
  * @property {boolean} [draft]
  * @property {boolean} [work_in_progress] - Legacy GitLab draft field.
  */
@@ -20,6 +21,7 @@ const NO_MERGE_REQUEST_RE =
  * @typedef {object} GitLabTransport
  * @property {(ctx: { host: string }) => Promise<void>} checkAuth
  * @property {(ctx: { host: string, project: string, branch: string }) => Promise<GitLabMr|null>} getMergeRequest
+ * @property {(ctx: { host: string, project: string, branch: string, base: string }) => Promise<GitLabMr[]>} [listMergedRequests]
  * @property {(ctx: { host: string, project: string, sourceBranch: string, targetBranch: string, title: string, description: string, descriptionFilePath?: string, draft: boolean }) => Promise<void>} createMergeRequest
  * @property {(ctx: { host: string, project: string, iid: number, branch: string, title: string, description: string, descriptionFilePath?: string, draft: boolean }) => Promise<void>} updateMergeRequest
  */
@@ -123,6 +125,32 @@ export function glabTransport(options = {}) {
       }
     },
 
+    async listMergedRequests({ host, project, branch, base }) {
+      const pageSize = 30;
+      const args = [
+        'mr',
+        'list',
+        '--merged',
+        '--source-branch',
+        branch,
+        '--target-branch',
+        base,
+        '--output',
+        'json',
+        '--repo',
+        repository(host, project),
+        '--per-page',
+        String(pageSize),
+      ];
+      const requests = [];
+      for (let page = 1; ; page += 1) {
+        const { stdout } = await run([...args, '--page', String(page)]);
+        const pageRequests = JSON.parse(stdout) ?? [];
+        requests.push(...pageRequests);
+        if (pageRequests.length < pageSize) return requests;
+      }
+    },
+
     async createMergeRequest({
       host,
       project,
@@ -215,6 +243,17 @@ export function gitlabBackend(options = {}) {
 
     async view({ remote, branch }) {
       return mapMergeRequest((await mergeRequest(remote, branch)).mr);
+    },
+
+    async mergedRequests({ remote, branch, base }) {
+      if (!transport.listMergedRequests) throw new PublishError('The GitLab transport does not support merge lookups.');
+      const { host, project } = await resolveRepository(remote);
+      const requests = await transport.listMergedRequests({ host, project, branch, base });
+      return requests.map((mr) => ({
+        state: mr.state?.toUpperCase(),
+        baseRefName: mr.target_branch,
+        headRefOid: mr.sha,
+      }));
     },
 
     async create({ remote, base, branch, title, body, bodyFilePath, draft }) {

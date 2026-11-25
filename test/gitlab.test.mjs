@@ -68,6 +68,102 @@ test('GitLab backend maps native MR fields and supports the legacy draft field',
   ]);
 });
 
+test('GitHub finds merged requests on later pages for the specified source and target branches', async () => {
+  const context = { remote: 'origin', branch: 'feat/example', base: 'master' };
+  const merged = { state: 'MERGED', baseRefName: 'master', headRefOid: sha };
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({
+    ...merged,
+    headRefOid: index.toString(16).padStart(40, '0'),
+  }));
+  const github = githubBackend({
+    git: {
+      async remoteUrl() {
+        return 'https://github.com/group/project.git';
+      },
+    },
+    async runner(command, args) {
+      assert.equal(command, 'gh');
+      const query = args.find((arg) => arg.startsWith('query='));
+      assert.match(query, /\$endCursor: String/);
+      assert.match(
+        query,
+        /pullRequests\(states: \[MERGED\], headRefName: \$branch, baseRefName: \$base, first: 100, after: \$endCursor\)/,
+      );
+      assert.match(query, /pageInfo \{ hasNextPage endCursor \}/);
+      assert.deepEqual(args, [
+        'api',
+        'graphql',
+        '--hostname',
+        'github.com',
+        '--paginate',
+        '--slurp',
+        '-f',
+        query,
+        '-f',
+        'owner=group',
+        '-f',
+        'repo=project',
+        '-f',
+        'branch=feat/example',
+        '-f',
+        'base=master',
+      ]);
+      const page = (nodes, hasNextPage, endCursor) => ({
+        data: { repository: { pullRequests: { nodes, pageInfo: { hasNextPage, endCursor } } } },
+      });
+      return { stdout: JSON.stringify([page(firstPage, true, 'cursor1'), page([merged], false, 'cursor2')]) };
+    },
+  });
+  assert.deepEqual(await github.mergedRequests(context), [...firstPage, merged]);
+});
+
+test('GitLab searches full pages of merged requests until the last page', async () => {
+  const context = { remote: 'origin', branch: 'feat/example', base: 'master' };
+  const merged = { state: 'merged', target_branch: 'master', sha };
+  const firstPage = Array.from({ length: 30 }, (_, index) => ({
+    ...merged,
+    sha: index.toString(16).padStart(40, '0'),
+  }));
+  const pages = [firstPage, [merged]];
+  let page = 0;
+  const gitlab = gitlabBackend({
+    git: {
+      async remoteUrl() {
+        return 'https://gitlab.com/group/project.git';
+      },
+    },
+    transport: glabTransport({
+      async runner(command, args) {
+        assert.equal(command, 'glab');
+        assert.deepEqual(args, [
+          'mr',
+          'list',
+          '--merged',
+          '--source-branch',
+          'feat/example',
+          '--target-branch',
+          'master',
+          '--output',
+          'json',
+          '--repo',
+          'https://gitlab.com/group/project',
+          '--per-page',
+          '30',
+          '--page',
+          String(++page),
+        ]);
+        assert.ok(page <= pages.length);
+        return { stdout: JSON.stringify(pages[page - 1]) };
+      },
+    }),
+  });
+  assert.deepEqual(
+    await gitlab.mergedRequests(context),
+    [...firstPage, merged].map((mr) => ({ state: 'MERGED', baseRefName: mr.target_branch, headRefOid: mr.sha })),
+  );
+  assert.equal(page, 2);
+});
+
 test('GitLab publish creates and then updates a verified draft MR', async () => {
   const runDir = await mkdtemp(join(tmpdir(), 'loop-gitlab-publish-'));
   const bodyPath = join(runDir, 'pr.md');

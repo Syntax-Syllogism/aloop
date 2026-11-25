@@ -61,6 +61,8 @@ These modules support the orchestration layer:
 - `src/adapters.mjs`: agent adapters, including each adapter's named-agent support (`agentSupport`)
 - `src/agents.mjs`: named-agent definitions (lookup, frontmatter parsing, inline prompt wrapping) and the setup diagnostics shared by `doctor` and runs. See [Named agents](agents.md).
 - `src/git.mjs`: Git operations
+- `src/operations.mjs`: operator commands over saved runs (`list`, `status`, `inspect`, `watch`, `replay`, `cancel`, `clean`, `doctor`). It owns the cleanup guards, such as the dirty-worktree check and merge-confirmed branch deletion. See [Operational run commands](operations.md).
+- `src/publish.mjs`: the publish use case, the GitHub backend, and backend resolution. `src/backends/gitlab.mjs` holds the bundled GitLab backend and `glab` transport. See [Publishing](publishing.md).
 - `src/prompts.mjs`: prompts
 - `src/state.mjs`: durable state
 - `src/review-routing.mjs`: `reviewRouting` normalization and the per-round risk assessment (file count, changed lines, binary changes, sensitive globs) that selects the reviewer tier. See [Risk-based review routing](loop.md#risk-based-review-routing).

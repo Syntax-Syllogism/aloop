@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseLoopArgs, runOperationalCommand, watchCommand } from '../bin/loop.mjs';
@@ -21,6 +22,7 @@ import {
 import { RunState } from '../src/state.mjs';
 
 const exec = promisify(execFile);
+const cli = fileURLToPath(new URL('../bin/loop.mjs', import.meta.url));
 
 function processIsAlive(pid) {
   try {
@@ -510,10 +512,264 @@ test('clean removes a completed run worktree before its run directory', async ()
   await assert.rejects(readFile(join(worktree, 'README.md')));
 });
 
+async function completedTree(root, name) {
+  const worktree = join(root, 'worktrees', name);
+  const branch = `feat/${name}`;
+  await git(root, 'worktree', 'add', '-b', branch, worktree, 'master');
+  const state = await completedRun(root, name, { worktree, branch });
+  await ageRun(state);
+  return { state, worktree, branch };
+}
+
+async function ageRun(state) {
+  const saved = JSON.parse(await readFile(state.path, 'utf8'));
+  saved.updatedAt = '2020-01-01T00:00:00.000Z';
+  await writeFile(state.path, `${JSON.stringify(saved)}\n`);
+}
+
+test('clean removes missing and clean worktrees while retaining a dirty worktree in a mixed batch', async (t) => {
+  const root = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const missing = await completedTree(root, 'a-missing');
+  const dirty = await completedTree(root, 'b-dirty');
+  const clean = await completedTree(root, 'c-clean');
+  await rm(missing.worktree, { recursive: true });
+  await git(dirty.worktree, 'config', 'status.showUntrackedFiles', 'no');
+  await writeFile(join(dirty.worktree, 'untracked.txt'), 'keep me');
+  assert.match(await git(root, 'worktree', 'list', '--porcelain'), /^prunable /m);
+
+  const result = await cleanRuns({ cwd: root, yes: true });
+  assert.deepEqual(result.removed, ['a-missing', 'c-clean']);
+  assert.deepEqual(
+    result.errors.map(({ name, code }) => ({ name, code })),
+    [{ name: 'b-dirty', code: 'dirty-worktree' }],
+  );
+  assert.deepEqual(result.details, [
+    { name: 'a-missing', worktree: 'missing', branch: 'skipped' },
+    { name: 'c-clean', worktree: 'removed', branch: 'skipped' },
+  ]);
+  assert.doesNotMatch(await git(root, 'worktree', 'list', '--porcelain'), /a-missing|c-clean/);
+  await assert.rejects(readFile(missing.state.path), { code: 'ENOENT' });
+  await assert.rejects(readFile(clean.state.path), { code: 'ENOENT' });
+  await readFile(dirty.state.path);
+  assert.equal(await readFile(join(dirty.worktree, 'untracked.txt'), 'utf8'), 'keep me');
+
+  const forced = await cleanRuns({ cwd: root, yes: true, force: true });
+  assert.deepEqual(forced.removed, ['b-dirty']);
+  assert.deepEqual(forced.errors, []);
+  assert.equal(forced.force, true);
+  await assert.rejects(readFile(dirty.state.path), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(dirty.worktree, 'untracked.txt')), { code: 'ENOENT' });
+});
+
+test('clean keeps an existing unregistered directory and recognizes symlinked worktree paths', async (t) => {
+  const root = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const unregistered = join(root, 'unregistered');
+  await mkdir(unregistered);
+  await writeFile(join(unregistered, 'file'), 'keep me');
+  const state = await completedRun(root, 'orphan', { worktree: unregistered });
+  await ageRun(state);
+
+  const alias = join(root, 'alias');
+  await symlink(root, alias, 'junction');
+  const worktree = join(root, 'tree');
+  await git(root, 'worktree', 'add', '-b', 'feat/linked', worktree, 'master');
+  await ageRun(await completedRun(root, 'linked', { worktree: join(alias, 'tree') }));
+  await ageRun(await completedRun(root, 'main', { worktree: alias }));
+
+  const result = await cleanRuns({ cwd: alias, yes: true, force: true });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.details, [
+    { name: 'linked', worktree: 'removed', branch: 'skipped' },
+    { name: 'main', worktree: 'none', branch: 'skipped' },
+    { name: 'orphan', worktree: 'unregistered-dir', branch: 'skipped' },
+  ]);
+  await assert.rejects(readFile(state.path), { code: 'ENOENT' });
+  assert.equal(await readFile(join(unregistered, 'file'), 'utf8'), 'keep me');
+  assert.equal(await git(root, 'branch', '--show-current'), 'master');
+});
+
+test('clean --branches deletes only branches whose tips are covered by a merge', async (t) => {
+  const root = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await git(root, 'remote', 'add', 'forge', 'https://github.com/example/project.git');
+  const local = await completedTree(root, 'local');
+  await git(local.worktree, 'commit', '--allow-empty', '-m', 'local change');
+  await git(root, 'merge', '--no-ff', local.branch);
+  const heads = {};
+  for (const name of ['squashed', 'advanced', 'older', 'unmerged', 'wrong-base']) {
+    const tree = await completedTree(root, name);
+    await git(tree.worktree, 'commit', '--allow-empty', '-m', 'feature change');
+    if (name !== 'unmerged') heads[tree.branch] = await git(tree.worktree, 'rev-parse', 'HEAD');
+    if (name === 'advanced') await git(tree.worktree, 'commit', '--allow-empty', '-m', 'new local change');
+    if (name === 'older') {
+      await git(tree.worktree, 'commit', '--allow-empty', '-m', 'additional merged change');
+      heads[tree.branch] = await git(tree.worktree, 'rev-parse', 'HEAD');
+      await git(tree.worktree, 'reset', '--hard', 'HEAD^');
+    }
+  }
+  await git(root, 'worktree', 'add', '-b', 'feat/checked', join(root, 'checked'));
+  await ageRun(await completedRun(root, 'checked'));
+  await ageRun(await completedRun(root, 'missing'));
+  await ageRun(await completedRun(root, 'base', { branch: 'master' }));
+  const precheckLog = join(root, 'prechecks');
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    `
+    import { appendFile } from 'node:fs/promises';
+    export default { remote: 'forge', publish: { backend: {
+      async precheck({ remote }) { await appendFile(${JSON.stringify(precheckLog)}, remote + '\\n'); },
+      async mergedRequests({ branch }) {
+        const headRefOid = ${JSON.stringify(heads)}[branch];
+        return headRefOid ? [{
+          state: 'MERGED', headRefOid, baseRefName: branch === 'feat/wrong-base' ? 'other' : 'master',
+        }] : null;
+      },
+    } } };
+  `,
+  );
+
+  const result = await cleanRuns({
+    cwd: root,
+    yes: true,
+    branches: true,
+    onWarning: (warning) => assert.fail(warning),
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.branches, true);
+  assert.equal(await readFile(precheckLog, 'utf8'), 'forge\n');
+  assert.deepEqual(Object.fromEntries(result.details.map(({ name, branch }) => [name, branch])), {
+    advanced: 'kept-unmerged',
+    base: 'skipped',
+    checked: 'kept-checked-out',
+    local: 'deleted',
+    missing: 'kept-missing',
+    older: 'deleted',
+    squashed: 'deleted',
+    unmerged: 'kept-unmerged',
+    'wrong-base': 'kept-unmerged',
+  });
+  assert.equal(
+    await git(root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'),
+    'feat/advanced\nfeat/checked\nfeat/unmerged\nfeat/wrong-base\nmaster',
+  );
+});
+
+test('clean --branches keeps unmerged branches and warns once when forge precheck fails', async (t) => {
+  const root = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await git(root, 'remote', 'add', 'origin', 'https://github.com/example/project.git');
+  for (const name of ['a', 'b']) {
+    const tree = await completedTree(root, name);
+    await git(tree.worktree, 'commit', '--allow-empty', '-m', 'unmerged');
+  }
+  const marker = join(root, 'prechecks');
+  await writeFile(
+    join(root, 'loop.config.mjs'),
+    `
+    import { appendFile } from 'node:fs/promises';
+    export default { publish: { backend: {
+      async precheck() {
+        await appendFile(${JSON.stringify(marker)}, 'check\\n');
+        throw new Error('offline');
+      },
+      mergedRequests() { throw new Error('lookup should have been skipped'); },
+    } } };
+  `,
+  );
+  const warnings = [];
+  const result = await cleanRuns({
+    cwd: root,
+    yes: true,
+    branches: true,
+    onWarning: (message) => warnings.push(message),
+  });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.removed, ['a', 'b']);
+  assert.deepEqual(
+    result.details.map(({ branch, branchReason }) => [branch, branchReason]),
+    [
+      ['kept-unmerged', 'offline'],
+      ['kept-unmerged', 'offline'],
+    ],
+  );
+  assert.equal(await readFile(marker, 'utf8'), 'check\n');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Warning:.*offline/);
+});
+
+test('clean CLI exits 1 for dirty runs and separates failures from removals', async (t) => {
+  const root = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dirty = await completedTree(root, 'dirty');
+  await writeFile(join(dirty.worktree, 'untracked.txt'), 'keep me');
+  const args = [cli, 'clean', '--yes'];
+
+  await assert.rejects(exec(process.execPath, args, { cwd: root }), (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, 1);
+    assert.equal(error.stderr, '');
+    assert.match(
+      error.stdout,
+      /^Removed 0 run\(s\)\.\r?\nFailed 1 run\(s\):\r?\n  dirty: Worktree has uncommitted changes/,
+    );
+    return true;
+  });
+  await assert.rejects(exec(process.execPath, [...args, '--json'], { cwd: root }), (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, 1);
+    const result = JSON.parse(error.stdout);
+    assert.deepEqual(result.removed, []);
+    assert.equal(result.errors[0].code, 'dirty-worktree');
+    assert.deepEqual(result.details, []);
+    assert.equal(result.force, false);
+    assert.equal(result.branches, false);
+    return true;
+  });
+  const missing = await completedTree(root, 'missing');
+  await rm(missing.worktree, { recursive: true });
+  await completedTree(root, 'clean');
+  await assert.rejects(exec(process.execPath, args, { cwd: root }), (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, 1);
+    assert.match(
+      error.stdout,
+      /^Removed 2 run\(s\)\.\r?\n  clean\r?\n  missing \(worktree already gone\)\r?\nFailed 1 run\(s\):\r?\n  dirty:/,
+    );
+    return true;
+  });
+  const { stdout } = await exec(process.execPath, [...args, '--force'], { cwd: root });
+  assert.match(stdout, /^Removed 1 run\(s\)\.\r?\n  dirty/);
+});
+
+test('clean CLI reports branch cleanup failures for removed runs separately', async (t) => {
+  const root = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await ageRun(await completedRun(root, 'merged'));
+  await git(root, 'branch', 'feat/merged');
+  await writeFile(join(root, '.git', 'refs', 'heads', 'feat', 'merged.lock'), '');
+  await assert.rejects(exec(process.execPath, [cli, 'clean', '--yes', '--branches'], { cwd: root }), (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, 1);
+    assert.equal(error.stderr, '');
+    assert.match(
+      error.stdout,
+      /^Removed 1 run\(s\)\.\r?\n  merged\r?\nBranch cleanup failed for 1 removed run\(s\):\r?\n  merged:/,
+    );
+    return true;
+  });
+  assert.deepEqual(await listRuns({ cwd: root }), []);
+  assert.equal(await git(root, 'branch', '--list', 'feat/merged'), 'feat/merged');
+});
+
 test('operational subcommands parse names and machine-readable options', () => {
   assert.deepEqual(parseLoopArgs(['list', '--json']).command, 'list');
   assert.equal(parseLoopArgs(['status', 'demo', '--json']).runName, 'demo');
   assert.equal(parseLoopArgs(['clean', '--older-than', '14', '--yes']).olderThanDays, 14);
+  const clean = parseLoopArgs(['clean', '--yes', '--force', '--branches']);
+  assert.equal(clean.force, true);
+  assert.equal(clean.branches, true);
   assert.equal(parseLoopArgs(['doctor', '--json']).json, true);
   assert.equal(parseLoopArgs(['replay', 'demo', '--json']).runName, 'demo');
 });

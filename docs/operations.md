@@ -103,11 +103,16 @@ aloop clean
 aloop clean --older-than 14
 aloop clean --older-than 14 --yes
 aloop clean --older-than 14 --dry-run --json
+aloop clean --yes --branches
 ```
 
 `clean` considers only runs with derived status `completed` whose `updatedAt` (or `startedAt` if that's missing) is at least the given number of days old. The default is 30 days.
 
-Without `--yes`, it previews the candidates and changes nothing. `--dry-run` asks for the same preview explicitly. With `--yes`, it removes each candidate's run directory. If the run has an external worktree, that's removed through Git first. `clean` never touches active, interrupted, stalled, cancelled, or unknown runs.
+Without `--yes`, it previews the candidates and changes nothing. `--dry-run` asks for the same preview explicitly. With `--yes`, Git removes registered external worktrees before aloop removes their run directories. If a worktree is already gone, aloop prunes stale Git metadata and removes the run directory. An existing unregistered directory is left in place.
+
+Worktrees with uncommitted changes, including untracked files, and their run directories are kept by default. Commit or stash changes before retrying, or pass `--force` to discard them. Cleanup lists successful removals and failures separately. The exit code is 1 if any candidate fails, including with `--json`.
+
+Pass `--branches` to also delete each removed run's local branch when its tip is merged into the base. Clean checks local and remote-tracking base branches, then asks the configured GitHub or GitLab backend for a merged request whose head contains the local tip. This also covers squash merges. A custom backend supports this check only if it implements the optional `mergedRequests` operation. See [Custom backends](publishing.md#custom-backends). Checked-out branches and branches without merge confirmation are kept. Forge lookup failures produce a warning and do not affect the exit code. If a branch can't be deleted after its run is removed, that counts as a failure, and the exit code is 1.
 
 ## Diagnosing local prerequisites
 

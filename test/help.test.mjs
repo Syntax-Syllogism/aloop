@@ -23,7 +23,13 @@ test('each aloop command prints its own help and relevant options', async (t) =>
     if (command !== 'run') assert.doesNotMatch(stdout, /--task-file/);
     if (command !== 'watch') assert.doesNotMatch(stdout, /--interval/);
     if (command !== 'clean') assert.doesNotMatch(stdout, /--older-than/);
-    if (command !== 'init') assert.doesNotMatch(stdout, /--force/);
+    if (command === 'clean') {
+      assert.match(stdout, /--force/);
+      assert.match(stdout, /--branches/);
+    } else {
+      if (command !== 'init') assert.doesNotMatch(stdout, /--force/);
+      assert.doesNotMatch(stdout, /--branches/);
+    }
     if (command === 'init') {
       assert.doesNotMatch(stdout, /--config/);
     } else if (command !== 'help') {
@@ -39,6 +45,7 @@ test('aloop --help retains the complete command list', async (t) => {
   assert.deepEqual(await readdir(cwd), [], 'help should leave no state or lock files');
   assert.equal(stderr, '');
   assert.match(stdout, /^Usage: aloop \[command\] \[options\]/);
+  assert.match(stdout, /--branches/);
   for (const command of commands) assert.match(stdout, new RegExp(`^  ${command}\\b`, 'm'));
 });
 

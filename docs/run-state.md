@@ -88,4 +88,4 @@ A saved `status: "running"` with no live runner or active command is derived as 
 
 To stop an active run, use `aloop cancel <name>`. It waits for the recorded command and runner to stop, then records `status: "cancelled"` and releases the lock. The run directory and worktree stay for inspection.
 
-To clear out finished runs, preview and remove them with `aloop clean`. It also removes the external worktree of each selected completed run. It never selects active, interrupted, stalled, cancelled, or unknown runs.
+To clear out finished runs, preview and remove them with `aloop clean`. It also removes the registered external worktree of each selected completed run. A dirty worktree and its run directory are kept unless `--force` is given. It never selects active, interrupted, stalled, cancelled, or unknown runs.

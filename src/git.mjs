@@ -44,12 +44,12 @@ export class GitFacade {
     return stdout;
   }
 
-  async status() {
-    return this.output(['status', '--porcelain']);
+  async status(options = []) {
+    return this.output(['status', '--porcelain', ...options]);
   }
 
-  async isDirty() {
-    return Boolean(await this.status());
+  async isDirty(options = []) {
+    return Boolean(await this.status(options));
   }
 
   async push(remote, branch, { setUpstream = true, ...options } = {}) {
@@ -107,19 +107,39 @@ export class GitFacade {
     return { path, branch, created: true };
   }
 
-  async worktreePath(branch) {
-    const output = await this.output(['worktree', 'list', '--porcelain']);
-    const blocks = output.split('\n\n');
-    for (const block of blocks) {
-      const lines = block.split('\n');
-      const worktree = lines.find((line) => line.startsWith('worktree '))?.slice('worktree '.length);
-      const ref = lines.find((line) => line.startsWith('branch '))?.slice('branch '.length);
-      if (worktree && ref === `refs/heads/${branch}`) return worktree;
-    }
-    return null;
+  async worktreeList() {
+    const { stdout } = await this.run(['worktree', 'list', '--porcelain', '-z']);
+    return stdout.split('\0\0').flatMap((block) => {
+      const fields = block.split('\0');
+      const path = fields.find((field) => field.startsWith('worktree '))?.slice('worktree '.length);
+      const ref = fields.find((field) => field.startsWith('branch '))?.slice('branch '.length);
+      return path ? [{ path, ref }] : [];
+    });
   }
 
-  async removeWorktree(path) {
-    await this.run(['worktree', 'remove', '--force', path]);
+  async worktreePath(branch) {
+    return (await this.worktreeList()).find(({ ref }) => ref === `refs/heads/${branch}`)?.path ?? null;
+  }
+
+  async removeWorktree(path, { force = false } = {}) {
+    await this.run(['worktree', 'remove', ...(force ? ['--force'] : []), '--', path]);
+  }
+
+  async pruneWorktrees() {
+    await this.run(['worktree', 'prune', '--expire', 'now']);
+  }
+
+  async isAncestor(commit, ref) {
+    try {
+      await this.run(['merge-base', '--is-ancestor', commit, ref]);
+      return true;
+    } catch (error) {
+      if (error.code === 1 || error.code === 128) return false;
+      throw error;
+    }
+  }
+
+  async deleteBranch(branch) {
+    await this.run(['branch', '-D', '--', branch]);
   }
 }

@@ -63,12 +63,13 @@ GitLab drafts use both the native draft flag and the `Draft:` title prefix. An e
 
 For a REST, MCP, or other GitLab client, import `gitlabBackend` and inject a transport. The transport works in GitLab's own terms, and the backend maps merge requests to aloop's verified pull-request shape:
 
-| Method               | Context in, result out                                                                                                        |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `checkAuth`          | `{ host }`. Resolves or throws.                                                                                               |
-| `getMergeRequest`    | `{ host, project, branch }`. Returns `{ iid, web_url, target_branch, sha, draft }` (or legacy `work_in_progress`), or `null`. |
-| `createMergeRequest` | `{ host, project, sourceBranch, targetBranch, title, description, descriptionFilePath, draft }`                               |
-| `updateMergeRequest` | `{ host, project, iid, branch, title, description, descriptionFilePath, draft }`                                              |
+| Method               | Context in, result out                                                                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `checkAuth`          | `{ host }`. Resolves or throws.                                                                                                                                                      |
+| `getMergeRequest`    | `{ host, project, branch }`. Returns `{ iid, web_url, target_branch, sha, draft }` (or legacy `work_in_progress`), or `null`.                                                        |
+| `createMergeRequest` | `{ host, project, sourceBranch, targetBranch, title, description, descriptionFilePath, draft }`                                                                                      |
+| `updateMergeRequest` | `{ host, project, iid, branch, title, description, descriptionFilePath, draft }`                                                                                                     |
+| `listMergedRequests` | Optional. `{ host, project, branch, base }`. Returns merged MRs as `{ state, target_branch, sha }`. Only `aloop clean --branches` calls it. Without it, that check keeps the branch. |
 
 ```js
 import { gitlabBackend } from '@syntax-syllogism/aloop';
@@ -87,7 +88,7 @@ export default {
 
 ## Custom backends
 
-To use another service, set `publish.backend` to an object with all four operations. The driver passes these contexts:
+To use another service, set `publish.backend` to an object with all four required operations. The driver passes these contexts:
 
 ```js
 {
@@ -95,9 +96,13 @@ To use another service, set `publish.backend` to an object with all four operati
   async view({ remote, branch, base }) {},
   async create({ remote, branch, base, title, body, bodyFilePath, draft }) {},
   async update({ remote, branch, base, title, body, bodyFilePath, draft }) {},
+  // Optional. Only `aloop clean --branches` calls it.
+  async mergedRequests({ remote, branch, base }) {},
 }
 ```
 
 `view` returns the existing PR, or `null` if there isn't one. After `create` or `update`, the final `view` result must contain `url`, an integer `number`, `baseRefName`, `headRefOid`, and a boolean `isDraft`. They must match the configured base, the approved SHA, and the draft setting. `bodyFilePath` points to a temporary body-only file in the run directory, which the driver removes afterward. A backend can use either `body` or that path.
+
+The optional `mergedRequests` operation returns the merged requests whose head is `branch` and whose target is `base`, as an array of `{ state, baseRefName, headRefOid }`. `state` must be `'MERGED'`, and `headRefOid` must be a full commit SHA. `aloop clean --branches` uses these to confirm squash merges. A backend without this operation keeps those branches and prints a warning. The publish phase doesn't need it.
 
 The publish result is kept in `manifest.json` on the `publish` phase: `approvedSha`, `remoteSha`, `prUrl`, and the verified `pullRequest` object. The URL also appears in the run report and in `aloop status` and `aloop inspect --json`.

@@ -1,6 +1,7 @@
 import { agentPhases, diagnoseAgents } from './agents.mjs';
-import { access, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, relative, resolve, win32 as windowsPath } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -12,6 +13,7 @@ import { hashConfig, hashText } from './manifest.mjs';
 import { computeAggregateMetrics, computeRunMetrics, readRunManifests } from './metrics.mjs';
 import { describeJudgeEntry, judgeOutcome } from './judge.mjs';
 import { interpolate, packagePrompts, withOperatorNote } from './prompts.mjs';
+import { resolveBackend } from './publish.mjs';
 import { RunState, slugFor } from './state.mjs';
 
 const PULL_REQUEST_URL = /https?:\/\/[^\s"'`<>]+(?:\/pull\/\d+|\/merge_requests\/\d+)[^\s"'`<>]*/i;
@@ -895,6 +897,96 @@ async function stopProcesses(targets) {
   return waitForProcessesToStop(watched, 5000);
 }
 
+async function cleanWorktreePath(path) {
+  const absolute = resolve(path.replace(/^~[/\\]/, () => `${homedir()}/`));
+  try {
+    return { path: await realpath(absolute), exists: true };
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+    return { path: absolute, exists: false };
+  }
+}
+
+async function cleanWorktree(run, context, registered, protectedPaths, force) {
+  if (!run.worktree) return 'none';
+  const { path, exists } = await cleanWorktreePath(run.worktree);
+  if (protectedPaths.has(path)) return 'none';
+  if (!exists) return 'missing';
+  const registeredPath = registered.get(path);
+  if (!registeredPath) return 'unregistered-dir';
+
+  const git = new GitFacade(path);
+  if (!force && (await git.isDirty(['--untracked-files=normal']))) {
+    const error = new Error('Worktree has uncommitted changes. Commit, stash, or rerun with --force.');
+    throw Object.assign(error, { code: 'dirty-worktree' });
+  }
+  await context.rootGit.removeWorktree(registeredPath, { force });
+  registered.delete(path);
+  return 'removed';
+}
+
+function cleanBranchRemover({ rootGit, config }, onWarning) {
+  let remoteLookup;
+  let forgeLookup;
+  let warned = false;
+
+  async function checkForge(remote) {
+    if (!remote) throw new Error('No Git remote is configured.');
+    const backend = resolveBackend(config.publish?.backend, rootGit.cwd, rootGit);
+    if (typeof backend.mergedRequests !== 'function') {
+      throw new Error('The configured publish backend does not support merge lookups.');
+    }
+    await backend.precheck({ remote });
+    return backend;
+  }
+
+  return async (run) => {
+    const { branch } = run;
+    const base = run.baseBranch ?? config.baseBranch;
+    if (!branch || branch === base || branch === config.baseBranch) return { branch: 'skipped' };
+    if (!(await rootGit.localBranchExists(branch))) return { branch: 'kept-missing' };
+    if (await rootGit.worktreePath(branch)) return { branch: 'kept-checked-out' };
+
+    const ref = `refs/heads/${branch}`;
+    const tip = await rootGit.revParse(ref);
+    let merged = await rootGit.isAncestor(tip, `refs/heads/${base}`);
+    if (!merged) {
+      try {
+        const remote = config.remote ?? (await (remoteLookup ??= rootGit.defaultRemote()));
+        merged = Boolean(remote && (await rootGit.isAncestor(tip, `refs/remotes/${remote}/${base}`)));
+        if (!merged) {
+          const backend = await (forgeLookup ??= checkForge(remote));
+          const requests = await backend.mergedRequests({ remote, branch, base });
+          for (const { state, baseRefName, headRefOid } of requests ?? []) {
+            if (state !== 'MERGED' || baseRefName !== base || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(headRefOid)) {
+              continue;
+            }
+            if (tip === headRefOid.toLowerCase() || (await rootGit.isAncestor(tip, headRefOid))) {
+              merged = true;
+              break;
+            }
+          }
+        }
+      } catch (error) {
+        const branchReason = String(error?.message ?? error)
+          .split(/\r?\n/, 1)[0]
+          .slice(0, 300);
+        if (!warned) {
+          onWarning(`Warning: merge lookup failed. Branches without merge confirmation will be kept. ${branchReason}`);
+        }
+        warned = true;
+        return { branch: 'kept-unmerged', branchReason };
+      }
+    }
+    if (!merged) return { branch: 'kept-unmerged' };
+    if ((await rootGit.revParse(ref)) !== tip) {
+      return { branch: 'kept-unmerged', branchReason: 'The branch tip changed during cleanup.' };
+    }
+    await rootGit.deleteBranch(branch);
+    return { branch: 'deleted' };
+  };
+}
+
 export async function cleanRuns(options = {}) {
   const {
     cwd = process.cwd(),
@@ -902,25 +994,71 @@ export async function cleanRuns(options = {}) {
     olderThanDays = 30,
     dryRun = false,
     yes = false,
+    force = false,
+    branches = false,
+    onWarning = console.warn,
   } = /** @type {any} */ (options);
   const context = await operationalContext(cwd, configPath);
-  const runs = await listRuns({ cwd, configPath });
+  const runs = await listRunsIn(context.runsDir);
   const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
   const candidates = runs.filter((run) => run.status === 'completed' && ageTimestamp(run) <= cutoff);
   const previewOnly = dryRun || !yes;
   const removed = [];
   const errors = [];
+  const details = [];
 
-  if (!previewOnly) {
+  if (!previewOnly && candidates.length) {
+    const registered = new Map();
+    const protectedPaths = new Set([(await cleanWorktreePath(context.repoRoot)).path]);
+    const worktrees = await context.rootGit.worktreeList();
+    for (const { path } of worktrees) {
+      registered.set((await cleanWorktreePath(path)).path, path);
+    }
+    if (worktrees.length) protectedPaths.add((await cleanWorktreePath(worktrees[0].path)).path);
+
+    const outcomes = [];
     for (const run of candidates) {
       try {
-        if (run.worktree && resolve(run.worktree) !== resolve(context.repoRoot)) {
-          await context.rootGit.removeWorktree(run.worktree);
-        }
-        await rm(run.runDir, { recursive: true, force: true });
-        removed.push(run.name);
+        outcomes.push({ run, worktree: await cleanWorktree(run, context, registered, protectedPaths, force) });
       } catch (error) {
-        errors.push({ name: run.name, error: error.message });
+        outcomes.push({ run, error });
+      }
+    }
+
+    let pruneError;
+    const needsPrune = (worktree) => worktree === 'missing' || worktree === 'unregistered-dir';
+    if (outcomes.some(({ worktree }) => needsPrune(worktree))) {
+      try {
+        await context.rootGit.pruneWorktrees();
+      } catch (error) {
+        pruneError = error;
+      }
+    }
+
+    const removeBranch = cleanBranchRemover(context, onWarning);
+    for (const { run, worktree, error: worktreeError } of outcomes) {
+      try {
+        if (worktreeError) throw worktreeError;
+        if (pruneError && needsPrune(worktree)) throw pruneError;
+        await rm(run.runDir, { recursive: true, force: true });
+      } catch (error) {
+        const code = error.code === 'dirty-worktree' ? error.code : 'error';
+        errors.push({ name: run.name, error: error.message, code });
+        continue;
+      }
+      removed.push(run.name);
+      const detail = { name: run.name, worktree, branch: 'skipped' };
+      details.push(detail);
+      if (branches) {
+        try {
+          Object.assign(detail, await removeBranch(run));
+        } catch (error) {
+          errors.push({
+            name: run.name,
+            error: `Run removed, but branch cleanup failed: ${error.message}`,
+            code: 'error',
+          });
+        }
       }
     }
   }
@@ -932,6 +1070,9 @@ export async function cleanRuns(options = {}) {
     candidates,
     removed,
     errors,
+    details,
+    force,
+    branches,
   };
 }
 

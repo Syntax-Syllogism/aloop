@@ -7,12 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-25
+
+### Added
+
+- `aloop clean --force` allows discarding worktree changes
+- `--branches` also deletes merged local branches, including squash merges confirmed by GitHub or GitLab
+
+### Changed
+
+- `aloop clean` now keeps dirty worktrees and their run directories by default
+
+### Fixed
+
+- `aloop clean` removes run records for missing worktrees and prunes stale Git metadata
+- `aloop clean` lists failures separately and exits with code 1 when cleanup fails
+
 ## [0.13.0] - 2026-11-25
 
 ### Changed
+
 - Aloop reviews are now routed according to the risk of the diff being reviewed
 
 ### Fixed
+
 - Aloop run worktrees now install dependencies before the run starts
 
 ## [0.12.4] - 2026-11-23
