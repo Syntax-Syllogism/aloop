@@ -63,7 +63,8 @@ These modules support the orchestration layer:
 - `src/git.mjs`: Git operations
 - `src/prompts.mjs`: prompts
 - `src/state.mjs`: durable state
-- `src/verdict.mjs`: review verdicts
+- `src/review-routing.mjs`: `reviewRouting` normalization and the per-round risk assessment (file count, changed lines, binary changes, sensitive globs) that selects the reviewer tier. See [Risk-based review routing](loop.md#risk-based-review-routing).
+- `src/verdict.mjs`: review verdicts and the unanimous aggregate across a reviewer group
 - `src/judge.mjs`: repeated-blocker judge transports, request building, and answer validation. `runner.mjs` decides when to call it. It also classifies recorded judge entries (`judgeOutcome`) and formats their one-line summary (`describeJudgeEntry`). The run log, `aloop watch`, and metrics share these, so their wording and outcome labels match.
 
 `src/help-topics.mjs` sits outside the orchestration layer. It backs `aloop help`: it lists commands and guides, assembles each command manual from the `##` sections of the guides listed in `COMMAND_MANUALS`, and rewrites links between guides into `aloop help` references. It reads `docs/` at runtime, so `docs/` must ship in the npm package (`package.json` `files`). Renaming or removing a heading that a manual maps to changes that manual's output, and `test/help-topics.test.mjs` checks that the mapped sections exist. See [Agentic loop runner](loop.md#in-cli-documentation).

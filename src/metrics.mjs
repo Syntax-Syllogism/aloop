@@ -143,7 +143,7 @@ function judgeMetrics(entries) {
 /** Compute run-level cost, convergence, and reviewer metrics from one manifest. */
 export function computeRunMetrics(manifest) {
   const entries = entriesFrom(manifest);
-  const activity = entries.filter((entry) => !entry.aggregate);
+  const activity = entries.filter((entry) => !entry.aggregate && entry.role !== 'review-routing');
   const names = [...new Set(activity.map((entry) => entry.phase).filter(Boolean))];
   const phases = Object.fromEntries(
     names.map((name) => [

@@ -8,6 +8,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PERMISSIONS, validateAgent } from './adapters.mjs';
 import { normalizeHermeticConfig, resolvePhaseHermetic } from './hermetic.mjs';
+import { normalizeReviewRouting } from './review-routing.mjs';
 
 // Monotonic counter that makes every config import URL unique. `Date.now()`
 // alone has millisecond granularity, so two loadConfig calls of the same file
@@ -28,6 +29,7 @@ const defaults = {
   engines: { default: { name: 'claude' } },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   reviewRoles: [],
+  reviewRouting: null,
   publish: { backend: 'github', draft: true },
   gate: [],
   // Commands run once in a newly created worktree before the first phase.
@@ -664,6 +666,7 @@ export async function loadConfig(cwd, overrides = {}, configPath) {
     throw new Error('`heartbeatMinutes` must be a nonnegative number of minutes.');
   }
   merged.resolvedPhases = normalizePhases(merged.phases, { maxRounds: merged.maxRounds });
+  merged.reviewRouting = normalizeReviewRouting(merged.reviewRouting);
   if (
     !Array.isArray(merged.reviewRoles) ||
     new Set(merged.reviewRoles).size !== merged.reviewRoles.length ||
@@ -691,6 +694,30 @@ export async function loadConfig(cwd, overrides = {}, configPath) {
         0,
       ),
     );
+  }
+  if (merged.reviewRouting) {
+    const review = merged.resolvedPhases.find((phase) => phase.name === 'review' && phase.verdict);
+    if (review?.kind !== 'agent') throw new Error('`reviewRouting` requires a verdict agent phase named "review".');
+    const occupiedNames = new Set(
+      merged.resolvedPhases
+        .flatMap((phase) => [phase, ...(phase.reviewers ?? []), ...(phase.repair ?? [])])
+        .map((phase) => phase.name),
+    );
+    const reviewers = Array.from({ length: merged.reviewRouting.highReviewers - 1 }, (_, index) => {
+      const name = `review-${index + 2}`;
+      if (occupiedNames.has(name)) throw new Error(`Phase name "${name}" is reserved by reviewRouting.`);
+      return {
+        ...review,
+        name,
+        reviewGroup: review.name,
+        riskReviewer: true,
+        permissions: [PERMISSIONS.READ_ONLY],
+        role: undefined,
+        repair: undefined,
+        reviewers: undefined,
+      };
+    });
+    review.reviewers = [...reviewers, ...(review.reviewers ?? [])];
   }
   for (const phase of merged.resolvedPhases.flatMap((entry) => [
     entry,

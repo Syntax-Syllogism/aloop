@@ -3,12 +3,13 @@
 /** @typedef {import('./types.js').RunState} RunState */
 /** @typedef {import('./types.js').Summary} Summary */
 
-import { stat, unlink } from 'node:fs/promises';
+import { stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describeJudgeEntry, judgeBlockers, readResponse } from './judge.mjs';
 import { codePhasePostcondition, hasPostcondition, phaseIsSkippable, publishingAttestation } from './policy.mjs';
 import { banner, confirm, log } from './reporter.mjs';
-import { APPROVED, CHANGES_REQUESTED, formatFindings, readVerdict } from './verdict.mjs';
+import { assessReviewRisk } from './review-routing.mjs';
+import { APPROVED, CHANGES_REQUESTED, aggregateVerdicts, formatFindings, readVerdict } from './verdict.mjs';
 
 async function fileExists(path) {
   try {
@@ -241,7 +242,9 @@ async function runRepairs(phase, ctx, baseVariables, pending, operations, { reta
           ...baseVariables,
           ROUND: pending.round,
           MAX_ROUNDS: phase.maxRounds,
-          VERDICT_FILE: ctx.state.verdictPath(pending.round),
+          VERDICT_FILE: pending.verdictArtifact
+            ? join(ctx.state.dir, pending.verdictArtifact)
+            : ctx.state.verdictPath(pending.round),
           FINDINGS: formatFindings(pending.verdict?.blocking ?? []),
           SINCE_SHA: pending.reviewedSha,
           GATE_STATUS: gateOk ? 'passing' : `FAILING\n${gateFailure}`,
@@ -356,6 +359,23 @@ async function runGateRepairLoop(phase, ctx, variables, operations) {
   return { result };
 }
 
+async function selectReviewers(phase, ctx) {
+  const additional = phase.reviewers ?? [];
+  const routing = phase.name === 'review' ? ctx.config.reviewRouting : null;
+  if (!routing) return { reviewers: [phase, ...additional] };
+  if (ctx.dryRun) {
+    log('  dry run: previewing the high-risk review path.');
+    return { reviewers: [phase, ...additional] };
+  }
+
+  const baseSha = await ctx.git.revParse(ctx.baseBranch);
+  const headSha = await ctx.git.revParse();
+  const risk = assessReviewRisk(await ctx.git.diffNumstat(baseSha, headSha), routing);
+  const count = risk.tier === 'high' ? routing.highReviewers : routing.lowReviewers;
+  const reviewers = [phase, ...additional.filter((reviewer, index) => !reviewer.riskReviewer || index < count - 1)];
+  return { reviewers, baseSha, headSha, reviewRouting: { ...risk, baseSha, aggregation: routing.aggregation } };
+}
+
 /**
  * Run a verdict phase and its repair phases until the verdict clears.
  *
@@ -466,9 +486,34 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
     }
     banner(`${phase.name} (round ${round}/${phase.maxRounds})`);
     const reviewStatusBefore = ctx.dryRun ? null : await ctx.git.status();
-    const reviewers = [phase, ...(phase.reviewers ?? [])];
+    const route = await selectReviewers(phase, ctx);
+    const { reviewers } = route;
+    if (route.reviewRouting) {
+      log(`  ${route.reviewRouting.tier} risk: ${reviewers.map(({ name }) => name).join(', ')}`);
+      await recordManifest(ctx, {
+        ...operations.manifestEntry(phase, ctx, { inputSha: route.headSha, outputSha: route.headSha }),
+        role: 'review-routing',
+        round,
+        reviewRouting: route.reviewRouting,
+        reviewerSet: reviewers.map(({ name }) => name),
+      });
+    }
     const results = [];
     for (const reviewer of reviewers) {
+      if (reviewer !== phase && !ctx.dryRun) {
+        const reviewerBudget = budgetStatus(ctx);
+        if (reviewerBudget) {
+          const stalled = await recordBudgetStall(ctx, reviewer, reviewerBudget);
+          return {
+            verdict: CHANGES_REQUESTED,
+            rounds: Math.max(0, round - 1),
+            stalled: stalled.reason,
+            stalledPhase: stalled.phase,
+            output: stalled.output,
+            budgetStall: true,
+          };
+        }
+      }
       await ctx.state.enterPhase(reviewer.name);
       const suffix = reviewer === phase ? '' : `-${reviewer.name}`;
       const verdictPath =
@@ -478,6 +523,8 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
         if (!ctx.dryRun) await clearVerdict(verdictPath);
         const agentResult = await runAgent(reviewer, ctx, {
           ...baseVariables,
+          ...(route.baseSha ? { BASE_BRANCH: route.baseSha } : {}),
+          REVIEW_TASK_FILE: reviewer.riskReviewer ? '' : baseVariables.TASK_FILE,
           ROUND: round,
           MAX_ROUNDS: phase.maxRounds,
           VERDICT_FILE: verdictPath,
@@ -493,11 +540,18 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
       const reviewInputSha = agentResult.manifest.inputSha;
       const reviewedSha = agentResult.manifest.outputSha;
       const reviewStatusAfter = await ctx.git.status();
-      if (reviewInputSha !== reviewedSha || reviewStatusBefore !== reviewStatusAfter) {
+      const expectedSha = route.headSha ?? results[0]?.sha ?? reviewInputSha;
+      if (
+        reviewInputSha !== reviewedSha ||
+        expectedSha !== reviewInputSha ||
+        reviewStatusBefore !== reviewStatusAfter
+      ) {
         const reason =
           reviewInputSha !== reviewedSha
             ? `review phase advanced HEAD from ${reviewInputSha} to ${reviewedSha}; review changes must be gated and reviewed in a later round`
-            : 'review phase changed files in the worktree; review must leave the worktree unchanged';
+            : expectedSha !== reviewInputSha
+              ? `HEAD changed from ${expectedSha} to ${reviewInputSha} before review phase ${reviewer.name}`
+              : 'review phase changed files in the worktree; review must leave the worktree unchanged';
         if (reviewInputSha !== reviewedSha) await invalidateGateCompletion(ctx.state, reviewInputSha);
         await recordManifest(ctx, { ...agentResult.manifest, status: 'stalled', failure: { reason } });
         return {
@@ -522,29 +576,17 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
     }
     if (ctx.dryRun) return { verdict: APPROVED, rounds: round, dryRun: true };
     const reviewedSha = results[0].sha;
-    const blocking = results.flatMap(({ reviewer, verdict: roleVerdict }) =>
-      roleVerdict.blocking.map((finding) => ({
-        ...finding,
-        issue: `[${reviewer}] ${finding.issue ?? finding.summary}`,
-      })),
-    );
-    const verdict =
-      results.length === 1
-        ? results[0].verdict
-        : {
-            verdict: blocking.length ? CHANGES_REQUESTED : APPROVED,
-            blocking,
-            nits: results.flatMap(({ verdict: roleVerdict }) => roleVerdict.nits ?? []),
-            summary: results
-              .map(({ reviewer, verdict: roleVerdict }) => `${reviewer}: ${roleVerdict.verdict}`)
-              .join('; '),
-          };
-    if (results.length > 1) {
+    const verdict = aggregateVerdicts(results);
+    const verdictArtifact = results.length > 1 ? `verdict-aggregate-round-${round}.json` : null;
+    if (verdictArtifact) {
+      await writeFile(join(ctx.state.dir, verdictArtifact), `${JSON.stringify(verdict, null, 2)}\n`);
       await recordManifest(ctx, {
         ...operations.manifestEntry(phase, ctx, { inputSha: reviewedSha, outputSha: reviewedSha }),
         round,
         reviewGroup: phase.name,
         aggregate: true,
+        artifacts: [verdictArtifact],
+        ...(route.reviewRouting ? { reviewRouting: route.reviewRouting } : {}),
         reviewerSet: results.map(({ reviewer }) => reviewer),
         verdict: { ...verdict, sha: reviewedSha },
       });
@@ -568,7 +610,7 @@ async function runVerdictLoop(phase, ctx, baseVariables, operations) {
     if (verdict.verdict === CHANGES_REQUESTED && phase.repair.length) {
       reviewState.pendingRepairs = {
         ...ctx.state.data.pendingRepairs,
-        [phase.name]: { round, reviewedSha, verdict, nextRepair: 0 },
+        [phase.name]: { round, reviewedSha, verdict, nextRepair: 0, ...(verdictArtifact ? { verdictArtifact } : {}) },
       };
     }
     await ctx.state.record(reviewState);

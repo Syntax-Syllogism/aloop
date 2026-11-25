@@ -99,6 +99,26 @@ export async function readVerdict(path) {
   return parseVerdict(text);
 }
 
+/** @param {{ reviewer: string, verdict: Verdict }[]} results @returns {Verdict} */
+export function aggregateVerdicts(results) {
+  if (results.length === 1) return results[0].verdict;
+
+  const blockers = new Map();
+  for (const { reviewer, verdict } of results) {
+    for (const finding of verdict.blocking) {
+      const issue = finding.issue ?? finding.summary;
+      const key = JSON.stringify([finding.file, finding.line, issue]);
+      if (!blockers.has(key)) blockers.set(key, { ...finding, issue: `[${reviewer}] ${issue}` });
+    }
+  }
+  return {
+    verdict: results.every(({ verdict }) => verdict.verdict === APPROVED) ? APPROVED : CHANGES_REQUESTED,
+    blocking: [...blockers.values()],
+    nits: results.flatMap(({ verdict }) => verdict.nits),
+    summary: results.map(({ reviewer, verdict }) => `${reviewer}: ${verdict.verdict}`).join('; '),
+  };
+}
+
 /** @param {Finding[]} findings */
 export function formatFindings(findings) {
   if (!findings.length) return '(none)';

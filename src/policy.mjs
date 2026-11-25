@@ -48,11 +48,12 @@ export async function codePhasePostcondition(phase, ctx, { hasFindings = true, h
 
 function latestApprovedReview(state) {
   const index = state.manifest.entries.findLastIndex(
-    (entry) => (entry.role === 'verdict' || entry.role === 'review-override') && entry.status !== 'skipped',
+    (entry) => ['verdict', 'review-override', 'review-routing'].includes(entry.role) && entry.status !== 'skipped',
   );
   const entry = index === -1 ? null : state.manifest.entries[index];
   if (entry?.role === 'review-override') {
-    if (entry.status !== 'completed' || entry.reason !== 'repeated-blockers' || typeof entry.outputSha !== 'string') return null;
+    if (entry.status !== 'completed' || entry.reason !== 'repeated-blockers' || typeof entry.outputSha !== 'string')
+      return null;
     return { index, sha: entry.outputSha, overridden: true };
   }
   if (

@@ -182,6 +182,7 @@ export default {
   },
   phases: ['implement', 'docs', 'gate', 'review', 'address', 'pr-description', 'publish'],
   reviewRoles: [], // optional: security, api-compat, test-quality
+  reviewRouting: null, // optional: see Risk-based review routing
   gate: ['npm test'],
   publish: { backend: 'github', draft: true },
   setup: ['npm ci'],
@@ -510,6 +511,47 @@ Parsing fails closed. A missing, malformed, or unrecognized verdict stalls the r
 - `CHANGES_REQUESTED` needs at least one `blocking` finding. `APPROVED` needs `blocking` to be empty.
 - The loop won't exit on approval while the last gate re-check was red. If a reviewer approves anyway with a red repair gate, the run stalls and reports the gate failure, instead of starting a repair with no findings.
 
+### Risk-based review routing
+
+Set `reviewRouting: {}` in `loop.config.mjs` to enable routing for the
+verdict phase named `review`. Routing needs that phase to be an agent phase;
+otherwise configuration loading fails. The following settings show the defaults.
+
+```js
+reviewRouting: {
+  maxFiles: 10,
+  maxChangedLines: 200,
+  sensitivePaths: ['**/auth/**', '**/migrations/**', '.github/workflows/**'],
+  lowReviewers: 1,
+  highReviewers: 2,
+  aggregation: 'unanimous',
+},
+```
+
+Each round assesses the committed diff from the merge base to the commit under
+review. Changes above either limit, binary changes, or paths matching a
+sensitive glob are high risk. The line count adds insertions and deletions.
+Renames count as a deletion and an addition so both paths are assessed.
+Globs match case-sensitively against repository-relative paths with forward
+slashes. `*` and `?` match within one segment, and a full `**` segment
+matches across directories.
+
+The counts include the primary generalist. Additional generalists run the
+same prompt in fresh agent processes and write separate artifacts. Set
+`engines['review-2']`, `engines['review-3']`, and so on to select different
+models or engines. Extra generalists inherit the `review` engine but not its
+`agent`, as specialized reviewers do. Configured specialized reviewers also run
+in every tier. Every selected reviewer must approve. A dissent sends the union
+of blocking findings to repair. The manifest records the assessment and selected
+reviewers before they run, and a multi-reviewer round writes
+`verdict-aggregate-round-<n>.json` for repair. A dry run previews the high-risk
+path because the committed diff can change during implementation.
+
+On a routed review, `BASE_BRANCH` is the base commit SHA rather than the branch
+name, so the prompt's `git diff {{BASE_BRANCH}}...HEAD` compares against the same
+base as the assessment. Extra generalists get an empty `REVIEW_TASK_FILE`, so they
+don't add notes to a work item's `## Code Review` section.
+
 ### Specialized reviewers
 
 Specialized reviewers do not inherit the review agent; set `engines['review-security'].agent` explicitly.
@@ -557,7 +599,9 @@ Templates use `{{VARIABLE}}` placeholders. An unresolved placeholder throws inst
 - Task: `TASK`, `TASK_FILE`, `TASK_NAME`, `TASK_DIR`, `TASK_CONTEXT`.
 - Repository: `BRANCH`, `BASE_BRANCH`, `REPO`, `REMOTE`.
 - Run: `RUN_DIR`, `GATE_COMMANDS`.
-- Verdict loop: `ROUND`, `MAX_ROUNDS`, `VERDICT_FILE`, `REVIEW_FILE`, `FINDINGS`, `GATE_STATUS`, `SINCE_SHA`.
+- Verdict loop: `ROUND`, `MAX_ROUNDS`, `VERDICT_FILE`, `REVIEW_FILE`, `REVIEW_TASK_FILE`, `FINDINGS`, `GATE_STATUS`, `SINCE_SHA`.
+
+`REVIEW_TASK_FILE` is the task file a reviewer may annotate. It's empty when no task file is supplied, and always empty for routed extra generalists.
 
 `TASK`, `TASK_FILE`, and `TASK_CONTEXT` are empty when the matching input isn't supplied. `TASK_CONTEXT` is the prompt-ready form of the task: inline text, a reference to the task file, or both. The shipped prompts therefore need no conditional interpolation. Human-readable run artefacts belong in `RUN_DIR`, which always exists for a real run. A dry run only reports its intended path.
 

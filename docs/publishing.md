@@ -26,7 +26,7 @@ The description phase must not commit, push, or call a pull-request service. Its
 Before the driver changes a remote, it requires:
 
 - a clean worktree;
-- a current `HEAD` that matches the latest approved review SHA;
+- a current `HEAD` that matches the latest approved review SHA. In a multi-reviewer round, that approval is the aggregate verdict; an incomplete reviewer group doesn't count;
 - a passing gate receipt for that same SHA, dated before the approval.
 
 A recorded `repeated-blockers` override from the [repeated-blocker judge](judge.md#stall-and-override) can stand in for the approval. The gate receipt is still required, and the run logs that it is publishing with unresolved review findings.

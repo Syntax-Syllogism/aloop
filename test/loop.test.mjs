@@ -35,7 +35,7 @@ import {
   renderPrompt,
   resolvePresetPromptDir,
 } from '../src/prompts.mjs';
-import { parseVerdict, formatFindings } from '../src/verdict.mjs';
+import { aggregateVerdicts, parseVerdict, formatFindings } from '../src/verdict.mjs';
 import { hashConfig, hashText } from '../src/manifest.mjs';
 import { computeAggregateMetrics, computeRunMetrics } from '../src/metrics.mjs';
 import {
@@ -56,6 +56,7 @@ import {
   resolvePhaseHermetic,
 } from '../src/hermetic.mjs';
 import { phaseIsSkippable, publishingAttestation } from '../src/policy.mjs';
+import { assessReviewRisk, normalizeReviewRouting } from '../src/review-routing.mjs';
 import { APPROVED } from '../src/verdict.mjs';
 import { formatPhase } from '../src/reporter.mjs';
 import workItemPreset from '../presets/work-item/loop.config.mjs';
@@ -111,6 +112,58 @@ test('publishing waits for the aggregate verdict of a reviewer group', () => {
   assert.equal(publishingAttestation({ manifest: { entries } }, sha), null);
 });
 
+test('review routing records prevent reusing an earlier approval for the same commit', () => {
+  const sha = 'a'.repeat(40);
+  const state = {
+    manifest: {
+      entries: [
+        { role: 'gate', status: 'completed', outputSha: sha },
+        { role: 'verdict', status: 'completed', verdict: { verdict: APPROVED, sha } },
+        { role: 'review-routing', status: 'completed', outputSha: sha, reviewerSet: ['review', 'review-2'] },
+      ],
+    },
+  };
+  assert.match(publishingAttestation(state, sha).reason, /no completed approval/);
+});
+
+test('risk assessment uses inclusive size limits, sensitive paths and binary changes', () => {
+  const routing = normalizeReviewRouting({ maxFiles: 2, maxChangedLines: 4 });
+  const atLimits = '1\t1\tdocs/first.md\0' + '0\t2\tdocs/tab\tand\nnewline.md\0';
+  assert.deepEqual(assessReviewRisk(atLimits, routing), {
+    tier: 'low',
+    files: 2,
+    changedLines: 4,
+    binaryFiles: 0,
+    sensitivePaths: [],
+  });
+  assert.equal(assessReviewRisk(atLimits + '0\t0\tdocs/third.md\0', routing).tier, 'high');
+  assert.equal(assessReviewRisk('3\t2\tdocs/first.md\0', routing).tier, 'high');
+  assert.equal(assessReviewRisk('-\t-\timage.png\0', routing).tier, 'high');
+  assert.deepEqual(
+    assessReviewRisk('0\t1\tauth/root.mjs\0' + '1\t0\tsrc/auth/nested/file.mjs\0', routing).sensitivePaths,
+    ['auth/root.mjs', 'src/auth/nested/file.mjs'],
+  );
+  assert.throws(() => normalizeReviewRouting({ highReviewers: 2, lowReviewers: 2 }), /must exceed lowReviewers/);
+  assert.throws(() => normalizeReviewRouting({ aggregation: 'majority' }), /must be "unanimous"/);
+});
+
+test('risk review verdict aggregation keeps each distinct blocker once', () => {
+  const first = { file: 'auth/login.mjs', line: 1, issue: 'first concern' };
+  const second = { file: 'auth/login.mjs', line: 1, summary: 'second concern' };
+  const verdict = aggregateVerdicts([
+    { reviewer: 'review', verdict: parseVerdict(JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [first] })) },
+    {
+      reviewer: 'review-2',
+      verdict: parseVerdict(JSON.stringify({ verdict: 'CHANGES_REQUESTED', blocking: [first, second] })),
+    },
+  ]);
+  assert.equal(verdict.verdict, 'CHANGES_REQUESTED');
+  assert.deepEqual(
+    verdict.blocking.map((finding) => finding.issue),
+    ['[review] first concern', '[review-2] second concern'],
+  );
+});
+
 test('reporter formats verdict rounds with singular and plural labels', () => {
   assert.equal(formatPhase({ name: 'review', rounds: 1, verdict: APPROVED }), '  ✓ review (1 round, APPROVED)');
   assert.equal(formatPhase({ name: 'review', rounds: 2, verdict: APPROVED }), '  ✓ review (2 rounds, APPROVED)');
@@ -121,7 +174,9 @@ async function git(cwd, ...args) {
 }
 
 async function repoFixture({ config = null, phases = null } = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'loop-repo-'));
+  const parent = await mkdtemp(join(tmpdir(), 'loop-fixture-'));
+  const root = join(parent, 'repo');
+  await mkdir(root);
   await git(root, 'init', '--initial-branch=master');
   await git(root, 'config', 'user.email', 'loop@example.com');
   await git(root, 'config', 'user.name', 'Loop Test');
@@ -541,6 +596,90 @@ test('configured review roles use independent verdict descriptors', async () => 
     (await loadConfig((await repoFixture()).root)).resolvedPhases.find((phase) => phase.name === 'review').reviewers,
     undefined,
   );
+});
+
+test('risk routing selects independent reviewers and sends dissent to repair', async (t) => {
+  const agentScript = `
+const fs = require('node:fs');
+const prompt = process.argv[1];
+if (prompt.includes('## Blocking findings')) {
+  const verdictPath = prompt.match(/structured review verdict is recorded in \\x60([^\\x60]+)\\x60/)[1];
+  const verdict = JSON.parse(fs.readFileSync(verdictPath, 'utf8'));
+  if (verdict.blocking.length !== 1 || !verdict.blocking[0].issue.includes('inspect auth boundary')) process.exit(1);
+  const response = prompt.match(/Write any rebuttal to \\x60([^\\x60]+)\\x60/)[1];
+  fs.writeFileSync(response, 'The finding is disputed after inspection.\\n');
+} else {
+  const verdictPath = prompt.match(/write this JSON to \\x60([^\\x60]+)\\x60/)[1];
+  const reviewPath = prompt.match(/Write your prose review to \\x60([^\\x60]+)\\x60/)[1];
+  const dissent = verdictPath.endsWith('review-2-round-1.json');
+  fs.writeFileSync(reviewPath, 'Review complete.\\n');
+  fs.writeFileSync(verdictPath, JSON.stringify(dissent
+    ? { verdict: 'CHANGES_REQUESTED', blocking: [{ file: 'src/auth/login.mjs', line: 1, issue: 'inspect auth boundary' }] }
+    : { verdict: 'APPROVED' }));
+}
+`;
+  for (const [file, tier] of [
+    ['docs/guide.md', 'low'],
+    ['src/auth/login.mjs', 'high'],
+  ]) {
+    await t.test(tier, async () => {
+      const { root, workItem } = await repoFixture({
+        config: `export default {
+          adapters: { fake: { command({ prompt }) {
+            return { command: process.execPath, args: ['-e', ${JSON.stringify(agentScript)}, prompt] };
+          } } },
+          engines: { default: 'fake', 'review-2': { model: 'alternate' } },
+          phases: ['gate', 'review', 'address'],
+          reviewRouting: { highReviewers: 3 },
+          gate: ['git --version'],
+          worktrees: false,
+        };`,
+      });
+      await writeFile(join(root, '.gitignore'), '.loop/\n');
+      await git(root, 'add', '.');
+      await git(root, 'commit', '-m', 'test: configure risk routing');
+      await git(root, 'switch', '-c', 'feat/ss-demo-feature');
+      await mkdir(join(root, dirname(file)), { recursive: true });
+      await writeFile(join(root, file), 'change\n');
+      await git(root, 'add', file);
+      await git(root, 'commit', '-m', 'test: add reviewed change');
+
+      const summary = await runLoop({ args: { taskFile: workItem, cwd: root, yes: true } });
+      assert.equal(summary.stalled, null);
+      const manifest = JSON.parse(await readFile(join(summary.runDir, 'manifest.json'), 'utf8'));
+      const high = tier === 'high';
+      const reviewers = high ? ['review', 'review-2', 'review-3'] : ['review'];
+      const routes = manifest.phases.filter((entry) => entry.role === 'review-routing');
+      assert.equal(routes.length, high ? 2 : 1);
+      for (const route of routes) {
+        assert.equal(route.reviewRouting.tier, tier);
+        assert.deepEqual(route.reviewRouting.sensitivePaths, high ? [file] : []);
+        assert.deepEqual(route.reviewerSet, reviewers);
+        const reviewed = manifest.phases.filter(
+          (entry) => entry.round === route.round && entry.verdict && !entry.aggregate,
+        );
+        assert.deepEqual(
+          reviewed.map(({ phase }) => phase),
+          reviewers,
+        );
+        assert.ok(
+          reviewed.every(({ inputSha, outputSha }) => inputSha === route.inputSha && outputSha === route.inputSha),
+        );
+      }
+      const aggregate = manifest.phases.filter((entry) => entry.aggregate);
+      assert.deepEqual(
+        aggregate.map((entry) => entry.verdict.verdict),
+        high ? ['CHANGES_REQUESTED', 'APPROVED'] : [],
+      );
+      assert.equal(manifest.phases.filter((entry) => entry.role === 'repair').length, high ? 1 : 0);
+      assert.equal(publishingAttestation({ manifest: { entries: manifest.phases } }, routes.at(-1).outputSha), null);
+      if (high) {
+        const second = manifest.phases.find((entry) => entry.phase === 'review-2');
+        assert.equal(second.engine.model, 'alternate');
+        assert.ok(second.artifacts.includes('review-review-2-round-1.md'));
+      }
+    });
+  }
 });
 
 test('specialized reviewers inherit the review phase hermetic setting', async () => {
@@ -7088,7 +7227,7 @@ test('a writer adapter receives linked-worktree Git metadata', async () => {
   const addDirs = JSON.parse(await readFile(capturedAddDirs, 'utf8'));
   const gitCommonDir = resolve(summary.worktree, await git(summary.worktree, 'rev-parse', '--git-common-dir'));
 
-  assert.notEqual(summary.worktree, root, 'the writer runs in a linked worktree');
+  assert.equal(summary.worktree, join(dirname(root), '.loop-worktrees', 'ss-demo-feature'));
   assert.ok(
     addDirs.includes(gitCommonDir),
     `expected writer adapter args to include linked-worktree Git metadata ${gitCommonDir}`,

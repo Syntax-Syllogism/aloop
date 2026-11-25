@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-25
+
+### Changed
+- Aloop reviews are now routed according to the risk of the diff being reviewed
+
+### Fixed
+- Aloop run worktrees now install dependencies before the run starts
+
 ## [0.12.4] - 2026-11-23
 
 ### Changed

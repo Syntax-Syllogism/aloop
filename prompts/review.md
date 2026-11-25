@@ -3,7 +3,7 @@
 Take on the role of a senior developer. Review all work on branch `{{BRANCH}}`
 in the worktree at `{{REPO}}` for bugs, quality, and alignment with the task.
 
-Write your prose review to `{{RUN_DIR}}/review-round-{{ROUND}}.md`. Include a
+Write your prose review to `{{REVIEW_FILE}}`. Include a
 summary of the review and any gaps in completion of the task.
 
 The implementation and documentation phases have already committed their work,

@@ -5,10 +5,12 @@ quality, following best practice and bugs. This work is in reference to task
 `{{TASK_NAME}}`. Implemented on branch `{{BRANCH}}` in the worktree at
 `{{REPO}}`.
 
-If a task file is present (`{{TASK_FILE}}`), add your notes to its `## Code Review`
-section, creating the section at the end of the file if it is absent. Start with Date
-AND Time as there may be multiple rounds of code reviews. Provide a summary of your
-review and note any gaps in completion of the task.
+Write your prose review to `{{REVIEW_FILE}}`. Provide a summary of your review
+and note any gaps in completion of the task.
+
+If `{{REVIEW_TASK_FILE}}` supplies a task file path, also add your notes to its
+`## Code Review` section. Create the section if needed and start each entry
+with the date and time.
 
 The implementation and documentation phases have already committed their work,
 so documentation is included in the reviewed diff. The repair phase may revise

@@ -40,6 +40,7 @@ export interface PhaseBase {
   recheck?: boolean;
   verdict?: boolean;
   reviewers?: AgentPhase[];
+  riskReviewer?: boolean;
   reviewGroup?: string;
   role?: PhaseRole;
   hermetic?: HermeticConfig | null;
@@ -154,6 +155,15 @@ export interface JudgeDecision {
   judge: Record<string, unknown>;
 }
 
+export interface ReviewRouting {
+  maxFiles: number;
+  maxChangedLines: number;
+  sensitivePaths: string[];
+  lowReviewers: number;
+  highReviewers: number;
+  aggregation: 'unanimous';
+}
+
 export interface Config {
   baseBranch: string;
   branchPrefix: string;
@@ -164,6 +174,7 @@ export interface Config {
   engines: Record<string, EngineEntry> & { default: Engine };
   phases: Array<string | Partial<PhaseDescriptor>>;
   resolvedPhases: PhaseDescriptor[];
+  reviewRouting: ReviewRouting | null;
   publish: { backend?: string | object; draft?: boolean };
   gate: CommandEntry[];
   setup: CommandEntry[];

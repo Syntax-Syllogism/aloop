@@ -30,6 +30,20 @@ export class GitFacade {
     return this.output(['rev-parse', ref]);
   }
 
+  async diffNumstat(baseSha, headSha) {
+    const { stdout } = await this.run([
+      'diff',
+      '--numstat',
+      '-z',
+      '--no-renames',
+      '--no-ext-diff',
+      '--no-textconv',
+      `${baseSha}...${headSha}`,
+      '--',
+    ]);
+    return stdout;
+  }
+
   async status() {
     return this.output(['status', '--porcelain']);
   }
